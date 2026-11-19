@@ -9,3 +9,4 @@
 *.pdf binary
 vendor/** -text
 unicode-data/** -text
+tests/fixtures/** -text

@@ -1,6 +1,10 @@
 use std::cmp::Ordering;
 
+mod context;
+mod scan;
 mod tables;
+
+pub use scan::scan_text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Script {
