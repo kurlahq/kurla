@@ -144,6 +144,16 @@ impl TextDoc {
             }
         }
         let sample = &bytes[..bytes.len().min(SNIFF_LEN)];
+        if let Some(encoding) = detect_utf16_without_bom(sample) {
+            let (text, offsets, _) = decode_utf16(bytes, 0, encoding == Encoding::Utf16Be);
+            return Some(TextDoc {
+                text,
+                encoding,
+                invalid_utf8: true,
+                bom_len: 0,
+                offsets,
+            });
+        }
         if std::str::from_utf8(bytes).is_ok() || lossy_utf8_is_text(sample) {
             let (text, offsets, invalid_utf8) = decode_utf8(bytes, 0);
             return Some(TextDoc {
@@ -154,15 +164,7 @@ impl TextDoc {
                 offsets,
             });
         }
-        let encoding = detect_utf16_without_bom(sample)?;
-        let (text, offsets, _) = decode_utf16(bytes, 0, encoding == Encoding::Utf16Be);
-        Some(TextDoc {
-            text,
-            encoding,
-            invalid_utf8: true,
-            bom_len: 0,
-            offsets,
-        })
+        None
     }
 
     pub fn position(&self, char_offset: usize) -> (u32, u32) {
@@ -488,5 +490,43 @@ mod tests {
             below.push(b'a');
         }
         assert!(TextDoc::decode(&below).is_none());
+    }
+
+    #[test]
+    fn ascii_utf16le_without_bom_is_utf16_not_utf8() {
+        let text = "fn main() {}";
+        let doc = TextDoc::decode(&utf16_bytes(text, false)).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf16Le);
+        assert_eq!(doc.text, text);
+        assert!(doc.invalid_utf8);
+        assert_eq!(doc.byte_span(11, 12), (22, 24));
+    }
+
+    #[test]
+    fn ascii_utf16be_without_bom_is_utf16_not_utf8() {
+        let text = "fn main() {}";
+        let doc = TextDoc::decode(&utf16_bytes(text, true)).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf16Be);
+        assert_eq!(doc.text, text);
+        assert!(doc.invalid_utf8);
+        assert_eq!(doc.byte_span(11, 12), (22, 24));
+    }
+
+    #[test]
+    fn rlo_in_bomless_utf16le_survives_decoding() {
+        let text = "abcdefgh\u{202E}ijkl";
+        let doc = TextDoc::decode(&utf16_bytes(text, false)).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf16Le);
+        assert!(doc.text.contains('\u{202E}'));
+        assert_eq!(doc.text, text);
+        assert_eq!(doc.byte_span(8, 9), (16, 18));
+    }
+
+    #[test]
+    fn utf8_with_single_nul_stays_utf8() {
+        let doc = TextDoc::decode(b"hello\0world").unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf8);
+        assert_eq!(doc.text, "hello\0world");
+        assert!(!doc.invalid_utf8);
     }
 }
