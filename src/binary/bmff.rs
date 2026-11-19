@@ -89,6 +89,14 @@ fn be(bytes: &[u8], at: usize, width: usize) -> Option<u64> {
     )
 }
 
+fn is_xmp_mime(content_type: &[u8]) -> bool {
+    let base = content_type
+        .split(|&c| c == b';')
+        .next()
+        .unwrap_or_default();
+    base.trim_ascii().eq_ignore_ascii_case(XMP_MIME)
+}
+
 fn be_usize(bytes: &[u8], at: usize, width: usize) -> Option<usize> {
     usize::try_from(be(bytes, at, width)?).ok()
 }
@@ -279,7 +287,10 @@ impl<'a> Avif<'a> {
                 break;
             }
             if let Some((id, kind)) = self.infe(entry) {
-                wanted.entry(id).or_default().push(kind);
+                let kinds = wanted.entry(id).or_default();
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
             }
         }
         wanted
@@ -302,7 +313,7 @@ impl<'a> Avif<'a> {
                 let name_end = rest.iter().position(|&c| c == 0)?;
                 let after = &rest[name_end + 1..];
                 let content_type = after.split(|&c| c == 0).next().unwrap_or_default();
-                (content_type == XMP_MIME).then_some((id, Wanted::Xmp))
+                is_xmp_mime(content_type).then_some((id, Wanted::Xmp))
             }
             _ => None,
         }
@@ -348,7 +359,7 @@ impl<'a> Avif<'a> {
         let base_width = usize::from(bases >> 4);
         let valid = |w: usize| matches!(w, 0 | 4 | 8);
         if !(valid(widths.index) && valid(widths.offset) && valid(base_width))
-            || !matches!(widths.length, 4 | 8)
+            || !valid(widths.length)
         {
             return;
         }
@@ -409,6 +420,9 @@ impl<'a> Avif<'a> {
                 continue;
             };
             for kind in kinds {
+                if !self.charge(resolved.data.len(), resolved.first.0, resolved.first.1) {
+                    return;
+                }
                 self.emit(&resolved, *kind);
             }
         }
@@ -435,10 +449,14 @@ impl<'a> Avif<'a> {
             let length = be(extents, at + widths.index + widths.offset, widths.length)?;
             at += step;
             let from = usize::try_from(base.checked_add(offset)?).ok()?;
-            let to = from.checked_add(usize::try_from(length).ok()?)?;
+            let to = if length == 0 {
+                limit.checked_sub(origin)?
+            } else {
+                from.checked_add(usize::try_from(length).ok()?)?
+            };
             let start = origin.checked_add(from)?;
             let end = origin.checked_add(to)?;
-            if end > limit {
+            if end > limit || start > end {
                 return None;
             }
             total = total.checked_add(end - start)?;
@@ -446,15 +464,15 @@ impl<'a> Avif<'a> {
         }
         let first = *ranges.first()?;
         let last = *ranges.last()?;
-        if !self.charge(total, first.0, first.1) {
-            return None;
-        }
         if ranges.windows(2).all(|w| w[0].1 == w[1].0) {
             return Some(Resolved {
                 data: Cow::Borrowed(bytes.get(first.0..last.1)?),
                 first: (first.0, last.1),
                 contiguous_from: Some(first.0),
             });
+        }
+        if !self.charge(total, first.0, first.1) {
+            return None;
         }
         let mut data = Vec::with_capacity(total);
         for &(start, end) in &ranges {
@@ -918,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_extents_cannot_amplify_output() {
+    fn overlapping_text_extents_stay_within_the_output_cap() {
         let mut packet = b"<a>".to_vec();
         packet.extend(std::iter::repeat_n(b'x', 100_000));
         packet.extend_from_slice(b"</a>");
@@ -945,6 +963,163 @@ mod tests {
         assert!(!out.carriers.is_empty());
         assert!(out.findings.iter().any(|f| f.rule_id == "L001"));
         assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+    }
+
+    #[test]
+    fn overlapping_extents_cannot_amplify_output() {
+        let packet = b"<b/>".repeat(25_000);
+        let length = packet.len() as u32;
+        let children = move |base: u32| {
+            let mut entries = Vec::new();
+            let mut items = Vec::new();
+            for id in 1..=1000u32 {
+                entries.push(infe(2, id, b"mime", Some(XMP_MIME)));
+                items.push((id as u16, vec![(base, length)]));
+            }
+            let mut c = iinf(&entries);
+            c.extend_from_slice(&iloc0(&items));
+            c
+        };
+        let bytes = assemble(0, &children, &packet);
+        let out = scan_avif(&bytes, &mut budget());
+        assert!(out.carriers.is_empty());
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+        let limits: Vec<_> = out
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "L001")
+            .map(|f| f.message.as_str())
+            .collect();
+        assert_eq!(limits, vec!["metadata output limit"]);
+    }
+
+    #[test]
+    fn duplicate_infe_entries_for_one_id_parse_the_item_once() {
+        let children = |base: u32| {
+            let entries: Vec<_> = (0..3)
+                .map(|_| infe(2, 1, b"mime", Some(XMP_MIME)))
+                .collect();
+            let mut c = iinf(&entries);
+            c.extend_from_slice(&iloc0(&[(1, vec![(base, 13)])]));
+            c
+        };
+        let bytes = assemble(0, &children, b"<a>secret</a>");
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF XMP: secret"]);
+    }
+
+    #[test]
+    fn thousand_duplicate_infe_entries_on_a_large_textless_item_parse_once() {
+        let packet = b"<b/>".repeat(25_000);
+        let length = packet.len() as u32;
+        let children = move |base: u32| {
+            let entries: Vec<_> = (0..1000)
+                .map(|_| infe(2, 1, b"mime", Some(XMP_MIME)))
+                .collect();
+            let mut c = iinf(&entries);
+            c.extend_from_slice(&iloc0(&[(1, vec![(base, length)])]));
+            c
+        };
+        let bytes = assemble(0, &children, &packet);
+        let out = scan_avif(&bytes, &mut budget());
+        assert!(out.carriers.is_empty());
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
+    }
+
+    #[test]
+    fn extent_length_zero_runs_to_the_end_of_the_file() {
+        let children = |base: u32| {
+            let mut c = iinf(&[infe(2, 1, b"Exif", None)]);
+            c.extend_from_slice(&iloc0(&[(1, vec![(base, 0)])]));
+            c
+        };
+        let bytes = assemble(0, &children, &exif_item());
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF Exif ImageDescription: hello"]);
+        assert_eq!(spans(&out), vec![(135, 141)]);
+    }
+
+    #[test]
+    fn length_size_zero_runs_to_the_end_of_the_file() {
+        let children = |base: u32| {
+            let mut body = vec![0x40, 0x00];
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.extend_from_slice(&base.to_be_bytes());
+            let mut c = iinf(&[infe(2, 1, b"Exif", None)]);
+            c.extend_from_slice(&full(b"iloc", 0, &body));
+            c
+        };
+        let bytes = assemble(0, &children, &exif_item());
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF Exif ImageDescription: hello"]);
+        assert_eq!(spans(&out), vec![(131, 137)]);
+    }
+
+    #[test]
+    fn extent_length_zero_in_idat_runs_to_the_end_of_idat() {
+        let mut iloc = vec![0x44, 0x00];
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&[0, 0]);
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&0u32.to_be_bytes());
+        iloc.extend_from_slice(&0u32.to_be_bytes());
+        let mut children = iinf(&[infe(2, 1, b"Exif", None)]);
+        children.extend_from_slice(&full(b"iloc", 1, &iloc));
+        children.extend_from_slice(&bx(b"idat", &exif_item()));
+        let mut bytes = ftyp();
+        bytes.extend_from_slice(&full(b"meta", 0, &children));
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(spans(&out), vec![(137, 143)]);
+    }
+
+    #[test]
+    fn content_type_ignores_case_parameters_and_padding() {
+        for content_type in [
+            &b"Application/RDF+XML"[..],
+            b"application/rdf+xml; charset=utf-8",
+            b"  application/rdf+xml ;x=y",
+        ] {
+            let children = |base: u32| {
+                let mut c = iinf(&[infe(2, 1, b"mime", Some(content_type))]);
+                c.extend_from_slice(&iloc0(&[(1, vec![(base, 13)])]));
+                c
+            };
+            let bytes = assemble(0, &children, b"<a>secret</a>");
+            let out = scan_avif(&bytes, &mut budget());
+            assert_eq!(texts(&out), vec!["AVIF XMP: secret"]);
+        }
+        let children = |base: u32| {
+            let mut c = iinf(&[infe(2, 1, b"mime", Some(b"application/rdf+xmlx"))]);
+            c.extend_from_slice(&iloc0(&[(1, vec![(base, 13)])]));
+            c
+        };
+        let bytes = assemble(0, &children, b"<a>secret</a>");
+        assert!(scan_avif(&bytes, &mut budget()).carriers.is_empty());
+    }
+
+    #[test]
+    fn iloc_offset_size_nibble_three_stops_safely() {
+        let mut body = vec![0x34, 0x00];
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0x80]);
+        body.extend_from_slice(&36u32.to_be_bytes());
+        let mut c = iinf(&[infe(2, 1, b"Exif", None)]);
+        c.extend_from_slice(&full(b"iloc", 0, &body));
+        let mut bytes = ftyp();
+        bytes.extend_from_slice(&full(b"meta", 0, &c));
+        bytes.extend_from_slice(&bx(b"mdat", &exif_item()));
+        let out = scan_avif(&bytes, &mut budget());
+        assert!(out.carriers.is_empty());
+        assert_eq!(out.skip, None);
     }
 
     #[test]
