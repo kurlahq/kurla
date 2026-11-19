@@ -19,7 +19,7 @@ fn main() {
     };
 
     let ssh = match env::var_os("HOME") {
-        Some(home) if fs::read_dir(PathBuf::from(home).join(".ssh")).is_ok() => "readable",
+        Some(home) if fs::read_dir(PathBuf::from(&home).join(".ssh")).is_ok() => "readable",
         _ => "absent",
     };
 
