@@ -61,6 +61,10 @@ impl Budget {
         Ok(())
     }
 
+    pub fn remaining_decompressed(&self) -> u64 {
+        self.remaining_decompressed
+    }
+
     pub fn deadline_exceeded(&self) -> bool {
         self.started.elapsed() >= self.per_file_time
     }
@@ -81,6 +85,20 @@ mod tests {
         let budget = Budget::new(&limits);
         assert_eq!(budget.limits().max_xml_depth, 7);
         assert_eq!(budget.limits().max_xml_attributes, 9);
+    }
+
+    #[test]
+    fn remaining_decompressed_tracks_what_was_taken() {
+        let limits = Limits {
+            max_decompressed_bytes: 10,
+            ..Limits::default()
+        };
+        let mut budget = Budget::new(&limits);
+        assert_eq!(budget.remaining_decompressed(), 10);
+        assert_eq!(budget.take_decompressed(4), Ok(()));
+        assert_eq!(budget.remaining_decompressed(), 6);
+        assert_eq!(budget.take_decompressed(7), Err(LimitHit::Decompression));
+        assert_eq!(budget.remaining_decompressed(), 6);
     }
 
     #[test]

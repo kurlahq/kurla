@@ -1,3 +1,4 @@
+pub mod binary;
 pub mod limits;
 pub mod markup;
 pub mod model;
