@@ -8,3 +8,4 @@
 *.ico binary
 *.pdf binary
 vendor/** -text
+unicode-data/** -text
