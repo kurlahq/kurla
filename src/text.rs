@@ -14,6 +14,7 @@ pub struct TextDoc {
     pub invalid_utf8: bool,
     pub bom_len: usize,
     offsets: Vec<u64>,
+    line_starts: Vec<usize>,
 }
 
 const SNIFF_LEN: usize = 8192;
@@ -182,6 +183,18 @@ fn decode_utf32(body: &[u8], base: usize, big_endian: bool) -> (String, Vec<u64>
     (text, offsets, invalid)
 }
 
+fn line_starts(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut upcoming = text.chars().skip(1);
+    for (i, c) in text.chars().enumerate() {
+        let next = upcoming.next();
+        if c == '\n' || (c == '\r' && next != Some('\n')) {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
 impl TextDoc {
     pub fn decode(bytes: &[u8]) -> Option<TextDoc> {
         for (bom, encoding, big_endian) in [
@@ -191,6 +204,7 @@ impl TextDoc {
             if let Some(body) = bytes.strip_prefix(&bom) {
                 let (text, offsets, invalid_utf8) = decode_utf32(body, bom.len(), big_endian);
                 return Some(TextDoc {
+                    line_starts: line_starts(&text),
                     text,
                     encoding,
                     invalid_utf8,
@@ -202,6 +216,7 @@ impl TextDoc {
         if let Some(body) = bytes.strip_prefix(&UTF8_BOM) {
             let (text, offsets, invalid_utf8) = decode_utf8(body, UTF8_BOM.len());
             return Some(TextDoc {
+                line_starts: line_starts(&text),
                 text,
                 encoding: Encoding::Utf8,
                 invalid_utf8,
@@ -216,6 +231,7 @@ impl TextDoc {
             if let Some(body) = bytes.strip_prefix(&bom) {
                 let (text, offsets, invalid_utf8) = decode_utf16(body, bom.len(), big_endian);
                 return Some(TextDoc {
+                    line_starts: line_starts(&text),
                     text,
                     encoding,
                     invalid_utf8,
@@ -228,6 +244,7 @@ impl TextDoc {
         if let Some(encoding) = detect_utf32_without_bom(sample) {
             let (text, offsets, _) = decode_utf32(bytes, 0, encoding == Encoding::Utf32Be);
             return Some(TextDoc {
+                line_starts: line_starts(&text),
                 text,
                 encoding,
                 invalid_utf8: true,
@@ -238,6 +255,7 @@ impl TextDoc {
         if let Some(encoding) = detect_utf16_without_bom(sample) {
             let (text, offsets, _) = decode_utf16(bytes, 0, encoding == Encoding::Utf16Be);
             return Some(TextDoc {
+                line_starts: line_starts(&text),
                 text,
                 encoding,
                 invalid_utf8: true,
@@ -248,6 +266,7 @@ impl TextDoc {
         if std::str::from_utf8(bytes).is_ok() || lossy_utf8_is_text(sample) {
             let (text, offsets, invalid_utf8) = decode_utf8(bytes, 0);
             return Some(TextDoc {
+                line_starts: line_starts(&text),
                 text,
                 encoding: Encoding::Utf8,
                 invalid_utf8,
@@ -259,19 +278,15 @@ impl TextDoc {
     }
 
     pub fn position(&self, char_offset: usize) -> (u32, u32) {
-        let mut line = 1u32;
-        let mut column = 1u32;
-        let mut upcoming = self.text.chars().skip(1);
-        for c in self.text.chars().take(char_offset) {
-            let next = upcoming.next();
-            if c == '\n' || (c == '\r' && next != Some('\n')) {
-                line = line.saturating_add(1);
-                column = 1;
-            } else {
-                column = column.saturating_add(1);
-            }
-        }
-        (line, column)
+        let line_index = self
+            .line_starts
+            .partition_point(|&start| start <= char_offset)
+            - 1;
+        let column = char_offset - self.line_starts[line_index] + 1;
+        (
+            u32::try_from(line_index + 1).unwrap_or(u32::MAX),
+            u32::try_from(column).unwrap_or(u32::MAX),
+        )
     }
 
     pub fn byte_span(&self, char_start: usize, char_end: usize) -> (u64, u64) {
@@ -325,6 +340,27 @@ mod tests {
         assert_eq!(doc.position(7), (4, 2));
         assert_eq!(doc.position(8), (5, 1));
         assert_eq!(doc.position(9), (5, 2));
+    }
+
+    #[test]
+    fn positions_across_mixed_line_breaks_at_every_offset() {
+        let doc = TextDoc::decode(b"ab\r\ncd\re\nf").unwrap();
+        let expected = [
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 1),
+            (2, 2),
+            (2, 3),
+            (3, 1),
+            (3, 2),
+            (4, 1),
+            (4, 2),
+        ];
+        for (offset, want) in expected.iter().enumerate() {
+            assert_eq!(doc.position(offset), *want, "offset {offset}");
+        }
     }
 
     #[test]
