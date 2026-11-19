@@ -420,4 +420,20 @@ mod tests {
         assert_eq!(out.skip, Some(SkipReason::Timeout));
         assert!(out.carriers.is_empty());
     }
+
+    #[test]
+    fn many_one_character_xmp_attributes_are_not_b003() {
+        let element = b"<e a=\"x\" b=\"x\" c=\"x\" d=\"x\" e=\"x\" f=\"x\" g=\"x\" h=\"x\"/>";
+        let mut packet = Vec::new();
+        while packet.len() + element.len() <= 60_000 {
+            packet.extend_from_slice(element);
+        }
+        let mut payload = XMP_NS.to_vec();
+        payload.extend_from_slice(&packet);
+        let segments: Vec<Vec<u8>> = (0..16).map(|_| seg(0xE1, &payload)).collect();
+        let out = scan_jpeg(&jpeg(&segments), &mut budget());
+        assert!(out.carriers.len() > 100_000);
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
+    }
 }

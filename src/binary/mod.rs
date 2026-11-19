@@ -107,7 +107,8 @@ pub(crate) enum Placement {
 pub(crate) struct Sink {
     pub out: DetectorOutput,
     pub stop: bool,
-    cap: usize,
+    input_len: usize,
+    inflated: usize,
     used: usize,
 }
 
@@ -120,9 +121,21 @@ impl Sink {
                 skip: None,
             },
             stop: false,
-            cap: input_len.saturating_mul(2).saturating_add(OUTPUT_CAP_SLACK),
+            input_len,
+            inflated: 0,
             used: 0,
         }
+    }
+
+    pub(crate) fn add_inflated(&mut self, len: usize) {
+        self.inflated = self.inflated.saturating_add(len);
+    }
+
+    fn cap(&self) -> usize {
+        self.input_len
+            .saturating_add(self.inflated)
+            .saturating_mul(3)
+            .saturating_add(OUTPUT_CAP_SLACK)
     }
 
     fn set_skip(&mut self, reason: SkipReason) {
@@ -177,8 +190,8 @@ impl Sink {
         }
         let evidence = &evidence[..evidence.len().min(EVIDENCE_CAP)];
         let full = format!("{label}: {text}");
-        let cost = full.len().saturating_add(evidence.len());
-        if self.used.saturating_add(cost) > self.cap {
+        let cost = text.len().saturating_add(evidence.len());
+        if self.used.saturating_add(cost) > self.cap() {
             self.stop = true;
             self.amplification(start, end);
             return false;

@@ -80,7 +80,10 @@ impl Walker<'_> {
             return None;
         }
         match inflate(compressed, self.budget) {
-            Inflated::Text(out) => Some(out),
+            Inflated::Text(out) => {
+                self.sink.add_inflated(out.len());
+                Some(out)
+            }
             Inflated::Unreadable => None,
             Inflated::LimitHit => {
                 self.limit_hit = true;
@@ -486,7 +489,7 @@ mod tests {
     fn cost(out: &DetectorOutput) -> usize {
         out.carriers
             .iter()
-            .map(|c| c.text.len() + c.evidence.len())
+            .map(|c| c.text.split_once(": ").map_or(0, |(_, t)| t.len()) + c.evidence.len())
             .sum()
     }
 
@@ -494,7 +497,7 @@ mod tests {
     fn exif_values_overlapping_one_blob_stay_under_the_output_cap() {
         let bytes = png(&[chunk(b"eXIf", &overlapping_tiff(1000, 30000, true))]);
         let out = scan_png(&bytes, &mut budget());
-        assert!(cost(&out) <= 2 * bytes.len() + 65536);
+        assert!(cost(&out) <= 3 * bytes.len() + 65536);
         assert!(!out.carriers.is_empty() && out.carriers.len() < 1000);
         assert_eq!(out.skip, Some(SkipReason::SizeLimit));
         assert_eq!(out.findings.len(), 1);
@@ -600,5 +603,29 @@ mod tests {
         let out = scan_png(&bytes, &mut b);
         assert!(out.carriers.is_empty() && out.findings.is_empty());
         assert!(b.remaining_decompressed() <= 400);
+    }
+
+    #[test]
+    fn compressible_ztxt_within_the_decompression_budget_is_not_b003() {
+        let z = compress_to_vec_zlib(&vec![b'A'; 200_000], 6);
+        let mut data = b"K\0\0".to_vec();
+        data.extend_from_slice(&z);
+        let bytes = png(&[chunk(b"zTXt", &data)]);
+        assert!(bytes.len() < 2000);
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(out.carriers.len(), 1);
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
+    }
+
+    #[test]
+    fn latin1_text_chunk_is_not_b003() {
+        let mut data = b"K\0".to_vec();
+        data.extend(std::iter::repeat_n(0xE9u8, 100_000));
+        let bytes = png(&[chunk(b"tEXt", &data)]);
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(out.carriers.len(), 1);
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
     }
 }

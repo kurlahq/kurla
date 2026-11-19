@@ -2,11 +2,12 @@ use super::{Placement, Sink, sub};
 use crate::limits::Budget;
 use crate::model::DetectorOutput;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const MAX_DEPTH: usize = 32;
 const MAX_ITEMS: usize = 1000;
 const WORK_SLACK: usize = 64 * 1024;
+const MAX_RECORDED_RANGES: usize = 1 << 20;
 const EXIF_PREFIX: &[u8] = b"Exif\0\0";
 const XMP_MIME: &[u8] = b"application/rdf+xml";
 const RIFF_HEADER_LEN: usize = 12;
@@ -59,12 +60,19 @@ pub fn scan_webp(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
 }
 
 pub fn scan_avif(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
+    let max_work = budget.limits().max_decompressed_bytes;
     let mut scan = Avif {
         bytes,
         sink: Sink::new(bytes.len()),
         budget,
         items: 0,
-        work_left: bytes.len().saturating_mul(2).saturating_add(WORK_SLACK),
+        work_left: bytes
+            .len()
+            .saturating_mul(3)
+            .saturating_add(WORK_SLACK)
+            .min(usize::try_from(max_work).unwrap_or(usize::MAX)),
+        anomaly: false,
+        charged: Vec::new(),
     };
     if read_box(bytes, 0, bytes.len()).is_some_and(|b| &b.kind == b"ftyp") {
         scan.run();
@@ -166,12 +174,15 @@ struct Avif<'a> {
     budget: &'a mut Budget,
     items: usize,
     work_left: usize,
+    anomaly: bool,
+    charged: Vec<(usize, usize)>,
 }
 
 struct Resolved<'a> {
     data: Cow<'a, [u8]>,
     first: (usize, usize),
     contiguous_from: Option<usize>,
+    ranges: Vec<(usize, usize)>,
 }
 
 impl<'a> Avif<'a> {
@@ -265,6 +276,7 @@ impl<'a> Avif<'a> {
 
     fn iinf(&mut self, b: BoxHeader) -> HashMap<u32, Vec<Wanted>> {
         let mut wanted: HashMap<u32, Vec<Wanted>> = HashMap::new();
+        let mut seen: HashSet<u32> = HashSet::new();
         let Some(&version) = self.bytes.get(b.payload) else {
             return wanted;
         };
@@ -287,46 +299,72 @@ impl<'a> Avif<'a> {
                 break;
             }
             if let Some((id, kind)) = self.infe(entry) {
-                let kinds = wanted.entry(id).or_default();
-                if !kinds.contains(&kind) {
-                    kinds.push(kind);
+                if !seen.insert(id) {
+                    self.anomaly = true;
+                }
+                if let Some(kind) = kind {
+                    let kinds = wanted.entry(id).or_default();
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
                 }
             }
         }
         wanted
     }
 
-    fn infe(&self, b: BoxHeader) -> Option<(u32, Wanted)> {
+    fn infe(&self, b: BoxHeader) -> Option<(u32, Option<Wanted>)> {
         let d = self.bytes.get(b.payload..b.end)?;
         let version = *d.first()?;
-        if version != 2 && version != 3 {
+        if version > 3 {
             return None;
+        }
+        if version < 2 {
+            return Some((u32::try_from(be(d, 4, 2)?).ok()?, None));
         }
         let id_width = if version == 2 { 2 } else { 4 };
         let id = u32::try_from(be(d, 4, id_width)?).ok()?;
         let type_at = 4 + id_width + 2;
         let kind = sub(d, type_at, 4)?;
         let rest = d.get(type_at + 4..)?;
-        match kind {
-            b"Exif" => Some((id, Wanted::Exif)),
-            b"mime" => {
-                let name_end = rest.iter().position(|&c| c == 0)?;
+        let wanted = match kind {
+            b"Exif" => Some(Wanted::Exif),
+            b"mime" => rest.iter().position(|&c| c == 0).and_then(|name_end| {
                 let after = &rest[name_end + 1..];
                 let content_type = after.split(|&c| c == 0).next().unwrap_or_default();
-                is_xmp_mime(content_type).then_some((id, Wanted::Xmp))
-            }
+                is_xmp_mime(content_type).then_some(Wanted::Xmp)
+            }),
             _ => None,
-        }
+        };
+        Some((id, wanted))
     }
 
-    fn charge(&mut self, len: usize, start: usize, end: usize) -> bool {
-        match self.work_left.checked_sub(len) {
+    fn overlaps(&mut self) -> bool {
+        self.charged.sort_unstable();
+        self.charged.windows(2).any(|w| w[1].0 < w[0].1)
+    }
+
+    fn charge(&mut self, item: &Resolved<'_>) -> bool {
+        let (start, end) = item.first;
+        for &range in item.ranges.iter().filter(|r| r.0 < r.1) {
+            if self.charged.len() >= MAX_RECORDED_RANGES {
+                self.sink.amplification(start, end);
+                self.sink.stop = true;
+                return false;
+            }
+            self.charged.push(range);
+        }
+        match self.work_left.checked_sub(item.data.len()) {
             Some(left) => {
                 self.work_left = left;
                 true
             }
             None => {
-                self.sink.amplification(start, end);
+                if self.anomaly || self.overlaps() {
+                    self.sink.amplification(start, end);
+                } else {
+                    self.sink.l001("metadata work limit", start, end);
+                }
                 self.sink.stop = true;
                 false
             }
@@ -419,10 +457,10 @@ impl<'a> Avif<'a> {
             let Some(resolved) = self.resolve(extents, widths, base, (origin, limit)) else {
                 continue;
             };
+            if !self.charge(&resolved) {
+                return;
+            }
             for kind in kinds {
-                if !self.charge(resolved.data.len(), resolved.first.0, resolved.first.1) {
-                    return;
-                }
                 self.emit(&resolved, *kind);
             }
         }
@@ -469,10 +507,8 @@ impl<'a> Avif<'a> {
                 data: Cow::Borrowed(bytes.get(first.0..last.1)?),
                 first: (first.0, last.1),
                 contiguous_from: Some(first.0),
+                ranges,
             });
-        }
-        if !self.charge(total, first.0, first.1) {
-            return None;
         }
         let mut data = Vec::with_capacity(total);
         for &(start, end) in &ranges {
@@ -482,6 +518,7 @@ impl<'a> Avif<'a> {
             data: Cow::Owned(data),
             first,
             contiguous_from: None,
+            ranges,
         })
     }
 
@@ -957,9 +994,9 @@ mod tests {
         let used: usize = out
             .carriers
             .iter()
-            .map(|c| c.text.len() + c.evidence.len())
+            .map(|c| c.text.split_once(": ").map_or(0, |(_, t)| t.len()) + c.evidence.len())
             .sum();
-        assert!(used <= bytes.len() * 2 + 64 * 1024);
+        assert!(used <= bytes.len() * 3 + 64 * 1024);
         assert!(!out.carriers.is_empty());
         assert!(out.findings.iter().any(|f| f.rule_id == "B003"));
         assert_eq!(out.skip, Some(SkipReason::SizeLimit));
@@ -1169,5 +1206,144 @@ mod tests {
         assert!(scan_avif(b"", &mut budget()).carriers.is_empty());
         let no_ftyp = bx(b"meta", &[0; 8]);
         assert!(scan_avif(&no_ftyp, &mut budget()).carriers.is_empty());
+    }
+
+    fn xmp_packet(fill: u8) -> Vec<u8> {
+        let mut v = b"<a>".to_vec();
+        v.extend(std::iter::repeat_n(fill, 53));
+        v.extend_from_slice(b"</a>");
+        v
+    }
+
+    fn xmp_scene(iinf_ids: &[u32], extents: &[(u32, u32)]) -> Vec<u8> {
+        let mut mdat = Vec::new();
+        for i in 0..4u8 {
+            mdat.extend_from_slice(&xmp_packet(b'a' + i));
+        }
+        let entries: Vec<Vec<u8>> = iinf_ids
+            .iter()
+            .map(|&id| infe(2, id, b"mime", Some(XMP_MIME)))
+            .collect();
+        let extents = extents.to_vec();
+        let children = move |base: u32| {
+            let mut c = iinf(&entries);
+            let items: Vec<(u16, Vec<(u32, u32)>)> = extents
+                .iter()
+                .enumerate()
+                .map(|(i, &(offset, length))| ((i + 1) as u16, vec![(base + offset, length)]))
+                .collect();
+            c.extend_from_slice(&iloc0(&items));
+            c
+        };
+        assemble(0, &children, &mdat)
+    }
+
+    fn small_budget() -> Budget {
+        Budget::new(&Limits {
+            max_decompressed_bytes: 100,
+            ..Limits::default()
+        })
+    }
+
+    fn assert_b003(out: &DetectorOutput) {
+        assert_eq!(out.findings.len(), 1);
+        let f = &out.findings[0];
+        assert_eq!(f.rule_id, "B003");
+        assert_eq!(f.family, Family::B);
+        assert_eq!(f.base, Severity::High);
+        assert_eq!(f.status, RuleStatus::Stable);
+        assert_eq!(f.carrier, CarrierKind::ResourceLimit);
+        assert_eq!(f.payload, None);
+        assert_eq!(f.message, "metadata amplification");
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+    }
+
+    #[test]
+    fn duplicate_item_ids_exhausting_the_budget_give_b003() {
+        let bytes = xmp_scene(
+            &[1, 1, 2, 2, 3, 3, 4, 4],
+            &[(0, 60), (60, 60), (120, 60), (180, 60)],
+        );
+        let out = scan_avif(&bytes, &mut small_budget());
+        assert_b003(&out);
+        assert_eq!(out.carriers.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_extents_exhausting_the_budget_give_b003() {
+        let bytes = xmp_scene(&[1, 2, 3, 4], &[(0, 60), (0, 60), (0, 60), (0, 60)]);
+        let out = scan_avif(&bytes, &mut small_budget());
+        assert_b003(&out);
+        assert_eq!(out.carriers.len(), 1);
+    }
+
+    #[test]
+    fn well_formed_items_exhausting_a_small_budget_give_l001_low_and_incomplete() {
+        let bytes = xmp_scene(&[1, 2, 3, 4], &[(0, 60), (60, 60), (120, 60), (180, 60)]);
+        let out = scan_avif(&bytes, &mut small_budget());
+        assert_eq!(out.findings.len(), 1);
+        let f = &out.findings[0];
+        assert_eq!(f.rule_id, "L001");
+        assert_eq!(f.family, Family::L);
+        assert_eq!(f.base, Severity::Low);
+        assert_eq!(f.status, RuleStatus::Stable);
+        assert_eq!(f.carrier, CarrierKind::ResourceLimit);
+        assert_eq!(f.payload, None);
+        assert_eq!(f.message, "metadata work limit");
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(out.carriers.len(), 1);
+    }
+
+    fn iref_box(kind: &[u8; 4], from: u16, to: &[u16]) -> Vec<u8> {
+        let mut body = from.to_be_bytes().to_vec();
+        body.extend_from_slice(&(to.len() as u16).to_be_bytes());
+        for t in to {
+            body.extend_from_slice(&t.to_be_bytes());
+        }
+        bx(kind, &body)
+    }
+
+    #[test]
+    fn phone_photo_shaped_heif_stays_under_the_budget_with_no_finding() {
+        let mut mdat = vec![0u8; 8];
+        for _ in 0..48 {
+            mdat.extend_from_slice(&[0xAB; 100]);
+        }
+        mdat.extend_from_slice(&[0xCD; 64]);
+        mdat.extend_from_slice(&exif_item());
+        mdat.extend_from_slice(&[0xEF; 100]);
+        assert_eq!(mdat.len(), 5008);
+        let children = |base: u32| {
+            let mut entries = vec![infe(2, 1, b"grid", None)];
+            for id in 2..=49 {
+                entries.push(infe(2, id, b"hvc1", None));
+            }
+            entries.push(infe(2, 50, b"hvc1", None));
+            entries.push(infe(2, 51, b"Exif", None));
+            entries.push(infe(2, 52, b"hvc1", None));
+            let mut items = vec![(1u16, vec![(base, 8u32)])];
+            for tile in 0..48u32 {
+                items.push(((tile + 2) as u16, vec![(base + 8 + 100 * tile, 100)]));
+            }
+            items.push((50, vec![(base + 4808, 64)]));
+            items.push((51, vec![(base + 4872, 36)]));
+            items.push((52, vec![(base + 4908, 100)]));
+            let mut c = iinf(&entries);
+            c.extend_from_slice(&iloc0(&items));
+            let tiles: Vec<u16> = (2..=49).collect();
+            let mut refs = iref_box(b"dimg", 1, &tiles);
+            refs.extend_from_slice(&iref_box(b"thmb", 50, &[1]));
+            refs.extend_from_slice(&iref_box(b"cdsc", 51, &[1]));
+            refs.extend_from_slice(&iref_box(b"auxl", 52, &[1]));
+            c.extend_from_slice(&full(b"iref", 0, &refs));
+            c
+        };
+        let bytes = assemble(0, &children, &mdat);
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF Exif ImageDescription: hello"]);
+        let value_at = (bytes.len() - 5008 + 4872 + 4 + 26) as u64;
+        assert_eq!(spans(&out), vec![(value_at, value_at + 6)]);
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
     }
 }
