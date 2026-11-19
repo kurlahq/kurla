@@ -429,4 +429,10 @@ mod tests {
         assert_eq!(confusable_skeleton(""), "");
         assert_eq!(confusable_skeleton("abc"), "abc");
     }
+
+    #[test]
+    fn skeleton_ignores_compatibility_decompositions() {
+        assert_eq!(confusable_skeleton("\u{00B2}"), "\u{14BE}");
+        assert_eq!(confusable_skeleton("\u{2460}"), "\u{2780}");
+    }
 }
