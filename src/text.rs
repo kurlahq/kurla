@@ -3,6 +3,8 @@ pub enum Encoding {
     Utf8,
     Utf16Le,
     Utf16Be,
+    Utf32Le,
+    Utf32Be,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +18,8 @@ pub struct TextDoc {
 
 const SNIFF_LEN: usize = 8192;
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+const UTF32_LE_BOM: [u8; 4] = [0xFF, 0xFE, 0x00, 0x00];
+const UTF32_BE_BOM: [u8; 4] = [0x00, 0x00, 0xFE, 0xFF];
 const UTF16_LE_BOM: [u8; 2] = [0xFF, 0xFE];
 const UTF16_BE_BOM: [u8; 2] = [0xFE, 0xFF];
 
@@ -116,8 +120,85 @@ fn decode_utf16(body: &[u8], base: usize, big_endian: bool) -> (String, Vec<u64>
     (text, offsets, invalid)
 }
 
+fn utf32_scalar(group: [u8; 4], big_endian: bool) -> Option<char> {
+    let value = if big_endian {
+        u32::from_be_bytes(group)
+    } else {
+        u32::from_le_bytes(group)
+    };
+    char::from_u32(value)
+}
+
+fn sniffable_utf32_scalar(c: char) -> bool {
+    !(c == '\0' || c.is_ascii_control() && !matches!(c, '\t' | '\n' | '\r' | '\x0C'))
+}
+
+fn utf32_sniff_matches(sample: &[u8], big_endian: bool) -> bool {
+    let usable = sample.len() / 4 * 4;
+    let groups = usable / 4;
+    let ok = sample[..usable]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|&&g| utf32_scalar(g, big_endian).is_some_and(sniffable_utf32_scalar))
+        .count();
+    groups > 0 && ok * 10 >= groups * 9
+}
+
+fn detect_utf32_without_bom(sample: &[u8]) -> Option<Encoding> {
+    if utf32_sniff_matches(sample, false) {
+        Some(Encoding::Utf32Le)
+    } else if utf32_sniff_matches(sample, true) {
+        Some(Encoding::Utf32Be)
+    } else {
+        None
+    }
+}
+
+fn decode_utf32(body: &[u8], base: usize, big_endian: bool) -> (String, Vec<u64>, bool) {
+    let mut text = String::with_capacity(body.len() / 4);
+    let mut offsets = Vec::with_capacity(body.len() / 4 + 1);
+    let mut invalid = false;
+    let (groups, remainder) = body.as_chunks::<4>();
+    let mut pos = base;
+    for &group in groups {
+        offsets.push(pos as u64);
+        match utf32_scalar(group, big_endian) {
+            Some(c) => text.push(c),
+            None => {
+                text.push(char::REPLACEMENT_CHARACTER);
+                invalid = true;
+            }
+        }
+        pos += 4;
+    }
+    if !remainder.is_empty() {
+        offsets.push(pos as u64);
+        text.push(char::REPLACEMENT_CHARACTER);
+        invalid = true;
+        pos += remainder.len();
+    }
+    offsets.push(pos as u64);
+    (text, offsets, invalid)
+}
+
 impl TextDoc {
     pub fn decode(bytes: &[u8]) -> Option<TextDoc> {
+        for (bom, encoding, big_endian) in [
+            (UTF32_LE_BOM, Encoding::Utf32Le, false),
+            (UTF32_BE_BOM, Encoding::Utf32Be, true),
+        ] {
+            if let Some(body) = bytes.strip_prefix(&bom) {
+                let (text, offsets, invalid_utf8) = decode_utf32(body, bom.len(), big_endian);
+                return Some(TextDoc {
+                    text,
+                    encoding,
+                    invalid_utf8,
+                    bom_len: bom.len(),
+                    offsets,
+                });
+            }
+        }
         if let Some(body) = bytes.strip_prefix(&UTF8_BOM) {
             let (text, offsets, invalid_utf8) = decode_utf8(body, UTF8_BOM.len());
             return Some(TextDoc {
@@ -144,6 +225,16 @@ impl TextDoc {
             }
         }
         let sample = &bytes[..bytes.len().min(SNIFF_LEN)];
+        if let Some(encoding) = detect_utf32_without_bom(sample) {
+            let (text, offsets, _) = decode_utf32(bytes, 0, encoding == Encoding::Utf32Be);
+            return Some(TextDoc {
+                text,
+                encoding,
+                invalid_utf8: true,
+                bom_len: 0,
+                offsets,
+            });
+        }
         if let Some(encoding) = detect_utf16_without_bom(sample) {
             let (text, offsets, _) = decode_utf16(bytes, 0, encoding == Encoding::Utf16Be);
             return Some(TextDoc {
@@ -528,5 +619,139 @@ mod tests {
         assert_eq!(doc.encoding, Encoding::Utf8);
         assert_eq!(doc.text, "hello\0world");
         assert!(!doc.invalid_utf8);
+    }
+
+    fn utf32_bytes(s: &str, big_endian: bool) -> Vec<u8> {
+        s.chars()
+            .flat_map(|c| {
+                if big_endian {
+                    u32::from(c).to_be_bytes()
+                } else {
+                    u32::from(c).to_le_bytes()
+                }
+            })
+            .collect()
+    }
+
+    fn le_groups(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn utf32le_bom_decodes_rlo_and_tag_character() {
+        let bytes = [
+            0xFF, 0xFE, 0x00, 0x00, 0x2E, 0x20, 0x00, 0x00, 0x41, 0x00, 0x0E, 0x00,
+        ];
+        let doc = TextDoc::decode(&bytes).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf32Le);
+        assert_eq!(doc.text, "\u{202E}\u{E0041}");
+        assert!(!doc.invalid_utf8);
+        assert_eq!(doc.bom_len, 4);
+        assert_eq!(doc.byte_span(0, 1), (4, 8));
+        assert_eq!(doc.byte_span(1, 2), (8, 12));
+        assert_eq!(doc.position(2), (1, 3));
+    }
+
+    #[test]
+    fn utf32be_bom_decodes_rlo_and_tag_character() {
+        let bytes = [
+            0x00, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x20, 0x2E, 0x00, 0x0E, 0x00, 0x41,
+        ];
+        let doc = TextDoc::decode(&bytes).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf32Be);
+        assert_eq!(doc.text, "\u{202E}\u{E0041}");
+        assert!(!doc.invalid_utf8);
+        assert_eq!(doc.bom_len, 4);
+        assert_eq!(doc.byte_span(1, 2), (8, 12));
+    }
+
+    #[test]
+    fn bomless_utf32le_keeps_rlo_and_flags_invalid() {
+        let text = "ab\u{202E}cd";
+        let doc = TextDoc::decode(&utf32_bytes(text, false)).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf32Le);
+        assert_eq!(doc.text, text);
+        assert!(doc.text.contains('\u{202E}'));
+        assert!(doc.invalid_utf8);
+        assert_eq!(doc.bom_len, 0);
+        assert_eq!(doc.byte_span(2, 3), (8, 12));
+    }
+
+    #[test]
+    fn bomless_utf32be_keeps_rlo_and_flags_invalid() {
+        let text = "ab\u{202E}cd";
+        let doc = TextDoc::decode(&utf32_bytes(text, true)).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf32Be);
+        assert_eq!(doc.text, text);
+        assert!(doc.invalid_utf8);
+        assert_eq!(doc.byte_span(4, 5), (16, 20));
+    }
+
+    #[test]
+    fn utf32_trailing_partial_group_becomes_replacement() {
+        let mut bom = vec![0xFF, 0xFE, 0x00, 0x00, 0x61, 0x00, 0x00, 0x00];
+        bom.extend_from_slice(&[0x41, 0x00]);
+        let doc = TextDoc::decode(&bom).unwrap();
+        assert_eq!(doc.text, "a\u{FFFD}");
+        assert!(doc.invalid_utf8);
+        assert_eq!(doc.byte_span(1, 2), (8, 10));
+        let mut bare = le_groups(&[0x61; 10]);
+        bare.extend_from_slice(&[0x41, 0x00]);
+        let doc = TextDoc::decode(&bare).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf32Le);
+        assert_eq!(doc.text, format!("{}\u{FFFD}", "a".repeat(10)));
+        assert!(doc.invalid_utf8);
+        assert_eq!(doc.byte_span(10, 11), (40, 42));
+    }
+
+    #[test]
+    fn utf32_invalid_scalar_becomes_replacement() {
+        let mut bytes = vec![0xFF, 0xFE, 0x00, 0x00];
+        bytes.extend(le_groups(&[0xD800, 0x61]));
+        let doc = TextDoc::decode(&bytes).unwrap();
+        assert_eq!(doc.text, "\u{FFFD}a");
+        assert!(doc.invalid_utf8);
+        assert_eq!(doc.byte_span(0, 1), (4, 8));
+    }
+
+    #[test]
+    fn utf32_sniff_threshold_at_exactly_ninety_percent() {
+        let mut nine = vec![0x61u32; 9];
+        nine.push(0x0011_0000);
+        let doc = TextDoc::decode(&le_groups(&nine)).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf32Le);
+        assert_eq!(doc.text.chars().filter(|&c| c == 'a').count(), 9);
+        assert!(doc.text.ends_with('\u{FFFD}'));
+        let mut eight = vec![0x61u32; 8];
+        eight.extend_from_slice(&[0x0011_0000, 0x0011_0000]);
+        let doc = TextDoc::decode(&le_groups(&eight)).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf8);
+    }
+
+    #[test]
+    fn utf32_sniff_accepts_four_whitespace_controls_and_rejects_other_c0() {
+        let ok = le_groups(&[0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x09, 0x0A, 0x0D, 0x0C]);
+        assert_eq!(TextDoc::decode(&ok).unwrap().encoding, Encoding::Utf32Le);
+        let bad = le_groups(&[0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x0B, 0x1F]);
+        assert_eq!(TextDoc::decode(&bad).unwrap().encoding, Encoding::Utf8);
+        let nul = le_groups(&[0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x00, 0x00]);
+        assert_eq!(TextDoc::decode(&nul).unwrap().encoding, Encoding::Utf8);
+        let nine = le_groups(&[0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x1F]);
+        assert_eq!(TextDoc::decode(&nine).unwrap().encoding, Encoding::Utf32Le);
+    }
+
+    #[test]
+    fn utf32_sniff_needs_one_whole_group() {
+        assert_eq!(TextDoc::decode(b"abc").unwrap().encoding, Encoding::Utf8);
+    }
+
+    #[test]
+    fn ascii_utf16le_without_bom_still_utf16_and_plain_ascii_still_utf8() {
+        let doc = TextDoc::decode(&utf16_bytes("ab\u{202E}cd", false)).unwrap();
+        assert_eq!(doc.encoding, Encoding::Utf16Le);
+        assert_eq!(doc.text, "ab\u{202E}cd");
+        let plain = TextDoc::decode(b"abcdefgh").unwrap();
+        assert_eq!(plain.encoding, Encoding::Utf8);
+        assert!(!plain.invalid_utf8);
     }
 }
