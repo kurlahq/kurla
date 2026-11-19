@@ -312,6 +312,7 @@ fn decode_reference(rest: &str) -> Option<(char, usize)> {
 struct Subst {
     values: HashMap<String, String>,
     spent: Cell<u64>,
+    capped: Cell<bool>,
 }
 
 impl Subst {
@@ -319,13 +320,22 @@ impl Subst {
         Subst {
             values: HashMap::new(),
             spent: Cell::new(0),
+            capped: Cell::new(false),
         }
     }
 
+    fn capped(&self) -> bool {
+        self.capped.get()
+    }
+
     fn lookup(&self, name: &str) -> Option<&str> {
+        if self.capped.get() {
+            return None;
+        }
         let value = self.values.get(name)?;
         let spent = self.spent.get().saturating_add(value.len() as u64);
         if spent > MAX_EXPANSION {
+            self.capped.set(true);
             return None;
         }
         self.spent.set(spent);
@@ -868,6 +878,7 @@ struct Dtd {
     referenced: HashSet<String>,
     expansion: u64,
     parameter_reference: bool,
+    markup_entity: bool,
 }
 
 impl Dtd {
@@ -1004,6 +1015,9 @@ impl Dtd {
         } else if value.contains('<') {
             self.issues.push(Issue::Text(value.to_string()));
         }
+        if value.contains('<') {
+            self.markup_entity = true;
+        }
     }
 
     fn take_substitutions(&mut self) -> Subst {
@@ -1014,6 +1028,7 @@ impl Dtd {
         if self.aborted
             || nested
             || self.parameter_reference
+            || self.markup_entity
             || self.declarations > MAX_ENTITY_DECLARATIONS
         {
             return Subst::none();
@@ -1021,6 +1036,7 @@ impl Dtd {
         Subst {
             values: std::mem::take(&mut self.values),
             spent: Cell::new(0),
+            capped: Cell::new(false),
         }
     }
 
@@ -1039,7 +1055,7 @@ impl Dtd {
         }
     }
 
-    fn verdict(&self) -> Option<String> {
+    fn verdict(&self, cap_hit: bool) -> Option<(String, &'static str)> {
         if self.aborted {
             return None;
         }
@@ -1058,7 +1074,16 @@ impl Dtd {
         if self.expansion > MAX_EXPANSION {
             reasons.push(format!("estimated expansion of {} bytes", self.expansion));
         }
-        (!reasons.is_empty()).then(|| reasons.join("; "))
+        let mut message = "DTD declares entities that can expand into a very large document";
+        if cap_hit {
+            reasons.push("entity expansion limit".to_string());
+            message = "entity expansion limit";
+        }
+        if self.markup_entity {
+            reasons.push("markup in entity value".to_string());
+            message = "markup in entity value";
+        }
+        (!reasons.is_empty()).then(|| (reasons.join("; "), message))
     }
 }
 
@@ -1552,13 +1577,10 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
     }
     scanner.flush();
     scanner.finish_root(last_end);
-    if let (Some(payload), Some(span)) = (scanner.dtd.verdict(), scanner.dtd.span) {
-        scanner.finding(
-            &ENTITY_BOMB,
-            span,
-            Some(payload),
-            "DTD declares entities that can expand into a very large document",
-        );
+    let cap_hit = scanner.subst.capped();
+    if let (Some((payload, message)), Some(span)) = (scanner.dtd.verdict(cap_hit), scanner.dtd.span)
+    {
+        scanner.finding(&ENTITY_BOMB, span, Some(payload), message);
     }
     scanner.out
 }
@@ -2169,8 +2191,9 @@ mod tests {
         let out = scan(
             "<!DOCTYPE svg SYSTEM \"a>b.dtd\" [<!ENTITY a \"x>y<z\"><!ENTITY b SYSTEM \"f.ent\"><!ATTLIST svg q CDATA \"<!ENTITY\">]><svg><title>t</title></svg>",
         );
-        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings.len(), 2);
         assert_eq!(rule(&out, "S003").len(), 1);
+        assert_eq!(rule(&out, "S004").len(), 1);
         assert!(out.carriers.iter().any(|c| c.text == "t"));
     }
 
@@ -2267,16 +2290,13 @@ mod tests {
     }
 
     #[test]
-    fn entity_holding_script_markup_is_s003_and_substituted_into_text() {
+    fn entity_holding_script_markup_is_s003_and_s004_and_stays_literal() {
         let out =
             scan("<!DOCTYPE svg [<!ENTITY j \"<script>alert(1)</script>\">]><svg><g>&j;</g></svg>");
         assert_eq!(rule(&out, "S003").len(), 1);
-        assert_eq!(out.findings.len(), 1);
-        assert!(
-            out.carriers
-                .iter()
-                .any(|c| c.text == "<script>alert(1)</script>" && !c.hidden)
-        );
+        assert_eq!(rule(&out, "S004").len(), 1);
+        assert_eq!(out.findings.len(), 2);
+        assert!(out.carriers.iter().any(|c| c.text == "&j;" && !c.hidden));
     }
 
     #[test]
@@ -2288,7 +2308,8 @@ mod tests {
     #[test]
     fn entity_holding_plain_markup_becomes_a_visible_carrier() {
         let out = scan("<!DOCTYPE svg [<!ENTITY j \"a &lt;b&gt; c\">]><svg/>");
-        assert!(out.findings.is_empty());
+        assert_eq!(rule(&out, "S004").len(), 1);
+        assert_eq!(out.findings.len(), 1);
         assert_eq!(out.carriers.len(), 1);
         assert_eq!(out.carriers[0].text, "a <b> c");
         assert!(!out.carriers[0].hidden);
@@ -2447,5 +2468,53 @@ mod tests {
     fn parameter_entity_declaration_without_reference_adds_nothing() {
         let out = scan("<!DOCTYPE svg [<!ENTITY % p \"x\"><!-- %p; -->]><svg/>");
         assert!(out.findings.is_empty());
+    }
+
+    #[test]
+    fn split_javascript_link_after_the_expansion_cap_is_s004() {
+        let pad = "p".repeat(1024);
+        let src = format!(
+            "<!DOCTYPE svg [<!ENTITY pad \"{pad}\"><!ENTITY a \"java\"><!ENTITY b \"script:x\">]><svg><title>{}</title><a href=\"&a;&b;\"/></svg>",
+            "&pad;".repeat(1024)
+        );
+        let out = scan(&src);
+        let found = rule(&out, "S004");
+        assert_eq!(found.len(), 1);
+        let f = found[0];
+        assert_eq!(f.family, Family::S);
+        assert_eq!(f.base, Severity::High);
+        assert_eq!(f.status, RuleStatus::Stable);
+        assert_eq!(f.carrier, CarrierKind::ResourceLimit);
+        assert_eq!(f.message, "entity expansion limit");
+        assert_eq!(f.span.byte_start, 0);
+        assert!(f.payload.is_some());
+        assert!(rule(&out, "S003").is_empty());
+        assert_eq!(out.skip, None);
+    }
+
+    #[test]
+    fn markup_in_entity_value_used_in_content_is_s004() {
+        let out =
+            scan("<!DOCTYPE svg [<!ENTITY x \"<text opacity='0'>hidden</text>\">]><svg>&x;</svg>");
+        let found = rule(&out, "S004");
+        assert_eq!(found.len(), 1);
+        let f = found[0];
+        assert_eq!(f.family, Family::S);
+        assert_eq!(f.base, Severity::High);
+        assert_eq!(f.status, RuleStatus::Stable);
+        assert_eq!(f.carrier, CarrierKind::ResourceLimit);
+        assert_eq!(f.message, "markup in entity value");
+        assert_eq!(f.span.byte_start, 0);
+        assert_eq!(out.findings.len(), 1);
+        assert!(out.carriers.iter().any(|c| c.text == "&x;"));
+    }
+
+    #[test]
+    fn illustrator_style_entity_with_zero_opacity_on_text_is_s002() {
+        let out = scan(
+            "<!DOCTYPE svg [<!ENTITY st0 \"opacity:0;\">]><svg><text x=\"1\" y=\"2\" style=\"&st0;\">t</text></svg>",
+        );
+        assert_eq!(payloads(&out, "S002"), vec!["t"]);
+        assert!(rule(&out, "S004").is_empty());
     }
 }
