@@ -8,14 +8,43 @@ pub enum ExifError {
 }
 
 const MAX_IFD_ENTRIES: usize = 1000;
+const MAX_IFDS: usize = 16;
 const ENTRY_LEN: usize = 12;
 const TAG_EXIF_IFD: u16 = 0x8769;
+const TAG_GPS_IFD: u16 = 0x8825;
+const TAG_INTEROP_IFD: u16 = 0xA005;
 const TAG_USER_COMMENT: u16 = 0x9286;
 const TAG_XP_FIRST: u16 = 0x9C9B;
 const TAG_XP_LAST: u16 = 0x9C9F;
+const TAG_GPS_PROCESSING_METHOD: u16 = 0x001B;
+const TAG_GPS_AREA_INFORMATION: u16 = 0x001C;
 const TYPE_BYTE: u16 = 1;
 const TYPE_ASCII: u16 = 2;
 const TYPE_UNDEFINED: u16 = 7;
+const PUBLIC_OUTPUT_SLACK: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Outcome {
+    pub timed_out: bool,
+    pub entry_limit: bool,
+    pub stopped: bool,
+}
+
+pub(crate) struct Value {
+    pub name: String,
+    pub text: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Ifd0,
+    Ifd1,
+    Exif,
+    Gps,
+    Interop,
+}
 
 #[derive(Clone, Copy)]
 struct Order {
@@ -42,32 +71,58 @@ impl Order {
     }
 }
 
-fn tag_name(tag: u16) -> String {
-    let known = match tag {
-        0x010E => "ImageDescription",
-        0x010F => "Make",
-        0x0110 => "Model",
-        0x0131 => "Software",
-        0x0132 => "DateTime",
-        0x013B => "Artist",
-        0x8298 => "Copyright",
-        0x9003 => "DateTimeOriginal",
-        0x9004 => "DateTimeDigitized",
-        0x9286 => "UserComment",
-        0x9C9B => "XPTitle",
-        0x9C9C => "XPComment",
-        0x9C9D => "XPAuthor",
-        0x9C9E => "XPKeywords",
-        0x9C9F => "XPSubject",
-        0xA420 => "ImageUniqueID",
-        0xA430 => "CameraOwnerName",
-        0xA431 => "BodySerialNumber",
-        0xA433 => "LensMake",
-        0xA434 => "LensModel",
-        0xA435 => "LensSerialNumber",
-        _ => return format!("Tag0x{tag:04X}"),
+fn gps_tag_name(tag: u16) -> Option<&'static str> {
+    Some(match tag {
+        0x0001 => "GPSLatitudeRef",
+        0x0003 => "GPSLongitudeRef",
+        0x0009 => "GPSStatus",
+        0x000A => "GPSMeasureMode",
+        0x000C => "GPSSpeedRef",
+        0x000E => "GPSTrackRef",
+        0x0010 => "GPSImgDirectionRef",
+        0x0012 => "GPSMapDatum",
+        0x0013 => "GPSDestLatitudeRef",
+        0x0015 => "GPSDestLongitudeRef",
+        0x0017 => "GPSDestBearingRef",
+        0x0019 => "GPSDestDistanceRef",
+        TAG_GPS_PROCESSING_METHOD => "GPSProcessingMethod",
+        TAG_GPS_AREA_INFORMATION => "GPSAreaInformation",
+        0x001D => "GPSDateStamp",
+        _ => return None,
+    })
+}
+
+fn tag_name(kind: Kind, tag: u16) -> String {
+    let known = match (kind, tag) {
+        (Kind::Gps, t) => gps_tag_name(t),
+        (Kind::Interop, 0x0001) => Some("InteropIndex"),
+        (_, 0x010E) => Some("ImageDescription"),
+        (_, 0x010F) => Some("Make"),
+        (_, 0x0110) => Some("Model"),
+        (_, 0x0131) => Some("Software"),
+        (_, 0x0132) => Some("DateTime"),
+        (_, 0x013B) => Some("Artist"),
+        (_, 0x8298) => Some("Copyright"),
+        (_, 0x9003) => Some("DateTimeOriginal"),
+        (_, 0x9004) => Some("DateTimeDigitized"),
+        (_, 0x9286) => Some("UserComment"),
+        (_, 0x9C9B) => Some("XPTitle"),
+        (_, 0x9C9C) => Some("XPComment"),
+        (_, 0x9C9D) => Some("XPAuthor"),
+        (_, 0x9C9E) => Some("XPKeywords"),
+        (_, 0x9C9F) => Some("XPSubject"),
+        (_, 0xA420) => Some("ImageUniqueID"),
+        (_, 0xA430) => Some("CameraOwnerName"),
+        (_, 0xA431) => Some("BodySerialNumber"),
+        (_, 0xA433) => Some("LensMake"),
+        (_, 0xA434) => Some("LensModel"),
+        (_, 0xA435) => Some("LensSerialNumber"),
+        _ => None,
     };
-    known.to_string()
+    match known {
+        Some(name) => name.to_string(),
+        None => format!("Tag0x{tag:04X}"),
+    }
 }
 
 fn utf16(bytes: &[u8], big: bool) -> String {
@@ -83,7 +138,7 @@ fn utf16(bytes: &[u8], big: bool) -> String {
         .collect()
 }
 
-fn decode_user_comment(value: &[u8], big: bool) -> Option<String> {
+fn decode_prefixed(value: &[u8], big: bool) -> Option<String> {
     let (prefix, body) = (value.get(..8)?, value.get(8..)?);
     Some(if prefix == b"UNICODE\0" {
         utf16(body, big)
@@ -92,17 +147,24 @@ fn decode_user_comment(value: &[u8], big: bool) -> Option<String> {
     })
 }
 
-fn decode_value(tag: u16, typ: u16, value: &[u8], big: bool) -> Option<String> {
-    let text = if (TAG_XP_FIRST..=TAG_XP_LAST).contains(&tag) {
+fn is_prefixed(kind: Kind, tag: u16) -> bool {
+    match kind {
+        Kind::Gps => matches!(tag, TAG_GPS_PROCESSING_METHOD | TAG_GPS_AREA_INFORMATION),
+        _ => tag == TAG_USER_COMMENT,
+    }
+}
+
+fn decode_value(kind: Kind, tag: u16, typ: u16, value: &[u8], big: bool) -> Option<String> {
+    let text = if (TAG_XP_FIRST..=TAG_XP_LAST).contains(&tag) && kind != Kind::Gps {
         if !matches!(typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED) {
             return None;
         }
         utf16(value, false)
-    } else if tag == TAG_USER_COMMENT {
+    } else if is_prefixed(kind, tag) {
         if !matches!(typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED) {
             return None;
         }
-        decode_user_comment(value, big)?
+        decode_prefixed(value, big)?
     } else if typ == TYPE_ASCII {
         lossy(value)
     } else {
@@ -112,84 +174,123 @@ fn decode_value(tag: u16, typ: u16, value: &[u8], big: bool) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-struct IfdWalk {
-    exif_pointer: Option<u32>,
-    timed_out: bool,
+#[derive(Default)]
+struct Pointers {
+    exif: Option<usize>,
+    gps: Option<usize>,
+    interop: Option<usize>,
+    next: Option<usize>,
 }
 
-fn walk_ifd(
-    tiff: &[u8],
+struct Walk<'a> {
+    tiff: &'a [u8],
     order: Order,
-    offset: usize,
-    fields: &mut Vec<(String, String)>,
-    expired: &dyn Fn() -> bool,
-) -> IfdWalk {
-    let mut walk = IfdWalk {
-        exif_pointer: None,
-        timed_out: false,
-    };
-    let Some(count) = order.u16(tiff, offset) else {
-        return walk;
-    };
-    let count = usize::from(count).min(MAX_IFD_ENTRIES);
-    for index in 0..count {
-        if expired() {
-            walk.timed_out = true;
-            break;
+    expired: &'a dyn Fn() -> bool,
+    emit: &'a mut dyn FnMut(Value) -> bool,
+    seen: HashSet<(usize, usize)>,
+    outcome: Outcome,
+}
+
+impl Walk<'_> {
+    fn ifd(&mut self, offset: usize, kind: Kind) -> Pointers {
+        let mut pointers = Pointers::default();
+        let order = self.order;
+        let Some(declared) = order.u16(self.tiff, offset) else {
+            return pointers;
+        };
+        let declared = usize::from(declared);
+        if declared > MAX_IFD_ENTRIES {
+            self.outcome.entry_limit = true;
         }
-        let Some(entry_at) = index
-            .checked_mul(ENTRY_LEN)
-            .and_then(|n| n.checked_add(offset))
-            .and_then(|n| n.checked_add(2))
-        else {
-            break;
-        };
-        let Some(entry) = sub(tiff, entry_at, ENTRY_LEN) else {
-            break;
-        };
-        let (Some(tag), Some(typ), Some(n)) = (
-            order.u16(entry, 0),
-            order.u16(entry, 2),
-            order.u32(entry, 4),
-        ) else {
-            break;
-        };
-        if tag == TAG_EXIF_IFD {
-            walk.exif_pointer = order.u32(entry, 8);
-            continue;
+        let entries_at = offset.saturating_add(2);
+        for index in 0..declared.min(MAX_IFD_ENTRIES) {
+            if (self.expired)() {
+                self.outcome.timed_out = true;
+                return pointers;
+            }
+            let Some(entry_at) = index
+                .checked_mul(ENTRY_LEN)
+                .and_then(|n| n.checked_add(entries_at))
+            else {
+                break;
+            };
+            let Some(entry) = sub(self.tiff, entry_at, ENTRY_LEN) else {
+                break;
+            };
+            let (Some(tag), Some(typ), Some(n)) = (
+                order.u16(entry, 0),
+                order.u16(entry, 2),
+                order.u32(entry, 4),
+            ) else {
+                break;
+            };
+            let pointer = order.u32(entry, 8).and_then(|o| usize::try_from(o).ok());
+            match (kind, tag) {
+                (Kind::Ifd0, TAG_EXIF_IFD) => {
+                    pointers.exif = pointer;
+                    continue;
+                }
+                (Kind::Ifd0, TAG_GPS_IFD) => {
+                    pointers.gps = pointer;
+                    continue;
+                }
+                (Kind::Exif, TAG_INTEROP_IFD) => {
+                    pointers.interop = pointer;
+                    continue;
+                }
+                _ => {}
+            }
+            if !matches!(typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED) {
+                continue;
+            }
+            let Ok(len) = usize::try_from(n) else {
+                continue;
+            };
+            let start = if len <= 4 {
+                Some(entry_at + 8)
+            } else {
+                pointer
+            };
+            let Some(start) = start else {
+                continue;
+            };
+            let Some(value) = sub(self.tiff, start, len) else {
+                continue;
+            };
+            if !self.seen.insert((start, len)) {
+                continue;
+            }
+            let Some(text) = decode_value(kind, tag, typ, value, order.big) else {
+                continue;
+            };
+            let value = Value {
+                name: tag_name(kind, tag),
+                text,
+                start,
+                end: start + len,
+            };
+            if !(self.emit)(value) {
+                self.outcome.stopped = true;
+                return pointers;
+            }
         }
-        if !matches!(typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED) {
-            continue;
-        }
-        let Ok(len) = usize::try_from(n) else {
-            continue;
-        };
-        let value = if len <= 4 {
-            sub(entry, 8, len)
-        } else {
-            order
-                .u32(entry, 8)
+        if kind == Kind::Ifd0 {
+            pointers.next = declared
+                .checked_mul(ENTRY_LEN)
+                .and_then(|n| n.checked_add(entries_at))
+                .and_then(|at| order.u32(self.tiff, at))
                 .and_then(|o| usize::try_from(o).ok())
-                .and_then(|o| sub(tiff, o, len))
-        };
-        let Some(value) = value else {
-            continue;
-        };
-        if let Some(text) = decode_value(tag, typ, value, order.big) {
-            fields.push((tag_name(tag), text));
+                .filter(|&o| o != 0);
         }
+        pointers
     }
-    walk
 }
 
-pub fn exif_text_fields(tiff: &[u8]) -> Result<Vec<(String, String)>, ExifError> {
-    parse(tiff, &|| false).map(|(fields, _)| fields)
-}
-
-pub(crate) fn parse(
+pub(crate) fn parse_values(
     tiff: &[u8],
     expired: &dyn Fn() -> bool,
-) -> Result<(Vec<(String, String)>, bool), ExifError> {
+    emit: &mut dyn FnMut(Value) -> bool,
+) -> Result<Outcome, ExifError> {
     let big = match tiff.get(..2) {
         Some(b"II") => false,
         Some(b"MM") => true,
@@ -203,21 +304,56 @@ pub(crate) fn parse(
         .u32(tiff, 4)
         .and_then(|o| usize::try_from(o).ok())
         .ok_or(ExifError::BadHeader)?;
-    let mut fields = Vec::new();
-    let mut visited = HashSet::new();
-    visited.insert(first);
-    let walk = walk_ifd(tiff, order, first, &mut fields, expired);
-    if walk.timed_out {
-        return Ok((fields, true));
-    }
-    let Some(exif_at) = walk.exif_pointer.and_then(|o| usize::try_from(o).ok()) else {
-        return Ok((fields, false));
+    let mut walk = Walk {
+        tiff,
+        order,
+        expired,
+        emit,
+        seen: HashSet::new(),
+        outcome: Outcome::default(),
     };
-    if !visited.insert(exif_at) {
-        return Ok((fields, false));
+    let mut visited = HashSet::new();
+    let mut queue = vec![(first, Kind::Ifd0)];
+    visited.insert(first);
+    let mut index = 0;
+    while index < queue.len() && !walk.outcome.stopped && !walk.outcome.timed_out {
+        let (offset, kind) = queue[index];
+        index += 1;
+        let pointers = walk.ifd(offset, kind);
+        let found = [
+            (pointers.exif, Kind::Exif),
+            (pointers.gps, Kind::Gps),
+            (pointers.interop, Kind::Interop),
+            (pointers.next, Kind::Ifd1),
+        ];
+        for (pointer, kind) in found {
+            if let Some(at) = pointer
+                && queue.len() < MAX_IFDS
+                && visited.insert(at)
+            {
+                queue.push((at, kind));
+            }
+        }
     }
-    let second = walk_ifd(tiff, order, exif_at, &mut fields, expired);
-    Ok((fields, second.timed_out))
+    Ok(walk.outcome)
+}
+
+pub fn exif_text_fields(tiff: &[u8]) -> Result<Vec<(String, String)>, ExifError> {
+    let cap = tiff
+        .len()
+        .saturating_mul(2)
+        .saturating_add(PUBLIC_OUTPUT_SLACK);
+    let mut used = 0usize;
+    let mut fields = Vec::new();
+    parse_values(tiff, &|| false, &mut |value| {
+        used = used.saturating_add(value.text.len());
+        if used > cap {
+            return false;
+        }
+        fields.push((value.name, value.text));
+        true
+    })?;
+    Ok(fields)
 }
 
 #[cfg(test)]
@@ -527,5 +663,128 @@ mod tests {
         tiff.extend_from_slice(&entry(LE, 0x0110, 2, 4, [0, 0, 0, 0]));
         tiff.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(exif_text_fields(&tiff), Ok(vec![]));
+    }
+
+    fn values(tiff: &[u8]) -> (Vec<(String, usize, usize)>, Outcome) {
+        let mut seen = Vec::new();
+        let outcome = parse_values(tiff, &|| false, &mut |v: Value| {
+            seen.push((v.name, v.start, v.end));
+            true
+        })
+        .unwrap();
+        (seen, outcome)
+    }
+
+    #[test]
+    fn values_report_their_own_byte_range() {
+        let offset = single_ifd(LE, 0x010E, 2, b"hello\0");
+        assert_eq!(
+            values(&offset).0,
+            vec![("ImageDescription".to_string(), 26, 32)]
+        );
+        let mut inline = header(LE);
+        inline.extend_from_slice(&u16b(LE, 1));
+        inline.extend_from_slice(&entry(LE, 0x010F, 2, 3, *b"ab\0\0"));
+        inline.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(values(&inline).0, vec![("Make".to_string(), 18, 21)]);
+    }
+
+    #[test]
+    fn identical_offset_and_length_is_emitted_once() {
+        let mut tiff = header(LE);
+        tiff.extend_from_slice(&u16b(LE, 3));
+        for tag in [0x010E, 0x010F, 0x0110] {
+            tiff.extend_from_slice(&entry(LE, tag, 2, 6, u32b(LE, 50)));
+        }
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(b"hello\0");
+        let (seen, _) = values(&tiff);
+        assert_eq!(seen, vec![("ImageDescription".to_string(), 50, 56)]);
+    }
+
+    #[test]
+    fn entry_limit_is_reported_only_past_one_thousand() {
+        let build = |n: u16| {
+            let mut tiff = header(LE);
+            tiff.extend_from_slice(&u16b(LE, n));
+            for _ in 0..n {
+                tiff.extend_from_slice(&entry(LE, 0x010F, 2, 3, *b"ab\0\0"));
+            }
+            tiff.extend_from_slice(&[0, 0, 0, 0]);
+            tiff
+        };
+        let (seen, outcome) = values(&build(1001));
+        assert_eq!(seen.len(), 1000);
+        assert!(outcome.entry_limit);
+        let (seen, outcome) = values(&build(1000));
+        assert_eq!(seen.len(), 1000);
+        assert!(!outcome.entry_limit);
+    }
+
+    #[test]
+    fn refusing_callback_stops_the_walk() {
+        let tiff = single_ifd(LE, 0x010E, 2, b"hello\0");
+        let outcome = parse_values(&tiff, &|| false, &mut |_| false).unwrap();
+        assert!(outcome.stopped);
+    }
+
+    #[test]
+    fn expired_deadline_is_reported() {
+        let tiff = single_ifd(LE, 0x010E, 2, b"hello\0");
+        let outcome = parse_values(&tiff, &|| true, &mut |_| true).unwrap();
+        assert!(outcome.timed_out);
+    }
+
+    #[test]
+    fn ifd1_is_read_through_the_ifd0_next_pointer() {
+        let mut tiff = header(LE);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x010F, 2, 3, *b"a\0\0\0"));
+        tiff.extend_from_slice(&u32b(LE, 26));
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x0110, 2, 3, *b"b\0\0\0"));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            exif_text_fields(&tiff),
+            Ok(vec![pair("Make", "a"), pair("Model", "b")])
+        );
+    }
+
+    #[test]
+    fn gps_ifd_text_is_read_with_gps_names() {
+        let mut tiff = header(LE);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x8825, 4, 1, u32b(LE, 26)));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(&u16b(LE, 2));
+        tiff.extend_from_slice(&entry(LE, 0x001C, 7, 11, u32b(LE, 56)));
+        tiff.extend_from_slice(&entry(LE, 0x0001, 2, 2, *b"N\0\0\0"));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(b"ASCII\0\0\0xyz");
+        assert_eq!(
+            exif_text_fields(&tiff),
+            Ok(vec![
+                pair("GPSAreaInformation", "xyz"),
+                pair("GPSLatitudeRef", "N")
+            ])
+        );
+    }
+
+    #[test]
+    fn interop_ifd_is_read_from_the_exif_ifd() {
+        let mut tiff = header(LE);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x8769, 4, 1, u32b(LE, 26)));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0xA005, 4, 1, u32b(LE, 44)));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x0001, 2, 4, *b"R98\0"));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            exif_text_fields(&tiff),
+            Ok(vec![pair("InteropIndex", "R98")])
+        );
     }
 }

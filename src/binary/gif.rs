@@ -6,16 +6,9 @@ const HEADER_LEN: usize = 13;
 const APPLICATION_ID_LEN: usize = 11;
 const XMP_ID: &[u8] = b"XMP DataXMP";
 const TRAILER_LEN: usize = 258;
-const SEARCH_STRIDE: usize = 1 << 16;
 
 enum Stop {
     Truncated,
-    Timeout,
-}
-
-enum Search {
-    Found(usize),
-    Absent,
     Timeout,
 }
 
@@ -25,37 +18,6 @@ fn trailer() -> Vec<u8> {
     t.extend((1..=0xFFu8).rev());
     t.extend_from_slice(&[0x00, 0x00]);
     t
-}
-
-fn find_trailer(hay: &[u8], budget: &Budget) -> Search {
-    let pattern = trailer();
-    let mut fail = vec![0usize; pattern.len()];
-    let mut k = 0usize;
-    for i in 1..pattern.len() {
-        while k > 0 && pattern[i] != pattern[k] {
-            k = fail[k - 1];
-        }
-        if pattern[i] == pattern[k] {
-            k += 1;
-        }
-        fail[i] = k;
-    }
-    let mut matched = 0usize;
-    for (i, &byte) in hay.iter().enumerate() {
-        if i % SEARCH_STRIDE == 0 && budget.deadline_exceeded() {
-            return Search::Timeout;
-        }
-        while matched > 0 && byte != pattern[matched] {
-            matched = fail[matched - 1];
-        }
-        if byte == pattern[matched] {
-            matched += 1;
-        }
-        if matched == pattern.len() {
-            return Search::Found(i + 1 - pattern.len());
-        }
-    }
-    Search::Absent
 }
 
 fn sub_blocks(
@@ -135,30 +97,39 @@ impl Gif<'_> {
             return self.skip(at);
         }
         let from = at + 1 + APPLICATION_ID_LEN;
-        let rest = self.bytes.get(from..)?;
-        match find_trailer(rest, self.budget) {
-            Search::Found(offset) => {
-                let end = from + offset;
-                self.sink
-                    .xmp("GIF XMP", &self.bytes[from..end], from, end, self.budget);
-                Some(end + TRAILER_LEN)
+        match sub_blocks(self.bytes, from, self.budget, |_, _| {}) {
+            Ok(next) => {
+                let trailer_at = next.checked_sub(TRAILER_LEN).filter(|&t| t >= from);
+                let end = match trailer_at {
+                    Some(t) if self.bytes[t..next] == trailer()[..] => t,
+                    _ => next - 1,
+                };
+                self.sink.xmp(
+                    "GIF XMP",
+                    &self.bytes[from..end],
+                    from,
+                    end,
+                    true,
+                    self.budget,
+                );
+                Some(next)
             }
-            Search::Timeout => {
-                self.sink.timed_out();
+            Err(Stop::Truncated) => {
+                let end = self.bytes.len();
+                self.sink.xmp(
+                    "GIF XMP",
+                    &self.bytes[from..end],
+                    from,
+                    end,
+                    true,
+                    self.budget,
+                );
                 None
             }
-            Search::Absent => match sub_blocks(self.bytes, from, self.budget, |_, _| {}) {
-                Ok(next) => {
-                    let end = next - 1;
-                    self.sink
-                        .xmp("GIF XMP", &self.bytes[from..end], from, end, self.budget);
-                    Some(next)
-                }
-                Err(stop) => {
-                    self.finish(&stop);
-                    None
-                }
-            },
+            Err(stop) => {
+                self.finish(&stop);
+                None
+            }
         }
     }
 
@@ -186,6 +157,9 @@ impl Gif<'_> {
 
     fn walk(&mut self, mut at: usize) {
         loop {
+            if self.sink.stop {
+                return;
+            }
             if self.budget.deadline_exceeded() {
                 self.sink.timed_out();
                 return;
@@ -218,7 +192,7 @@ impl Gif<'_> {
 pub fn scan_gif(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
     let mut gif = Gif {
         bytes,
-        sink: Sink::new(),
+        sink: Sink::new(bytes.len()),
         budget,
     };
     if !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
@@ -367,9 +341,9 @@ mod tests {
                 out.carriers[0].span.byte_start,
                 out.carriers[0].span.byte_end
             ),
-            (33, 33 + xml.len() as u64)
+            (39, 49)
         );
-        assert_eq!(out.carriers[0].evidence, xml.as_bytes().to_vec());
+        assert_eq!(out.carriers[0].evidence, b"gif hidden".to_vec());
     }
 
     #[test]
@@ -473,5 +447,21 @@ mod tests {
         let out = scan_gif(&bytes, &mut Budget::new(&limits));
         assert_eq!(out.skip, Some(SkipReason::Timeout));
         assert!(out.carriers.is_empty());
+    }
+
+    #[test]
+    fn short_xmp_chain_does_not_swallow_a_later_comment() {
+        let mut bytes = head();
+        bytes.extend_from_slice(&[0x21, 0xFF, 0x0B]);
+        bytes.extend_from_slice(b"XMP DataXMP");
+        bytes.extend_from_slice(&[0x03, b'a', b'b', b'c', 0x00]);
+        bytes.extend_from_slice(&comment(&[b"payload"]));
+        bytes.extend_from_slice(&xmp_ext(b"<a>k</a>"));
+        bytes.push(0x3B);
+        let out = scan_gif(&bytes, &mut budget());
+        assert_eq!(
+            texts(&out),
+            vec!["GIF XMP: \u{3}abc", "GIF Comment: payload", "GIF XMP: k"]
+        );
     }
 }

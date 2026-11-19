@@ -1,6 +1,6 @@
 use super::{Sink, lossy, sub};
 use crate::limits::Budget;
-use crate::model::{DetectorOutput, SkipReason};
+use crate::model::DetectorOutput;
 
 const EXIF_PREFIX: &[u8] = b"Exif\0\0";
 const XMP_PREFIX: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
@@ -80,7 +80,7 @@ fn extended_chunk(
 }
 
 pub fn scan_jpeg(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
-    let mut sink = Sink::new();
+    let mut sink = Sink::new(bytes.len());
     if !bytes.starts_with(&[0xFF, 0xD8]) {
         return sink.out;
     }
@@ -91,8 +91,12 @@ pub fn scan_jpeg(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
             sink.timed_out();
             break;
         }
-        if bytes.get(at) != Some(&0xFF) {
-            break;
+        match bytes
+            .get(at..)
+            .and_then(|rest| rest.iter().position(|&b| b == 0xFF))
+        {
+            Some(skipped) => at += skipped,
+            None => break,
         }
         while bytes.get(at + 1) == Some(&0xFF) {
             at += 1;
@@ -102,8 +106,8 @@ pub fn scan_jpeg(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
         };
         at += 2;
         match marker {
-            0x00 | 0xD9 | 0xDA => break,
-            0x01 | 0xD0..=0xD8 => continue,
+            0xD9 | 0xDA => break,
+            0x00 | 0x01 | 0xD0..=0xD8 => continue,
             _ => {}
         }
         let Some(length) = sub(bytes, at, 2).map(|b| usize::from(u16::from_be_bytes([b[0], b[1]])))
@@ -137,6 +141,7 @@ pub fn scan_jpeg(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
                         packet,
                         start + XMP_PREFIX.len(),
                         start + payload.len(),
+                        true,
                         budget,
                     );
                 } else if let Some(rest) = payload.strip_prefix(EXTENDED_PREFIX) {
@@ -151,17 +156,18 @@ pub fn scan_jpeg(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
             }
             _ => {}
         }
-        if sink.out.skip == Some(SkipReason::Timeout) {
+        if sink.stop {
             break;
         }
     }
-    if sink.out.skip != Some(SkipReason::Timeout) {
+    if !sink.stop {
         for assembly in assemblies.iter().filter(|a| !a.rejected) {
             sink.xmp(
                 "JPEG XMP",
                 &assembly.data,
                 assembly.start,
                 assembly.end,
+                false,
                 budget,
             );
         }
@@ -255,8 +261,8 @@ mod tests {
         );
         assert_eq!(com.evidence, b"hello".to_vec());
         let ex = &out.carriers[1];
-        assert_eq!((ex.span.byte_start, ex.span.byte_end), (21, 53));
-        assert_eq!(ex.evidence, EXIF_HELLO.to_vec());
+        assert_eq!((ex.span.byte_start, ex.span.byte_end), (47, 53));
+        assert_eq!(ex.evidence, b"hello\0".to_vec());
         assert!(out.findings.is_empty());
         assert_eq!(out.skip, None);
     }
@@ -274,8 +280,9 @@ mod tests {
                 out.carriers[0].span.byte_start,
                 out.carriers[0].span.byte_end
             ),
-            (35, 35 + xml.len() as u64)
+            (153, 165)
         );
+        assert_eq!(out.carriers[0].evidence, b"hidden words".to_vec());
     }
 
     #[test]
@@ -362,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_length_or_missing_marker_prefix_stops_the_walk() {
+    fn invalid_length_stops_the_walk() {
         let short = jpeg(&[
             seg(0xFE, b"one"),
             vec![0xFF, 0xFE, 0x00, 0x01],
@@ -372,11 +379,17 @@ mod tests {
             texts(&scan_jpeg(&short, &mut budget())),
             vec!["JPEG COM: one"]
         );
-        let stray = jpeg(&[seg(0xFE, b"one"), vec![0x00], seg(0xFE, b"two")]);
-        assert_eq!(
-            texts(&scan_jpeg(&stray, &mut budget())),
-            vec!["JPEG COM: one"]
-        );
+    }
+
+    #[test]
+    fn stray_bytes_between_segments_are_skipped_and_the_walk_continues() {
+        for junk in [vec![0x00], vec![0x41, 0x42], vec![0xFF, 0x00]] {
+            let bytes = jpeg(&[seg(0xFE, b"one"), junk, seg(0xFE, b"two")]);
+            assert_eq!(
+                texts(&scan_jpeg(&bytes, &mut budget())),
+                vec!["JPEG COM: one", "JPEG COM: two"]
+            );
+        }
     }
 
     #[test]

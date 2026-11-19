@@ -22,10 +22,15 @@ pub(crate) const EVIDENCE_CAP: usize = 4096;
 const FTYP_BRANDS: [&[u8; 4]; 9] = [
     b"avif", b"avis", b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1",
 ];
-const FTYP_SCAN_CAP: usize = 4096;
+const FTYP_MAX_COMPATIBLE: usize = 64;
+const OUTPUT_CAP_SLACK: usize = 64 * 1024;
 const OTHER_IMAGE_EXTENSIONS: [&str; 13] = [
     "svgz", "bmp", "tif", "tiff", "ico", "cur", "jxl", "psd", "tga", "jp2", "j2k", "emf", "wmf",
 ];
+
+fn is_brand(chunk: &[u8]) -> bool {
+    FTYP_BRANDS.iter().any(|b| chunk == b.as_slice())
+}
 
 fn is_avif(bytes: &[u8]) -> bool {
     if bytes.get(4..8) != Some(b"ftyp".as_slice()) {
@@ -35,16 +40,25 @@ fn is_avif(bytes: &[u8]) -> bool {
         .get(0..4)
         .and_then(|b| <[u8; 4]>::try_from(b).ok())
         .map_or(0, u32::from_be_bytes);
-    let end = usize::try_from(declared)
-        .unwrap_or(usize::MAX)
-        .clamp(16, FTYP_SCAN_CAP)
-        .min(bytes.len());
-    let is_brand = |chunk: &[u8]| FTYP_BRANDS.iter().any(|b| chunk == b.as_slice());
-    if bytes.get(8..12).is_some_and(is_brand) {
+    let (major_at, end) = match declared {
+        0 => (8usize, bytes.len()),
+        1 => {
+            let large = bytes
+                .get(8..16)
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map_or(0, u64::from_be_bytes);
+            (16, usize::try_from(large).unwrap_or(usize::MAX))
+        }
+        n => (8, usize::try_from(n).unwrap_or(usize::MAX)),
+    };
+    if bytes.get(major_at..major_at + 4).is_some_and(is_brand) {
         return true;
     }
+    let compatible_at = major_at + 8;
+    let limit = compatible_at + 4 * FTYP_MAX_COMPATIBLE;
+    let end = end.min(bytes.len()).min(limit);
     bytes
-        .get(16..end)
+        .get(compatible_at..end)
         .is_some_and(|rest| rest.as_chunks::<4>().0.iter().any(|c| is_brand(c)))
 }
 
@@ -84,61 +98,125 @@ pub fn sniff(bytes: &[u8], path: &str) -> FileKind {
 
 pub(crate) struct Sink {
     pub out: DetectorOutput,
+    pub stop: bool,
+    cap: usize,
+    used: usize,
 }
 
 impl Sink {
-    pub fn new() -> Sink {
+    pub fn new(input_len: usize) -> Sink {
         Sink {
             out: DetectorOutput {
                 findings: Vec::new(),
                 carriers: Vec::new(),
                 skip: None,
             },
+            stop: false,
+            cap: input_len.saturating_mul(2).saturating_add(OUTPUT_CAP_SLACK),
+            used: 0,
         }
     }
 
-    pub fn carrier(&mut self, label: &str, text: &str, start: usize, end: usize, evidence: &[u8]) {
-        if text.is_empty() {
-            return;
+    fn set_skip(&mut self, reason: SkipReason) {
+        if self.out.skip.is_none() {
+            self.out.skip = Some(reason);
         }
-        self.out.carriers.push(Carrier {
-            kind: CarrierKind::MetadataField,
-            text: format!("{label}: {text}"),
+    }
+
+    fn l001(&mut self, message: &str, start: usize, end: usize) {
+        self.set_skip(SkipReason::SizeLimit);
+        self.out.findings.push(RawFinding {
+            rule_id: "L001",
+            family: Family::L,
+            base: Severity::Low,
+            status: RuleStatus::Stable,
             span: span(start, end),
-            hidden: false,
-            evidence: evidence[..evidence.len().min(EVIDENCE_CAP)].to_vec(),
+            carrier: CarrierKind::ResourceLimit,
+            payload: None,
+            message: message.to_string(),
+            evidence: Vec::new(),
         });
     }
 
-    pub fn exif(&mut self, tiff: &[u8], start: usize, budget: &Budget) {
+    pub fn carrier(
+        &mut self,
+        label: &str,
+        text: &str,
+        start: usize,
+        end: usize,
+        evidence: &[u8],
+    ) -> bool {
+        if self.stop {
+            return false;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        let evidence = &evidence[..evidence.len().min(EVIDENCE_CAP)];
+        let full = format!("{label}: {text}");
+        let cost = full.len().saturating_add(evidence.len());
+        if self.used.saturating_add(cost) > self.cap {
+            self.stop = true;
+            self.l001("metadata output limit", start, end);
+            return false;
+        }
+        self.used += cost;
+        self.out.carriers.push(Carrier {
+            kind: CarrierKind::MetadataField,
+            text: full,
+            span: span(start, end),
+            hidden: false,
+            evidence: evidence.to_vec(),
+        });
+        true
+    }
+
+    pub fn exif(&mut self, tiff: &[u8], base: usize, budget: &Budget) {
         let expired = || budget.deadline_exceeded();
-        if let Ok((fields, timed_out)) = exif::parse(tiff, &expired) {
-            for (name, text) in fields {
-                self.carrier(
-                    &format!("EXIF {name}"),
-                    &text,
-                    start,
-                    start + tiff.len(),
-                    tiff,
-                );
-            }
-            if timed_out {
-                self.out.skip = Some(SkipReason::Timeout);
-            }
+        let mut emit = |value: exif::Value| {
+            let evidence = tiff.get(value.start..value.end).unwrap_or_default();
+            self.carrier(
+                &format!("EXIF {}", value.name),
+                &value.text,
+                base + value.start,
+                base + value.end,
+                evidence,
+            )
+        };
+        let Ok(outcome) = exif::parse_values(tiff, &expired, &mut emit) else {
+            return;
+        };
+        if outcome.timed_out {
+            self.timed_out();
+        }
+        if outcome.entry_limit && !self.stop {
+            self.l001("EXIF entry limit", base, base + tiff.len());
         }
     }
 
-    pub fn xmp(&mut self, label: &str, packet: &[u8], start: usize, end: usize, budget: &Budget) {
-        for text in xmp::text(packet, budget) {
-            self.carrier(label, &text, start, end, packet);
-        }
+    pub fn xmp(
+        &mut self,
+        label: &str,
+        packet: &[u8],
+        start: usize,
+        end: usize,
+        mapped: bool,
+        budget: &Budget,
+    ) {
+        let mut emit = |text: &str, range: Option<(usize, usize)>| match range {
+            Some((a, b)) if mapped && a <= b && b <= packet.len() => {
+                self.carrier(label, text, start + a, start + b, &packet[a..b])
+            }
+            _ => self.carrier(label, text, start, end, text.as_bytes()),
+        };
+        xmp::scan(packet, budget, &mut emit);
         if budget.deadline_exceeded() {
-            self.out.skip = Some(SkipReason::Timeout);
+            self.timed_out();
         }
     }
 
     pub fn limit_hit(&mut self, start: usize, end: usize, message: &str) {
-        self.out.skip = Some(SkipReason::DecompressionLimit);
+        self.set_skip(SkipReason::DecompressionLimit);
         self.out.findings.push(RawFinding {
             rule_id: "B002",
             family: Family::B,
@@ -153,7 +231,8 @@ impl Sink {
     }
 
     pub fn timed_out(&mut self) {
-        self.out.skip = Some(SkipReason::Timeout);
+        self.set_skip(SkipReason::Timeout);
+        self.stop = true;
     }
 }
 
@@ -296,5 +375,47 @@ mod tests {
             sniff(&[0x80, 0x81, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05], "a.dat"),
             FileKind::UnknownBinary
         );
+    }
+
+    #[test]
+    fn sniff_ftyp_size_zero_reads_brands_to_end_of_file() {
+        let mut v = vec![0, 0, 0, 0];
+        v.extend_from_slice(b"ftypisom");
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v.extend_from_slice(b"iso2mif1");
+        assert_eq!(sniff(&v, "a"), FileKind::Avif);
+    }
+
+    #[test]
+    fn sniff_ftyp_size_one_uses_the_64_bit_largesize_layout() {
+        let mut compatible = vec![0, 0, 0, 1];
+        compatible.extend_from_slice(b"ftyp");
+        compatible.extend_from_slice(&28u64.to_be_bytes());
+        compatible.extend_from_slice(b"isom");
+        compatible.extend_from_slice(&[0, 0, 0, 0]);
+        compatible.extend_from_slice(b"mif1");
+        assert_eq!(sniff(&compatible, "a"), FileKind::Avif);
+        let mut major = vec![0, 0, 0, 1];
+        major.extend_from_slice(b"ftyp");
+        major.extend_from_slice(&24u64.to_be_bytes());
+        major.extend_from_slice(b"avif");
+        major.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(sniff(&major, "a"), FileKind::Avif);
+    }
+
+    #[test]
+    fn sniff_ftyp_reads_at_most_sixty_four_compatible_brands() {
+        let build = |fillers: usize| {
+            let mut v = vec![0, 0, 0, 0];
+            v.extend_from_slice(b"ftypisom");
+            v.extend_from_slice(&[0, 0, 0, 0]);
+            for _ in 0..fillers {
+                v.extend_from_slice(b"mp41");
+            }
+            v.extend_from_slice(b"avif");
+            v
+        };
+        assert_eq!(sniff(&build(63), "a"), FileKind::Avif);
+        assert_ne!(sniff(&build(64), "a"), FileKind::Avif);
     }
 }

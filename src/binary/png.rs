@@ -24,7 +24,10 @@ pub(crate) fn inflate(data: &[u8], budget: &mut Budget) -> Inflated {
         Err(error) if error.status == miniz_oxide::inflate::TINFLStatus::HasMoreOutput => {
             Inflated::LimitHit
         }
-        Err(_) => Inflated::Unreadable,
+        Err(error) => {
+            let _ = budget.take_decompressed(error.output.len() as u64);
+            Inflated::Unreadable
+        }
     }
 }
 
@@ -159,7 +162,7 @@ impl Walker<'_> {
                 b"IEND" => return,
                 _ => {}
             }
-            if self.sink.out.skip == Some(crate::model::SkipReason::Timeout) {
+            if self.sink.stop {
                 return;
             }
             let Some(next) = chunk
@@ -176,7 +179,7 @@ impl Walker<'_> {
 
 pub fn scan_png(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
     let mut walker = Walker {
-        sink: Sink::new(),
+        sink: Sink::new(bytes.len()),
         budget,
         limit_hit: false,
     };
@@ -321,8 +324,9 @@ mod tests {
                 out.carriers[0].span.byte_start,
                 out.carriers[0].span.byte_end
             ),
-            (16, 48)
+            (42, 48)
         );
+        assert_eq!(out.carriers[0].evidence, b"hello\0".to_vec());
     }
 
     #[test]
@@ -461,5 +465,139 @@ mod tests {
         let out = scan_png(&bytes, &mut Budget::new(&limits));
         assert_eq!(out.skip, Some(SkipReason::Timeout));
         assert!(out.carriers.is_empty());
+    }
+
+    fn overlapping_tiff(entries: usize, blob_len: usize, shrink: bool) -> Vec<u8> {
+        let blob_at = 8 + 2 + entries * 12 + 4;
+        let mut v = vec![b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
+        v.extend_from_slice(&(entries as u16).to_le_bytes());
+        for i in 0..entries {
+            let count = if shrink { blob_len - i } else { blob_len };
+            v.extend_from_slice(&0x010Eu16.to_le_bytes());
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&(count as u32).to_le_bytes());
+            v.extend_from_slice(&(blob_at as u32).to_le_bytes());
+        }
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v.extend_from_slice(&vec![b'A'; blob_len]);
+        v
+    }
+
+    fn cost(out: &DetectorOutput) -> usize {
+        out.carriers
+            .iter()
+            .map(|c| c.text.len() + c.evidence.len())
+            .sum()
+    }
+
+    #[test]
+    fn exif_values_overlapping_one_blob_stay_under_the_output_cap() {
+        let bytes = png(&[chunk(b"eXIf", &overlapping_tiff(1000, 30000, true))]);
+        let out = scan_png(&bytes, &mut budget());
+        assert!(cost(&out) <= 2 * bytes.len() + 65536);
+        assert!(!out.carriers.is_empty() && out.carriers.len() < 1000);
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(out.findings.len(), 1);
+        let f = &out.findings[0];
+        assert_eq!(f.rule_id, "L001");
+        assert_eq!(f.family, Family::L);
+        assert_eq!(f.base, Severity::Low);
+        assert_eq!(f.status, RuleStatus::Stable);
+        assert_eq!(f.carrier, CarrierKind::ResourceLimit);
+        assert_eq!(f.message, "metadata output limit");
+    }
+
+    #[test]
+    fn exif_values_with_the_same_offset_and_length_are_emitted_once() {
+        let bytes = png(&[chunk(b"eXIf", &overlapping_tiff(5, 30, false))]);
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(out.carriers.len(), 1);
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
+    }
+
+    fn many_inline_entries(count: usize) -> Vec<u8> {
+        let mut v = vec![b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
+        v.extend_from_slice(&(count as u16).to_le_bytes());
+        for _ in 0..count {
+            v.extend_from_slice(&0x010Fu16.to_le_bytes());
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&3u32.to_le_bytes());
+            v.extend_from_slice(&[b'a', 0, 0, 0]);
+        }
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v
+    }
+
+    #[test]
+    fn exif_entry_limit_is_visible_as_l001_and_size_limit() {
+        let bytes = png(&[chunk(b"eXIf", &many_inline_entries(1001))]);
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(out.carriers.len(), 1000);
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].rule_id, "L001");
+        assert_eq!(out.findings[0].message, "EXIF entry limit");
+        let exact = png(&[chunk(b"eXIf", &many_inline_entries(1000))]);
+        let out = scan_png(&exact, &mut budget());
+        assert_eq!(out.carriers.len(), 1000);
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
+    }
+
+    #[test]
+    fn the_first_skip_reason_wins() {
+        let z = compress_to_vec_zlib(&vec![b'A'; 1_000_000], 6);
+        let mut bomb = b"Bomb\0\0".to_vec();
+        bomb.extend_from_slice(&z);
+        let bytes = png(&[
+            chunk(b"zTXt", &bomb),
+            chunk(b"eXIf", &many_inline_entries(1001)),
+        ]);
+        let limits = Limits {
+            max_decompressed_bytes: 1000,
+            ..Limits::default()
+        };
+        let out = scan_png(&bytes, &mut Budget::new(&limits));
+        assert_eq!(out.skip, Some(SkipReason::DecompressionLimit));
+        let ids: Vec<&str> = out.findings.iter().map(|f| f.rule_id).collect();
+        assert_eq!(ids, vec!["B002", "L001"]);
+    }
+
+    #[test]
+    fn two_moderate_ztxt_chunks_sum_against_one_budget() {
+        let z = compress_to_vec_zlib(&vec![b'A'; 600], 6);
+        let mut data = b"K\0\0".to_vec();
+        data.extend_from_slice(&z);
+        let bytes = png(&[chunk(b"zTXt", &data), chunk(b"zTXt", &data)]);
+        let limits = Limits {
+            max_decompressed_bytes: 1000,
+            ..Limits::default()
+        };
+        let mut b = Budget::new(&limits);
+        let out = scan_png(&bytes, &mut b);
+        assert_eq!(out.carriers.len(), 1);
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].rule_id, "B002");
+        assert_eq!(out.skip, Some(SkipReason::DecompressionLimit));
+        assert_eq!(b.remaining_decompressed(), 400);
+    }
+
+    #[test]
+    fn inflate_that_fails_after_producing_output_is_still_charged() {
+        let mut z = compress_to_vec_zlib(&vec![b'A'; 600], 6);
+        let last = z.len() - 1;
+        z[last] ^= 0xFF;
+        let mut data = b"K\0\0".to_vec();
+        data.extend_from_slice(&z);
+        let bytes = png(&[chunk(b"zTXt", &data)]);
+        let limits = Limits {
+            max_decompressed_bytes: 1000,
+            ..Limits::default()
+        };
+        let mut b = Budget::new(&limits);
+        let out = scan_png(&bytes, &mut b);
+        assert!(out.carriers.is_empty() && out.findings.is_empty());
+        assert!(b.remaining_decompressed() <= 400);
     }
 }
