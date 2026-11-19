@@ -33,6 +33,7 @@ pub enum LimitHit {
 
 #[derive(Debug)]
 pub struct Budget {
+    limits: Limits,
     remaining_decompressed: u64,
     started: Instant,
     per_file_time: Duration,
@@ -41,10 +42,15 @@ pub struct Budget {
 impl Budget {
     pub fn new(limits: &Limits) -> Budget {
         Budget {
+            limits: limits.clone(),
             remaining_decompressed: limits.max_decompressed_bytes,
             started: Instant::now(),
             per_file_time: limits.per_file_time,
         }
+    }
+
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     pub fn take_decompressed(&mut self, n: u64) -> Result<(), LimitHit> {
@@ -53,6 +59,10 @@ impl Budget {
         }
         self.remaining_decompressed -= n;
         Ok(())
+    }
+
+    pub fn remaining_decompressed(&self) -> u64 {
+        self.remaining_decompressed
     }
 
     pub fn deadline_exceeded(&self) -> bool {
@@ -64,6 +74,32 @@ impl Budget {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn budget_exposes_the_limits_it_was_built_from() {
+        let limits = Limits {
+            max_xml_depth: 7,
+            max_xml_attributes: 9,
+            ..Limits::default()
+        };
+        let budget = Budget::new(&limits);
+        assert_eq!(budget.limits().max_xml_depth, 7);
+        assert_eq!(budget.limits().max_xml_attributes, 9);
+    }
+
+    #[test]
+    fn remaining_decompressed_tracks_what_was_taken() {
+        let limits = Limits {
+            max_decompressed_bytes: 10,
+            ..Limits::default()
+        };
+        let mut budget = Budget::new(&limits);
+        assert_eq!(budget.remaining_decompressed(), 10);
+        assert_eq!(budget.take_decompressed(4), Ok(()));
+        assert_eq!(budget.remaining_decompressed(), 6);
+        assert_eq!(budget.take_decompressed(7), Err(LimitHit::Decompression));
+        assert_eq!(budget.remaining_decompressed(), 6);
+    }
 
     #[test]
     fn budget_refuses_decompression_past_limit() {
