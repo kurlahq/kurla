@@ -187,16 +187,16 @@ fn decode_numeric_reference(rest: &[char]) -> Option<(char, usize)> {
         Some('x' | 'X') => (16, 2),
         _ => (10, 1),
     };
-    let digits: String = rest[digits_from..]
-        .iter()
-        .take(10)
-        .take_while(|c| c.is_digit(radix))
-        .collect();
-    if digits.is_empty() {
+    let mut value = 0u32;
+    let mut count = 0;
+    for digit in rest[digits_from..].iter().map_while(|c| c.to_digit(radix)) {
+        value = value.saturating_mul(radix).saturating_add(digit);
+        count += 1;
+    }
+    if count == 0 {
         return None;
     }
-    let value = u32::from_str_radix(&digits, radix).unwrap_or(u32::MAX);
-    let mut used = digits_from + digits.len();
+    let mut used = digits_from + count;
     if rest.get(used) == Some(&';') {
         used += 1;
     }
@@ -1306,5 +1306,33 @@ mod tests {
         }
         let out = run_with(&input, Markup::Markdown, &limits);
         assert_eq!(out.skip, Some(SkipReason::Timeout));
+    }
+
+    #[test]
+    fn numeric_references_consume_every_digit() {
+        let zeros = "0".repeat(1000);
+        for style in [
+            "display&#0000000000058;none".to_string(),
+            "display&#x000000000003A;none".to_string(),
+            format!("display&#{zeros}58;none"),
+            format!("display&#x{zeros}3a;none"),
+        ] {
+            let out = html(&format!("<i style=\"{style}\">t</i>"));
+            assert_eq!(out.findings.len(), 1, "{style}");
+        }
+        for style in [
+            "display&#99999999999999999999;none",
+            "display&#xFFFFFFFFFFFFFFFFFFFF;none",
+            "display&#0;none",
+            "display&#xD800;none",
+        ] {
+            let out = html(&format!("<i style=\"{style}\">t</i>"));
+            assert!(out.findings.is_empty(), "{style}");
+        }
+        assert_eq!(decode_references("&#99999999999999999999;"), "\u{fffd}");
+        assert_eq!(
+            decode_references("&#0;&#xD800;&#x110000;"),
+            "\u{fffd}\u{fffd}\u{fffd}"
+        );
     }
 }
