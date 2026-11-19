@@ -1,0 +1,91 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        shell: bash
+        run: rustup toolchain install --profile minimal
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --offline -- -D warnings
+      - name: Test
+        run: cargo test --locked --offline
+
+  dev-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+
+  offline-build:
+    needs: dev-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: Build both targets with the network off
+        run: dev/offline-build.sh
+
+  evil-build:
+    needs: dev-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: Probe a hostile build script
+        run: dev/evil-build-check.sh
+
+  supply-chain:
+    needs: dev-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: Install toolchain
+        run: rustup toolchain install --profile minimal
+      - name: Deny
+        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo deny check
+      - name: Vet
+        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo vet --locked
+      - name: Cooldown
+        run: cargo xtask cooldown-check
+
+  audit:
+    needs: dev-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: Audit
+        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo audit

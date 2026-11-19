@@ -1,0 +1,18 @@
+name: dev-image
+description: Load the dev container image from the cache, building it when the cache misses
+runs:
+  using: composite
+  steps:
+    - id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/kurla-dev.tar
+        key: kurla-dev-${{ hashFiles('dev/Dockerfile') }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        docker build -t kurla-dev - < dev/Dockerfile
+        docker save -o "$RUNNER_TEMP/kurla-dev.tar" kurla-dev
+    - if: steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: docker load -i "$RUNNER_TEMP/kurla-dev.tar"
