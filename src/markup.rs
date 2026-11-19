@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::limits::Budget;
 use crate::model::{
     Carrier, CarrierKind, DetectorOutput, Family, RawFinding, RuleStatus, Severity, SkipReason,
@@ -149,19 +151,156 @@ fn leading_number_is_zero(text: &str) -> bool {
     is_zero_number(&text[..end])
 }
 
+const NAMED_REFERENCES: [(&str, char); 21] = [
+    ("amp", '&'),
+    ("lt", '<'),
+    ("gt", '>'),
+    ("quot", '"'),
+    ("apos", '\''),
+    ("colon", ':'),
+    ("semi", ';'),
+    ("comma", ','),
+    ("period", '.'),
+    ("num", '#'),
+    ("percnt", '%'),
+    ("lpar", '('),
+    ("rpar", ')'),
+    ("excl", '!'),
+    ("sol", '/'),
+    ("bsol", '\\'),
+    ("plus", '+'),
+    ("equals", '='),
+    ("Tab", '\t'),
+    ("NewLine", '\n'),
+    ("nbsp", '\u{a0}'),
+];
+
+fn code_point(value: u32) -> char {
+    match char::from_u32(value) {
+        Some(c) if value != 0 => c,
+        _ => '\u{fffd}',
+    }
+}
+
+fn decode_numeric_reference(rest: &[char]) -> Option<(char, usize)> {
+    let (radix, digits_from) = match rest.get(1) {
+        Some('x' | 'X') => (16, 2),
+        _ => (10, 1),
+    };
+    let digits: String = rest[digits_from..]
+        .iter()
+        .take(10)
+        .take_while(|c| c.is_digit(radix))
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let value = u32::from_str_radix(&digits, radix).unwrap_or(u32::MAX);
+    let mut used = digits_from + digits.len();
+    if rest.get(used) == Some(&';') {
+        used += 1;
+    }
+    Some((code_point(value), used))
+}
+
+fn decode_references(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '&' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let rest = &chars[i + 1..];
+        if rest.first() == Some(&'#')
+            && let Some((c, used)) = decode_numeric_reference(rest)
+        {
+            out.push(c);
+            i += 1 + used;
+            continue;
+        }
+        let name: String = rest
+            .iter()
+            .take(8)
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        let known = NAMED_REFERENCES.iter().find(|(n, _)| *n == name);
+        if let Some((_, c)) = known
+            && rest.get(name.len()) == Some(&';')
+        {
+            out.push(*c);
+            i += name.len() + 2;
+            continue;
+        }
+        out.push('&');
+        i += 1;
+    }
+    out
+}
+
+fn normalise_css(style: &str) -> String {
+    let chars: Vec<char> = style.chars().collect();
+    let mut out = String::with_capacity(style.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(chars.len());
+            }
+            '\\' => {
+                i += 1;
+                let hex: String = chars[i.min(chars.len())..]
+                    .iter()
+                    .take(6)
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .collect();
+                if hex.is_empty() {
+                    if let Some(&c) = chars.get(i) {
+                        out.push(c);
+                        i += 1;
+                    }
+                } else {
+                    out.push(code_point(u32::from_str_radix(&hex, 16).unwrap_or(0)));
+                    i += hex.len();
+                    if chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn strip_important(value: &str) -> &str {
+    value
+        .strip_suffix("important")
+        .map(str::trim_end)
+        .and_then(|rest| rest.strip_suffix('!'))
+        .map_or(value, str::trim)
+}
+
 fn style_hides(style: &str) -> bool {
     let mut colour = None;
     let mut background = None;
+    let style = normalise_css(style);
     for declaration in style.split(';') {
         let Some((name, value)) = declaration.split_once(':') else {
             continue;
         };
         let name = name.trim().to_ascii_lowercase();
         let lowered = value.trim().to_ascii_lowercase();
-        let value = lowered
-            .strip_suffix("!important")
-            .unwrap_or(&lowered)
-            .trim();
+        let value = strip_important(&lowered).trim();
         let hides = match name.as_str() {
             "display" => value == "none",
             "visibility" => value == "hidden",
@@ -250,7 +389,7 @@ fn parse_open_tag(chars: &[char], start: usize) -> OpenTag {
             i = skip_spaces(chars, i + 1);
             (value, i) = read_attribute_value(chars, i);
         }
-        if attr == "hidden" || (attr == "style" && style_hides(&value)) {
+        if attr == "hidden" || (attr == "style" && style_hides(&decode_references(&value))) {
             hidden = true;
         }
     }
@@ -262,9 +401,26 @@ fn parse_open_tag(chars: &[char], start: usize) -> OpenTag {
     }
 }
 
-fn find_comment_end(chars: &[char], from: usize) -> Option<usize> {
-    (from..chars.len().saturating_sub(2))
-        .find(|&k| chars[k] == '-' && chars[k + 1] == '-' && chars[k + 2] == '>')
+fn comment_bounds(chars: &[char], start: usize) -> (usize, usize) {
+    let n = chars.len();
+    let body = start + 4;
+    if chars.get(body) == Some(&'>') {
+        return (body, body + 1);
+    }
+    if chars.get(body) == Some(&'-') && chars.get(body + 1) == Some(&'>') {
+        return (body, body + 2);
+    }
+    for k in body..n.saturating_sub(2) {
+        if chars[k] == '-' && chars[k + 1] == '-' {
+            if chars[k + 2] == '>' {
+                return (k, k + 3);
+            }
+            if chars[k + 2] == '!' && chars.get(k + 3) == Some(&'>') {
+                return (k, k + 4);
+            }
+        }
+    }
+    (n, n)
 }
 
 fn find_tag_end(chars: &[char], from: usize) -> usize {
@@ -274,19 +430,10 @@ fn find_tag_end(chars: &[char], from: usize) -> usize {
 }
 
 fn next_token(chars: &[char], i: usize) -> Option<Token> {
-    let n = chars.len();
     let next = *chars.get(i + 1)?;
     if chars[i..].starts_with(&['<', '!', '-', '-']) {
-        return Some(match find_comment_end(chars, i + 4) {
-            Some(pos) => Token::Comment {
-                content_end: pos,
-                end: pos + 3,
-            },
-            None => Token::Comment {
-                content_end: n,
-                end: n,
-            },
-        });
+        let (content_end, end) = comment_bounds(chars, i);
+        return Some(Token::Comment { content_end, end });
     }
     if next == '!' || next == '?' {
         return Some(Token::Skip {
@@ -370,31 +517,98 @@ fn is_blank_line_after(chars: &[char], newline: usize) -> bool {
     m >= chars.len() || chars[m] == '\n' || chars[m] == '\r'
 }
 
-fn inline_code_end(chars: &[char], i: usize) -> usize {
-    let len = run_len(chars, i, '`');
-    let mut k = i + len;
-    while k < chars.len() {
-        match chars[k] {
-            '`' => {
-                let run = run_len(chars, k, '`');
-                if run == len {
-                    return k + run;
-                }
-                k += run;
-            }
-            '\n' | '\r' => {
-                if is_blank_line_after(chars, k) {
-                    break;
-                }
-                k += 1;
-            }
-            _ => k += 1,
-        }
-    }
-    i + len
+struct CodeIndex {
+    runs: HashMap<usize, Vec<usize>>,
+    breaks: Vec<usize>,
 }
 
-fn code_region(chars: &[char], i: usize) -> Option<usize> {
+impl CodeIndex {
+    fn build(chars: &[char], budget: &Budget) -> Option<CodeIndex> {
+        let mut runs: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut breaks = Vec::new();
+        let mut k = 0;
+        let mut ticks = 0usize;
+        while k < chars.len() {
+            if ticks.is_multiple_of(DEADLINE_STRIDE) && budget.deadline_exceeded() {
+                return None;
+            }
+            ticks += 1;
+            match chars[k] {
+                '`' => {
+                    let len = run_len(chars, k, '`');
+                    runs.entry(len).or_default().push(k);
+                    k += len;
+                    continue;
+                }
+                '\n' | '\r' if is_blank_line_after(chars, k) => breaks.push(k),
+                _ => {}
+            }
+            k += 1;
+        }
+        Some(CodeIndex { runs, breaks })
+    }
+
+    fn closing_run_end(&self, from: usize, len: usize) -> Option<usize> {
+        let barrier = self
+            .breaks
+            .get(self.breaks.partition_point(|&b| b < from))
+            .copied()
+            .unwrap_or(usize::MAX);
+        let starts = self.runs.get(&len)?;
+        let start = *starts.get(starts.partition_point(|&s| s < from))?;
+        (start < barrier).then_some(start + len)
+    }
+}
+
+fn inline_code_end(chars: &[char], index: &CodeIndex, i: usize) -> usize {
+    let len = run_len(chars, i, '`');
+    index.closing_run_end(i + len, len).unwrap_or(i + len)
+}
+
+fn find_ci(chars: &[char], from: usize, needle: &str) -> Option<usize> {
+    let needle: Vec<char> = needle.chars().collect();
+    let last = chars.len().checked_sub(needle.len())?;
+    (from..=last).find(|&k| {
+        needle
+            .iter()
+            .enumerate()
+            .all(|(o, c)| chars[k + o].to_ascii_lowercase() == *c)
+    })
+}
+
+fn html_block_end(chars: &[char], i: usize) -> Option<usize> {
+    let n = chars.len();
+    let indent = chars[i..].iter().take(3).take_while(|&&c| c == ' ').count();
+    let j = i + indent;
+    if chars.get(j) != Some(&'<')
+        || !chars
+            .get(j + 1)
+            .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'))
+    {
+        return None;
+    }
+    let after_line = |pos: usize| next_line(chars, line_end(chars, pos));
+    if chars[j..].starts_with(&['<', '!', '-', '-']) {
+        let (_, end) = comment_bounds(chars, j);
+        return Some(after_line(end.min(n)));
+    }
+    let (name, _) = read_name(chars, j + 1);
+    if matches!(name.as_str(), "pre" | "script" | "style" | "textarea") {
+        let close = format!("</{name}");
+        return Some(find_ci(chars, j, &close).map_or(n, after_line));
+    }
+    let mut k = after_line(j);
+    while k < n {
+        let end = line_end(chars, k);
+        if chars[k..end].iter().all(|c| c.is_whitespace()) {
+            return Some(k);
+        }
+        k = next_line(chars, end);
+    }
+    Some(n)
+}
+
+fn code_region(chars: &[char], index: &CodeIndex, i: usize) -> Option<usize> {
     if chars[i] == '\\' && chars.get(i + 1) == Some(&'`') {
         return Some(i + 2);
     }
@@ -404,7 +618,7 @@ fn code_region(chars: &[char], i: usize) -> Option<usize> {
         return Some(end);
     }
     if chars[i] == '`' {
-        return Some(inline_code_end(chars, i));
+        return Some(inline_code_end(chars, index, i));
     }
     None
 }
@@ -457,6 +671,9 @@ fn emit_comment(
     (start, content_end, end): (usize, usize, usize),
 ) {
     let content_start = (start + 4).min(content_end);
+    if content_start == content_end {
+        return;
+    }
     let text: String = chars[content_start..content_end].iter().collect();
     out.carriers.push(Carrier {
         kind: CarrierKind::HtmlComment,
@@ -519,6 +736,15 @@ pub fn scan_markup(doc: &TextDoc, budget: &mut Budget, flavour: Markup) -> Detec
     let mut stack: Vec<String> = Vec::new();
     let mut root: Option<Root> = None;
     let mut i = 0;
+    let mut index = None;
+    if flavour == Markup::Markdown {
+        index = CodeIndex::build(&chars, budget);
+        if index.is_none() {
+            out.skip = Some(SkipReason::Timeout);
+            return out;
+        }
+    }
+    let mut block_until = 0usize;
     let mut ticks = 0usize;
     while i < n {
         if ticks.is_multiple_of(DEADLINE_STRIDE) && budget.deadline_exceeded() {
@@ -526,12 +752,20 @@ pub fn scan_markup(doc: &TextDoc, budget: &mut Budget, flavour: Markup) -> Detec
             return out;
         }
         ticks += 1;
-        if flavour == Markup::Markdown
-            && let Some(end) = code_region(&chars, i)
-        {
-            push_text(&mut root, &chars[i..end]);
-            i = end;
-            continue;
+        if let Some(code) = &index {
+            if i >= block_until
+                && (i == 0 || matches!(chars[i - 1], '\n' | '\r'))
+                && let Some(end) = html_block_end(&chars, i)
+            {
+                block_until = end;
+            }
+            if stack.is_empty()
+                && i >= block_until
+                && let Some(end) = code_region(&chars, code, i)
+            {
+                i = end;
+                continue;
+            }
         }
         let token = if chars[i] == '<' {
             next_token(&chars, i)
@@ -948,5 +1182,129 @@ mod tests {
         let out = html(&format!("<!-- {body} -->"));
         assert_eq!(out.carriers[0].evidence.len(), 4096);
         assert_eq!(out.carriers[0].span.byte_end, 10_009);
+    }
+
+    fn m002_count(input: &str, flavour: Markup) -> usize {
+        run_with(input, flavour, &Limits::default())
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "M002")
+            .count()
+    }
+
+    #[test]
+    fn character_references_in_style_values_are_decoded() {
+        for style in [
+            "display&#58;none",
+            "display&colon;none",
+            "&#100;isplay:none",
+            "&#x64;isplay:none",
+            "display&#58none",
+            "display&#x3A;&Tab;none",
+            "opacity&colon;0",
+        ] {
+            let out = html(&format!("<i style=\"{style}\">t</i>"));
+            assert_eq!(out.findings.len(), 1, "{style}");
+        }
+        for style in ["display&foo;:none", "display&amp;colon;none"] {
+            let out = html(&format!("<i style=\"{style}\">t</i>"));
+            assert!(out.findings.is_empty(), "{style}");
+        }
+    }
+
+    #[test]
+    fn css_comments_escapes_and_spaced_important_are_normalised() {
+        for style in [
+            "display:/**/none",
+            r"display:n\6f ne",
+            "display:none ! important",
+            "display:none!IMPORTANT",
+            "display:none /* x */",
+            r"display:\6e one",
+            "dis/* x */play:none",
+            "display:none;/* never closed",
+        ] {
+            let out = html(&format!("<i style=\"{style}\">t</i>"));
+            assert_eq!(out.findings.len(), 1, "{style}");
+        }
+        for style in ["display:/* none */block", r"display:\62lock"] {
+            let out = html(&format!("<i style=\"{style}\">t</i>"));
+            assert!(out.findings.is_empty(), "{style}");
+        }
+    }
+
+    #[test]
+    fn short_comment_closers_end_the_comment() {
+        for input in [
+            "<!--> <span hidden>x</span>",
+            "<!---> <span hidden>x</span>",
+        ] {
+            let out = html(input);
+            assert_eq!(payloads(&out), vec![Some("x")], "{input}");
+            assert!(
+                out.carriers
+                    .iter()
+                    .all(|c| c.kind == CarrierKind::HiddenText)
+            );
+        }
+        let out = html("<!-- a --!> <span hidden>y</span>");
+        assert_eq!(payloads(&out), vec![Some("y")]);
+        let comments: Vec<&str> = out
+            .carriers
+            .iter()
+            .filter(|c| c.kind == CarrierKind::HtmlComment)
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(comments, vec!["a"]);
+        let out = html("<!---->z");
+        assert!(out.carriers.is_empty());
+        let out = html("<!-- -->z");
+        assert_eq!(out.carriers.len(), 1);
+    }
+
+    #[test]
+    fn markdown_code_inside_raw_html_is_not_skipped() {
+        for input in [
+            "<div>\n```\n<span hidden>secret</span>\n</div>\n",
+            "<div>\n```\n<span hidden>secret</span>\n```\n</div>\n",
+            "<div>`x <span hidden>secret</span> y`</div>",
+            "<div></div>\n```\n<span hidden>secret</span>\n```\n",
+            "<p>unclosed\n\n```\n<span hidden>secret</span>\n```\n",
+            "<pre>\n\n```\n<span hidden>secret</span>\n```\n</pre>\n",
+        ] {
+            assert_eq!(m002_count(input, Markup::Markdown), 1, "{input}");
+        }
+    }
+
+    #[test]
+    fn markdown_code_outside_raw_html_is_still_skipped() {
+        for input in [
+            "```\n<span hidden>secret</span>\n```\n",
+            "<div></div>\n\n```\n<span hidden>secret</span>\n```\n",
+            "text `<span hidden>secret</span>` text",
+            "<!-- c -->\n```\n<span hidden>secret</span>\n```\n",
+            "~~~\n<span hidden>secret</span>\n```\n~~~\n",
+            "```\n<span hidden>secret</span>\n``\n",
+            "<!-- multi\n\nline -->\n```\n<span hidden>secret</span>\n```\n",
+            "``` x\n<span hidden>secret</span>\n``` y\n```\n",
+            "`a\n\n`<span hidden>secret</span>`\n",
+        ] {
+            assert_eq!(m002_count(input, Markup::Markdown), 0, "{input}");
+        }
+    }
+
+    #[test]
+    fn backtick_run_ladder_with_zero_deadline_times_out() {
+        let limits = Limits {
+            per_file_time: Duration::ZERO,
+            ..Limits::default()
+        };
+        let mut input = String::new();
+        for k in 1..=1500 {
+            input.push_str(&"`".repeat(k));
+            input.push('a');
+        }
+        let out = run_with(&input, Markup::Markdown, &limits);
+        assert_eq!(out.skip, Some(SkipReason::Timeout));
     }
 }
