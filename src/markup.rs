@@ -566,7 +566,22 @@ pub fn scan_markup(doc: &TextDoc, budget: &mut Budget, flavour: Markup) -> Detec
                         emit_hidden(&mut out, doc, &chars, (i, tag.end), None);
                     }
                 } else if stack.len() >= max_depth {
-                    push_text(&mut root, &chars[i..tag.end]);
+                    if let Some(r) = root.take() {
+                        emit_hidden(&mut out, doc, &chars, (r.start, i), collapse(&r.text));
+                    }
+                    out.findings.push(RawFinding {
+                        rule_id: "L001",
+                        family: Family::L,
+                        base: Severity::Low,
+                        status: RuleStatus::Stable,
+                        span: span_of(doc, i, tag.end),
+                        carrier: CarrierKind::ResourceLimit,
+                        payload: None,
+                        message: "markup nesting limit".to_string(),
+                        evidence: encode(&chars[i..tag.end], doc.encoding),
+                    });
+                    out.skip = Some(SkipReason::SizeLimit);
+                    return out;
                 } else {
                     if tag.hidden && root.is_none() {
                         root = Some(Root {
@@ -678,15 +693,72 @@ mod tests {
         );
     }
 
+    fn nesting_limit_findings(out: &DetectorOutput) -> Vec<&RawFinding> {
+        out.findings
+            .iter()
+            .filter(|f| f.rule_id == "L001")
+            .collect()
+    }
+
+    #[test]
+    fn hidden_span_below_depth_limit_is_not_silent() {
+        let limits = Limits {
+            max_xml_depth: 8,
+            ..Limits::default()
+        };
+        let input = "<div>".repeat(300) + "<span style=\"display:none\">x</span>";
+        let out = run_with(&input, Markup::Html, &limits);
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(out.findings.len(), 1);
+        let f = &out.findings[0];
+        assert_eq!(f.rule_id, "L001");
+        assert_eq!(f.family, Family::L);
+        assert_eq!(f.base, Severity::Low);
+        assert_eq!(f.status, RuleStatus::Stable);
+        assert_eq!(f.carrier, CarrierKind::ResourceLimit);
+        assert_eq!(f.payload, None);
+        assert_eq!(f.message, "markup nesting limit");
+        assert_eq!((f.span.byte_start, f.span.byte_end), (40, 45));
+        assert_eq!((f.span.line, f.span.column), (Some(1), Some(41)));
+        assert_eq!(f.evidence, b"<div>".to_vec());
+    }
+
+    #[test]
+    fn hidden_ancestor_open_at_depth_limit_is_still_reported() {
+        let limits = Limits {
+            max_xml_depth: 3,
+            ..Limits::default()
+        };
+        let out = run_with(
+            "<span hidden>a<i><b>b<u>c</u></b></i></span>",
+            Markup::Html,
+            &limits,
+        );
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(out.findings.len(), 2);
+        let m = &out.findings[0];
+        assert_eq!(m.rule_id, "M002");
+        assert_eq!(m.payload.as_deref(), Some("ab"));
+        assert_eq!((m.span.byte_start, m.span.byte_end), (0, 21));
+        let l = &out.findings[1];
+        assert_eq!(l.rule_id, "L001");
+        assert_eq!((l.span.byte_start, l.span.byte_end), (21, 24));
+        assert_eq!(out.carriers.len(), 1);
+        assert!(out.carriers[0].hidden);
+    }
+
     #[test]
     fn unclosed_tags_do_not_panic_and_stay_bounded() {
         let deep = "<div>".repeat(5000) + "<b hidden>x";
         let out = html(&deep);
-        assert_eq!(out.skip, None);
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(nesting_limit_findings(&out).len(), 1);
+        assert_eq!(out.findings.len(), 1);
         let nested = "<p hidden>".repeat(100_000);
         let out = html(&nested);
-        assert_eq!(out.findings.len(), 1);
-        assert_eq!(out.skip, None);
+        assert_eq!(out.findings.len(), 2);
+        assert_eq!(nesting_limit_findings(&out).len(), 1);
+        assert_eq!(out.skip, Some(SkipReason::SizeLimit));
         let tiny = Limits {
             max_xml_depth: 1,
             ..Limits::default()
