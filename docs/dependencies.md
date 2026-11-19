@@ -49,3 +49,4 @@
 - Sources are vendored in `vendor/` and replaced in `.cargo/config.toml`, so builds run with `--offline`.
 - The dev container installs Debian packages (`build-essential`, `cmake`, `mingw-w64`, `pkg-config`, `libssl-dev`, `curl`, `git`) from the base image's Debian bookworm archive. They are not version-pinned.
 - Exceptions to the cooldown go in `supply-chain/cooldown-exceptions.toml`. The file is absent while there are none.
+- actions/upload-artifact v7.0.2 (`cf430e030ddbb5b0abf93d22962f4752f3646cd9`, published 2026-10-07) is used only by the temporary `vet-bootstrap` CI job. GitHub's own action, pinned by full commit SHA.
