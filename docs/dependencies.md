@@ -49,4 +49,13 @@
 - Sources are vendored in `vendor/` and replaced in `.cargo/config.toml`, so builds run with `--offline`.
 - The dev container installs Debian packages (`build-essential`, `cmake`, `mingw-w64`, `pkg-config`, `libssl-dev`, `curl`, `git`) from the base image's Debian bookworm archive. They are not version-pinned.
 - Exceptions to the cooldown go in `supply-chain/cooldown-exceptions.toml`. The file is absent while there are none.
-- actions/upload-artifact v7.0.2 (`cf430e030ddbb5b0abf93d22962f4752f3646cd9`, published 2026-10-07) is used only by the temporary `vet-bootstrap` CI job. GitHub's own action, pinned by full commit SHA.
+
+## cargo-vet
+
+- Imports: every audit set in cargo-vet's built-in registry, namely `actix`, `ariel-os`, `bytecode-alliance`, `embark-studios`, `fermyon`, `google`, `isrg`, `mozilla` and `zcash`.
+- Verification 1 (2026-11-19, cargo-vet 0.10.3): 4 of the 29 crates.io packages in `Cargo.lock` are fully audited through imports: `adler2`, `cpufeatures`, `quote` and `windows-link`. The other 25 are listed as exemptions in `supply-chain/config.toml`.
+
+## Crate-policy reviews pending
+
+Each exempted crate needs a summary from an agent with no tools, no network and no credentials, approved by the code owner's merge. Pending:
+`block-buffer`, `cfg-if`, `const-oid`, `crypto-common`, `digest`, `hybrid-array`, `itoa`, `libc`, `memchr`, `miniz_oxide`, `proc-macro2`, `quick-xml`, `same-file`, `serde`, `serde_core`, `serde_derive`, `serde_json`, `sha2`, `syn`, `typenum`, `unicode-ident`, `walkdir`, `winapi-util`, `windows-sys` and `zmij`.
