@@ -326,7 +326,7 @@ impl<'a> Avif<'a> {
                 true
             }
             None => {
-                self.sink.l001("metadata output limit", start, end);
+                self.sink.amplification(start, end);
                 self.sink.stop = true;
                 false
             }
@@ -526,7 +526,7 @@ impl<'a> Avif<'a> {
 mod tests {
     use super::*;
     use crate::limits::Limits;
-    use crate::model::{CarrierKind, SkipReason};
+    use crate::model::{CarrierKind, Family, RuleStatus, Severity, SkipReason};
     use std::time::Duration;
 
     const TIFF: [u8; 32] = [
@@ -961,7 +961,7 @@ mod tests {
             .sum();
         assert!(used <= bytes.len() * 2 + 64 * 1024);
         assert!(!out.carriers.is_empty());
-        assert!(out.findings.iter().any(|f| f.rule_id == "L001"));
+        assert!(out.findings.iter().any(|f| f.rule_id == "B003"));
         assert_eq!(out.skip, Some(SkipReason::SizeLimit));
     }
 
@@ -987,10 +987,30 @@ mod tests {
         let limits: Vec<_> = out
             .findings
             .iter()
-            .filter(|f| f.rule_id == "L001")
-            .map(|f| f.message.as_str())
+            .filter(|f| f.rule_id == "B003")
+            .map(|f| {
+                (
+                    f.family,
+                    f.base,
+                    f.status,
+                    f.carrier,
+                    f.payload.clone(),
+                    f.message.as_str(),
+                )
+            })
             .collect();
-        assert_eq!(limits, vec!["metadata output limit"]);
+        assert_eq!(
+            limits,
+            vec![(
+                Family::B,
+                Severity::High,
+                RuleStatus::Stable,
+                CarrierKind::ResourceLimit,
+                None,
+                "metadata amplification"
+            )]
+        );
+        assert!(out.findings.iter().all(|f| f.rule_id != "L001"));
     }
 
     #[test]

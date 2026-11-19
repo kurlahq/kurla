@@ -499,12 +499,13 @@ mod tests {
         assert_eq!(out.skip, Some(SkipReason::SizeLimit));
         assert_eq!(out.findings.len(), 1);
         let f = &out.findings[0];
-        assert_eq!(f.rule_id, "L001");
-        assert_eq!(f.family, Family::L);
-        assert_eq!(f.base, Severity::Low);
+        assert_eq!(f.rule_id, "B003");
+        assert_eq!(f.family, Family::B);
+        assert_eq!(f.base, Severity::High);
         assert_eq!(f.status, RuleStatus::Stable);
         assert_eq!(f.carrier, CarrierKind::ResourceLimit);
-        assert_eq!(f.message, "metadata output limit");
+        assert_eq!(f.payload, None);
+        assert_eq!(f.message, "metadata amplification");
     }
 
     #[test]

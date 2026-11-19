@@ -146,6 +146,21 @@ impl Sink {
         });
     }
 
+    pub(crate) fn amplification(&mut self, start: usize, end: usize) {
+        self.set_skip(SkipReason::SizeLimit);
+        self.out.findings.push(RawFinding {
+            rule_id: "B003",
+            family: Family::B,
+            base: Severity::High,
+            status: RuleStatus::Stable,
+            span: span(start, end),
+            carrier: CarrierKind::ResourceLimit,
+            payload: None,
+            message: "metadata amplification".to_string(),
+            evidence: Vec::new(),
+        });
+    }
+
     pub fn carrier(
         &mut self,
         label: &str,
@@ -165,7 +180,7 @@ impl Sink {
         let cost = full.len().saturating_add(evidence.len());
         if self.used.saturating_add(cost) > self.cap {
             self.stop = true;
-            self.l001("metadata output limit", start, end);
+            self.amplification(start, end);
             return false;
         }
         self.used += cost;
