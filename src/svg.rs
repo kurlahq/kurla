@@ -1,7 +1,8 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesPI, BytesStart, Event};
 use quick_xml::reader::Reader;
 
 use crate::limits::{Budget, Limits};
@@ -27,6 +28,8 @@ const ACTIVE_PREFIXES: [&str; 6] = [
     "data:text/html",
     "javascript:",
 ];
+const DECLARED_ACTIVE_PREFIXES: [&str; 2] = ["javascript:", "data:text/html"];
+const EXTERNAL_PREFIXES: [&str; 4] = ["http:", "https:", "//", "file:"];
 const PREDEFINED_REFERENCES: [(&str, char); 5] = [
     ("amp;", '&'),
     ("lt;", '<'),
@@ -306,7 +309,35 @@ fn decode_reference(rest: &str) -> Option<(char, usize)> {
         .map(|(name, c)| (*c, name.len()))
 }
 
-fn decode_entities(raw: &str) -> Cow<'_, str> {
+struct Subst {
+    values: HashMap<String, String>,
+    spent: Cell<u64>,
+}
+
+impl Subst {
+    fn none() -> Subst {
+        Subst {
+            values: HashMap::new(),
+            spent: Cell::new(0),
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<&str> {
+        let value = self.values.get(name)?;
+        let spent = self.spent.get().saturating_add(value.len() as u64);
+        if spent > MAX_EXPANSION {
+            return None;
+        }
+        self.spent.set(spent);
+        Some(value)
+    }
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')
+}
+
+fn decode_entities<'a>(raw: &'a str, subst: &Subst) -> Cow<'a, str> {
     if !raw.contains('&') {
         return Cow::Borrowed(raw);
     }
@@ -315,13 +346,21 @@ fn decode_entities(raw: &str) -> Cow<'_, str> {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at + 1..];
-        match decode_reference(rest) {
-            Some((c, used)) => {
-                out.push(c);
-                rest = &rest[used..];
-            }
-            None => out.push('&'),
+        if let Some((c, used)) = decode_reference(rest) {
+            out.push(c);
+            rest = &rest[used..];
+            continue;
         }
+        let end = rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len());
+        if end > 0
+            && rest[end..].starts_with(';')
+            && let Some(value) = subst.lookup(&rest[..end])
+        {
+            out.push_str(value);
+            rest = &rest[end + 1..];
+            continue;
+        }
+        out.push('&');
     }
     out.push_str(rest);
     Cow::Owned(out)
@@ -385,11 +424,12 @@ fn strip_important(value: &str) -> &str {
 struct Attr {
     name: String,
     raw: String,
+    value: String,
 }
 
 impl Attr {
     fn value(&self) -> Cow<'_, str> {
-        decode_entities(&self.raw)
+        Cow::Borrowed(&self.value)
     }
 }
 
@@ -398,16 +438,19 @@ enum AttrError {
     Malformed,
 }
 
-fn collect_attrs(element: &BytesStart, max: usize) -> Result<Vec<Attr>, AttrError> {
+fn collect_attrs(element: &BytesStart, max: usize, subst: &Subst) -> Result<Vec<Attr>, AttrError> {
     let mut attrs = Vec::new();
     for attr in element.attributes().with_checks(false) {
         let attr = attr.map_err(|_| AttrError::Malformed)?;
         if attrs.len() >= max {
             return Err(AttrError::Limit);
         }
+        let raw = attr.value.into_owned();
+        let value = decode_entities(&raw, subst).into_owned();
         attrs.push(Attr {
             name: attr.key.as_ref().to_string(),
-            raw: attr.value.into_owned(),
+            raw,
+            value,
         });
     }
     Ok(attrs)
@@ -664,6 +707,8 @@ fn prepass(text: &str, budget: &Budget, limits: &Limits) -> Option<Prepass> {
     };
     let mut seen_svg = false;
     let mut background_seen = false;
+    let mut subst = Subst::none();
+    let mut doctype_seen = false;
     let mut events = 0usize;
     loop {
         if events.is_multiple_of(DEADLINE_STRIDE) && budget.deadline_exceeded() {
@@ -680,13 +725,24 @@ fn prepass(text: &str, budget: &Budget, limits: &Limits) -> Option<Prepass> {
                 stack.pop();
                 continue;
             }
+            Event::DocType(d) => {
+                if !doctype_seen {
+                    doctype_seen = true;
+                    let mut dtd = Dtd::default();
+                    if !dtd.parse(&d, budget) {
+                        return None;
+                    }
+                    subst = dtd.take_substitutions();
+                }
+                continue;
+            }
             Event::Eof => break,
             _ => continue,
         };
         if stack.len() + 1 > max_depth {
             break;
         }
-        let Ok(attrs) = collect_attrs(&element, max_attrs) else {
+        let Ok(attrs) = collect_attrs(&element, max_attrs, &subst) else {
             break;
         };
         let name = local_name(&element);
@@ -746,9 +802,7 @@ fn prepass(text: &str, budget: &Budget, limits: &Limits) -> Option<Prepass> {
 
 fn entity_refs(text: &str) -> impl Iterator<Item = &str> {
     text.split('&').skip(1).filter_map(|part| {
-        let end = part
-            .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')))
-            .unwrap_or(part.len());
+        let end = part.find(|c: char| !is_name_char(c)).unwrap_or(part.len());
         (end > 0 && part[end..].starts_with(';')).then_some(&part[..end])
     })
 }
@@ -787,9 +841,17 @@ fn skip_spaces(body: &[u8], mut i: usize) -> usize {
     i
 }
 
+enum Issue {
+    Active(String),
+    Text(String),
+}
+
 #[derive(Default)]
 struct Dtd {
     span: Option<Span>,
+    values: HashMap<String, String>,
+    issues: Vec<Issue>,
+    aborted: bool,
     declarations: u64,
     entities: HashMap<String, u64>,
     referenced: HashSet<String>,
@@ -870,6 +932,7 @@ impl Dtd {
         let name = &doctype[name_start..j];
         j = skip_spaces(body, j);
         let mut value = None;
+        let mut external = false;
         if let Some(&q) = body.get(j)
             && (q == b'"' || q == b'\'')
         {
@@ -880,17 +943,62 @@ impl Dtd {
                 .map_or(body.len(), |p| from + p);
             value = Some(&doctype[from..to]);
             j = (to + 1).min(body.len());
+        } else {
+            let word = body[j.min(body.len())..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphabetic())
+                .count();
+            let word = &doctype[j.min(body.len())..j.min(body.len()) + word];
+            external = word == "SYSTEM" || word == "PUBLIC";
         }
         self.declarations = self.declarations.saturating_add(1);
+        if external {
+            self.issues
+                .push(Issue::Active(format!("external entity {name}")));
+        }
         if !parameter {
+            let first = !self.entities.contains_key(name);
             self.entities
                 .entry(name.to_string())
                 .or_insert(value.map_or(0, |v| v.len() as u64));
             for reference in value.into_iter().flat_map(entity_refs) {
                 self.referenced.insert(reference.to_string());
             }
+            if first && let Some(raw) = value {
+                let decoded = decode_entities(raw, &Subst::none()).into_owned();
+                self.inspect(name, &decoded);
+                self.values.insert(name.to_string(), decoded);
+            }
         }
         skip_declaration(body, j, ticks, budget)
+    }
+
+    fn inspect(&mut self, name: &str, value: &str) {
+        let lower = value.to_ascii_lowercase();
+        if lower.contains("<script")
+            || has_event_markup(&lower)
+            || has_prefix(value, &DECLARED_ACTIVE_PREFIXES)
+        {
+            let shown: String = value.chars().take(PAYLOAD_VALUE_CAP).collect();
+            self.issues
+                .push(Issue::Active(format!("entity {name}={shown}")));
+        } else if value.contains('<') {
+            self.issues.push(Issue::Text(value.to_string()));
+        }
+    }
+
+    fn take_substitutions(&mut self) -> Subst {
+        let nested = self
+            .referenced
+            .iter()
+            .any(|name| self.entities.contains_key(name));
+        if self.aborted || nested || self.declarations > MAX_ENTITY_DECLARATIONS {
+            return Subst::none();
+        }
+        Subst {
+            values: std::mem::take(&mut self.values),
+            spent: Cell::new(0),
+        }
     }
 
     fn count_references(&mut self, text: &str) {
@@ -909,6 +1017,9 @@ impl Dtd {
     }
 
     fn verdict(&self) -> Option<String> {
+        if self.aborted {
+            return None;
+        }
         let mut reasons = Vec::new();
         if self.declarations > MAX_ENTITY_DECLARATIONS {
             reasons.push(format!("{} entity declarations", self.declarations));
@@ -966,14 +1077,45 @@ fn collapse(text: &str) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
-fn is_active_href(value: &str) -> bool {
+fn has_prefix(value: &str, prefixes: &[&str]) -> bool {
     let head: String = value
         .chars()
         .filter(|c| !(c.is_ascii_whitespace() || u32::from(*c) < 0x20))
         .take(ACTIVE_PREFIX_WINDOW)
         .map(|c| c.to_ascii_lowercase())
         .collect();
-    ACTIVE_PREFIXES.iter().any(|p| head.starts_with(p))
+    prefixes.iter().any(|p| head.starts_with(p))
+}
+
+fn is_active_href(value: &str) -> bool {
+    has_prefix(value, &ACTIVE_PREFIXES)
+}
+
+fn has_event_attr(segment: &str) -> bool {
+    let b = segment.as_bytes();
+    (1..b.len()).any(|i| {
+        let separated = b[i - 1].is_ascii_whitespace() || matches!(b[i - 1], b'"' | b'\'' | b'/');
+        if !separated || !b[i..].starts_with(b"on") {
+            return false;
+        }
+        let mut k = i + 2;
+        while b.get(k).is_some_and(u8::is_ascii_alphabetic) {
+            k += 1;
+        }
+        if k == i + 2 {
+            return false;
+        }
+        while b.get(k).is_some_and(u8::is_ascii_whitespace) {
+            k += 1;
+        }
+        b.get(k) == Some(&b'=')
+    })
+}
+
+fn has_event_markup(text: &str) -> bool {
+    text.split('<')
+        .skip(1)
+        .any(|tag| has_event_attr(tag.split('>').next().unwrap_or("")))
 }
 
 fn is_label_attribute(name: &str) -> bool {
@@ -1014,6 +1156,7 @@ struct Scanner<'a> {
     pending: Option<Pending>,
     hidden_root: Option<HiddenRoot>,
     dtd: Dtd,
+    subst: Subst,
 }
 
 impl Scanner<'_> {
@@ -1118,6 +1261,70 @@ impl Scanner<'_> {
         }
     }
 
+    fn after_doctype(&mut self, span: Span) {
+        for issue in std::mem::take(&mut self.dtd.issues) {
+            match issue {
+                Issue::Active(payload) => self.finding(
+                    &ACTIVE_CONTENT,
+                    span,
+                    Some(payload),
+                    "entity declaration with active or external content",
+                ),
+                Issue::Text(text) => self.carrier(text, span, false),
+            }
+        }
+        self.subst = self.dtd.take_substitutions();
+    }
+
+    fn animation(&mut self, name: &str, attrs: &[Attr], span: Span) {
+        if !matches!(name, "set" | "animate" | "animateTransform") {
+            return;
+        }
+        let Some(target) = attr_value(attrs, "attributeName") else {
+            return;
+        };
+        let lowered = target.trim().to_ascii_lowercase();
+        let payload = if lowered.starts_with("on") {
+            Some(format!("attributeName={}", target.trim()))
+        } else if lowered == "href" || lowered.ends_with(":href") {
+            ["to", "from", "by", "values"].iter().find_map(|key| {
+                let value = attr_value(attrs, key)?;
+                value.split(';').any(is_active_href).then(|| {
+                    let shown: String = value.chars().take(PAYLOAD_VALUE_CAP).collect();
+                    format!("{key}={shown}")
+                })
+            })
+        } else {
+            None
+        };
+        if let Some(payload) = payload {
+            self.finding(
+                &ACTIVE_CONTENT,
+                span,
+                Some(payload),
+                "animation sets an event handler or active link",
+            );
+        }
+    }
+
+    fn stylesheet(&mut self, instruction: &BytesPI, span: Span) {
+        if instruction.target() != "xml-stylesheet" {
+            return;
+        }
+        for attr in instruction.attributes().with_checks(false).flatten() {
+            let value = decode_entities(&attr.value, &Subst::none()).into_owned();
+            if attr.key.as_ref() == "href" && has_prefix(&value, &EXTERNAL_PREFIXES) {
+                let shown: String = value.chars().take(PAYLOAD_VALUE_CAP).collect();
+                self.finding(
+                    &ACTIVE_CONTENT,
+                    span,
+                    Some(format!("href={shown}")),
+                    "stylesheet processing instruction loads an external file",
+                );
+            }
+        }
+    }
+
     fn element(
         &mut self,
         element: &BytesStart,
@@ -1133,7 +1340,7 @@ impl Scanner<'_> {
             self.limit_hit(span, "element nesting exceeds the depth limit");
             return false;
         }
-        let attrs = match collect_attrs(element, max_attrs) {
+        let attrs = match collect_attrs(element, max_attrs, &self.subst) {
             Ok(attrs) => attrs,
             Err(AttrError::Limit) => {
                 self.limit_hit(span, "element has more attributes than the limit");
@@ -1145,6 +1352,7 @@ impl Scanner<'_> {
         for attr in &attrs {
             self.dtd.count_references(&attr.raw);
         }
+        self.animation(&name, &attrs, span);
         if name.eq_ignore_ascii_case("script") {
             self.finding(
                 &ACTIVE_CONTENT,
@@ -1235,6 +1443,7 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
         pending: None,
         hidden_root: None,
         dtd: Dtd::default(),
+        subst: Subst::none(),
     };
     let mut reader = Reader::from_str(text);
     let mut stack: Vec<Style> = Vec::new();
@@ -1263,7 +1472,11 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
             Event::CData(c) => scanner.append(start, end, &c),
             Event::GeneralRef(r) => {
                 scanner.dtd.reference(&r);
-                scanner.append(start, end, &decode_entities(&format!("&{};", &*r)));
+                let piece = match scanner.subst.lookup(&r) {
+                    Some(value) => value.to_string(),
+                    None => decode_entities(&format!("&{};", &*r), &Subst::none()).into_owned(),
+                };
+                scanner.append(start, end, &piece);
             }
             Event::Start(e) => {
                 let span = scanner.span(start, end);
@@ -1298,12 +1511,18 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
                     let span = scanner.span(start, end);
                     scanner.dtd.span = Some(span);
                     if !scanner.dtd.parse(&d, budget) {
+                        scanner.dtd.aborted = true;
                         scanner.out.skip = Some(SkipReason::Timeout);
                         break;
                     }
+                    scanner.after_doctype(span);
                 }
             }
-            Event::Decl(_) | Event::PI(_) => {}
+            Event::PI(p) => {
+                let span = scanner.span(start, end);
+                scanner.stylesheet(&p, span);
+            }
+            Event::Decl(_) => {}
             Event::Eof => break,
         }
     }
@@ -1926,8 +2145,9 @@ mod tests {
         let out = scan(
             "<!DOCTYPE svg SYSTEM \"a>b.dtd\" [<!ENTITY a \"x>y<z\"><!ENTITY b SYSTEM \"f.ent\"><!ATTLIST svg q CDATA \"<!ENTITY\">]><svg><title>t</title></svg>",
         );
-        assert!(out.findings.is_empty());
-        assert_eq!(out.carriers[0].text, "t");
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(rule(&out, "S003").len(), 1);
+        assert!(out.carriers.iter().any(|c| c.text == "t"));
     }
 
     #[test]
@@ -2010,5 +2230,157 @@ mod tests {
         assert_eq!(out.skip, Some(SkipReason::Unreadable));
         assert!(out.findings.is_empty());
         assert!(out.carriers.is_empty());
+    }
+
+    #[test]
+    fn entity_holding_javascript_scheme_is_flagged_at_declaration_and_use() {
+        let out = scan(
+            "<!DOCTYPE svg [<!ENTITY j \"javascript:alert(1)\">]><svg><a href=\"&j;\"/></svg>",
+        );
+        assert_eq!(rule(&out, "S003").len(), 2);
+        assert!(payloads(&out, "S003").contains(&"href=javascript:alert(1)"));
+        assert!(rule(&out, "S004").is_empty());
+    }
+
+    #[test]
+    fn entity_holding_script_markup_is_s003_and_substituted_into_text() {
+        let out =
+            scan("<!DOCTYPE svg [<!ENTITY j \"<script>alert(1)</script>\">]><svg><g>&j;</g></svg>");
+        assert_eq!(rule(&out, "S003").len(), 1);
+        assert_eq!(out.findings.len(), 1);
+        assert!(
+            out.carriers
+                .iter()
+                .any(|c| c.text == "<script>alert(1)</script>" && !c.hidden)
+        );
+    }
+
+    #[test]
+    fn entity_holding_event_handler_markup_is_s003() {
+        let out = scan("<!DOCTYPE svg [<!ENTITY j \"<g onclick='x()'/>\">]><svg/>");
+        assert_eq!(rule(&out, "S003").len(), 1);
+    }
+
+    #[test]
+    fn entity_holding_plain_markup_becomes_a_visible_carrier() {
+        let out = scan("<!DOCTYPE svg [<!ENTITY j \"a &lt;b&gt; c\">]><svg/>");
+        assert!(out.findings.is_empty());
+        assert_eq!(out.carriers.len(), 1);
+        assert_eq!(out.carriers[0].text, "a <b> c");
+        assert!(!out.carriers[0].hidden);
+    }
+
+    #[test]
+    fn entity_in_style_attribute_is_substituted_before_checking() {
+        let out = scan(
+            "<!DOCTYPE svg [<!ENTITY hide \"opacity:0\">]><svg><text x=\"1\" y=\"2\" style=\"&hide;\">t</text></svg>",
+        );
+        assert_eq!(payloads(&out, "S002"), vec!["t"]);
+    }
+
+    #[test]
+    fn entity_in_background_fill_is_substituted_in_the_prepass() {
+        let out = scan(
+            "<!DOCTYPE svg [<!ENTITY w \"white\">]><svg viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"&w;\"/><text x=\"1\" y=\"2\" fill=\"white\">t</text></svg>",
+        );
+        assert_eq!(payloads(&out, "S002"), vec!["t"]);
+    }
+
+    #[test]
+    fn entity_text_in_title_is_substituted_into_the_carrier() {
+        let out =
+            scan("<!DOCTYPE svg [<!ENTITY t \"secret words\">]><svg><title>a &t; b</title></svg>");
+        assert!(out.findings.is_empty());
+        assert_eq!(out.carriers[0].text, "a secret words b");
+    }
+
+    #[test]
+    fn entities_stay_literal_when_the_dtd_is_a_bomb() {
+        let out = scan(
+            "<!DOCTYPE svg [<!ENTITY a \"javascript:x\"><!ENTITY b \"&a;\">]><svg><a href=\"&a;\"/><title>&a;</title></svg>",
+        );
+        let ids: Vec<_> = out.findings.iter().map(|f| f.rule_id).collect();
+        assert!(ids.contains(&"S004"));
+        assert_eq!(rule(&out, "S003").len(), 1);
+        assert!(out.carriers.iter().any(|c| c.text == "&a;"));
+    }
+
+    #[test]
+    fn substitution_work_is_bounded_by_the_expansion_budget() {
+        let value = "a".repeat(1024);
+        let src = format!(
+            "<!DOCTYPE svg [<!ENTITY big \"{value}\">]><svg><title>{}</title></svg>",
+            "&big;".repeat(5000)
+        );
+        let out = scan(&src);
+        assert_eq!(rule(&out, "S004").len(), 1);
+        let title = out.carriers.iter().find(|c| c.text.contains('a')).unwrap();
+        assert_eq!(title.text.matches(&value).count(), 1024);
+        assert_eq!(title.text.matches("&big;").count(), 5000 - 1024);
+    }
+
+    #[test]
+    fn external_entities_are_s003_but_the_doctype_external_id_is_not() {
+        let out = scan("<!DOCTYPE svg [<!ENTITY x SYSTEM \"file:///etc/passwd\">]><svg>&x;</svg>");
+        assert_eq!(rule(&out, "S003").len(), 1);
+        let out =
+            scan("<!DOCTYPE svg [<!ENTITY % p PUBLIC \"-//X//EN\" \"http://x/y.ent\">]><svg/>");
+        assert_eq!(rule(&out, "S003").len(), 1);
+        let out = scan(
+            "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\"><svg/>",
+        );
+        assert!(out.findings.is_empty());
+        let out = scan(
+            "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\" []><svg/>",
+        );
+        assert!(out.findings.is_empty());
+    }
+
+    #[test]
+    fn animation_elements_can_set_event_handlers_and_active_links() {
+        let flagged = [
+            "<animate attributeName=\"href\" values=\"#a;javascript:x\"/>",
+            "<animate attributeName=\"xlink:href\" to=\"https://x/y\"/>",
+            "<set attributeName=\"href\" from=\"//x\"/>",
+            "<animateTransform attributeName=\"href\" by=\"JavaScript:x\"/>",
+            "<set attributeName=\"onmouseover\" to=\"alert(1)\"/>",
+            "<animate attributeName=\"OnClick\" values=\"a;b\"/>",
+        ];
+        for body in flagged {
+            let out = scan(&wrap(body));
+            assert_eq!(rule(&out, "S003").len(), 1, "{body}");
+        }
+        let benign = [
+            "<animate attributeName=\"href\" values=\"#a;#b\"/>",
+            "<animate attributeName=\"fill\" to=\"javascript:x\"/>",
+            "<set attributeName=\"opacity\" to=\"0\"/>",
+        ];
+        for body in benign {
+            let out = scan(&wrap(body));
+            assert!(rule(&out, "S003").is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn stylesheet_processing_instruction_with_external_href_is_s003() {
+        let out = scan("<?xml-stylesheet href=\"https://x/y.css\" type=\"text/css\"?><svg/>");
+        assert_eq!(rule(&out, "S003").len(), 1);
+        let out = scan("<?xml-stylesheet type=\"text/css\" href=\" //x/y.css\"?><svg/>");
+        assert_eq!(rule(&out, "S003").len(), 1);
+        let out = scan("<?xml-stylesheet href=\"local.css\"?><svg/>");
+        assert!(out.findings.is_empty());
+        let out = scan("<?other href=\"https://x/y.css\"?><svg/>");
+        assert!(out.findings.is_empty());
+    }
+
+    #[test]
+    fn timeout_with_a_large_dtd_emits_no_s004() {
+        let limits = Limits {
+            per_file_time: Duration::ZERO,
+            ..Limits::default()
+        };
+        let out = scan_bytes(entity_doc(5000, "").as_bytes(), &limits);
+        assert_eq!(out.skip, Some(SkipReason::Timeout));
+        assert!(rule(&out, "S004").is_empty());
     }
 }
