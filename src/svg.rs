@@ -9,6 +9,7 @@ use crate::model::{
     Carrier, CarrierKind, DetectorOutput, Family, RawFinding, RuleStatus, Severity, SkipReason,
     Span,
 };
+use crate::text::TextDoc;
 
 const EVIDENCE_CAP: usize = 4096;
 const DEADLINE_STRIDE: usize = 1024;
@@ -926,39 +927,37 @@ impl Dtd {
     }
 }
 
-struct Locator<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    line: u32,
-    column: u32,
+struct CharCursor<'a> {
+    text: &'a str,
+    byte: usize,
+    chars: usize,
 }
 
-impl Locator<'_> {
-    fn at(&mut self, to: usize) -> (u32, u32) {
-        let to = to.min(self.bytes.len());
-        while self.pos < to {
-            let byte = self.bytes[self.pos];
-            if byte == b'\n' {
-                self.line = self.line.saturating_add(1);
-                self.column = 1;
-            } else if byte & 0xC0 != 0x80 {
-                self.column = self.column.saturating_add(1);
-            }
-            self.pos += 1;
+impl CharCursor<'_> {
+    fn at(&mut self, to: usize) -> usize {
+        let to = to.min(self.text.len());
+        if to > self.byte {
+            self.chars += self.text.as_bytes()[self.byte..to]
+                .iter()
+                .filter(|b| **b & 0xC0 != 0x80)
+                .count();
+            self.byte = to;
         }
-        (self.line, self.column)
+        self.chars
     }
 }
 
 struct Pending {
     text: String,
-    span: Span,
+    char_start: usize,
+    char_end: usize,
     hidden: bool,
 }
 
 struct HiddenRoot {
     depth: usize,
     span: Span,
+    char_start: usize,
     text: String,
 }
 
@@ -1008,8 +1007,10 @@ fn is_hidden(style: &Style, pre: &Prepass) -> bool {
 
 struct Scanner<'a> {
     bytes: &'a [u8],
+    doc: &'a TextDoc,
     out: DetectorOutput,
-    locator: Locator<'a>,
+    cursor: CharCursor<'a>,
+    span_char_start: usize,
     pending: Option<Pending>,
     hidden_root: Option<HiddenRoot>,
     dtd: Dtd,
@@ -1017,10 +1018,18 @@ struct Scanner<'a> {
 
 impl Scanner<'_> {
     fn span(&mut self, start: usize, end: usize) -> Span {
-        let (line, column) = self.locator.at(start);
+        let char_start = self.cursor.at(start);
+        let char_end = self.cursor.at(end);
+        self.span_char_start = char_start;
+        self.chars_span(char_start, char_end)
+    }
+
+    fn chars_span(&self, char_start: usize, char_end: usize) -> Span {
+        let (byte_start, byte_end) = self.doc.byte_span(char_start, char_end);
+        let (line, column) = self.doc.position(char_start);
         Span {
-            byte_start: start as u64,
-            byte_end: end as u64,
+            byte_start,
+            byte_end,
             line: Some(line),
             column: Some(column),
         }
@@ -1068,18 +1077,17 @@ impl Scanner<'_> {
     }
 
     fn append(&mut self, start: usize, end: usize, piece: &str) {
-        if self.pending.is_none() {
-            let span = self.span(start, start);
-            self.pending = Some(Pending {
-                text: String::new(),
-                span,
-                hidden: self.hidden_root.is_some(),
-            });
-        }
-        if let Some(pending) = &mut self.pending {
-            pending.text.push_str(piece);
-            pending.span.byte_end = end as u64;
-        }
+        let char_start = self.cursor.at(start);
+        let char_end = self.cursor.at(end);
+        let hidden = self.hidden_root.is_some();
+        let pending = self.pending.get_or_insert(Pending {
+            text: String::new(),
+            char_start,
+            char_end,
+            hidden,
+        });
+        pending.text.push_str(piece);
+        pending.char_end = char_end;
         if let Some(root) = &mut self.hidden_root {
             root.text.push_str(piece);
         }
@@ -1089,7 +1097,8 @@ impl Scanner<'_> {
         if let Some(pending) = self.pending.take()
             && !pending.text.trim().is_empty()
         {
-            self.carrier(pending.text, pending.span, pending.hidden);
+            let span = self.chars_span(pending.char_start, pending.char_end);
+            self.carrier(pending.text, span, pending.hidden);
         }
     }
 
@@ -1097,7 +1106,8 @@ impl Scanner<'_> {
         let Some(mut root) = self.hidden_root.take() else {
             return;
         };
-        root.span.byte_end = end as u64;
+        let char_end = self.cursor.at(end);
+        root.span.byte_end = self.chars_span(root.char_start, char_end).byte_end;
         if let Some(payload) = collapse(&root.text) {
             self.finding(
                 &HIDDEN_TEXT,
@@ -1188,22 +1198,12 @@ impl Scanner<'_> {
                 self.hidden_root = Some(HiddenRoot {
                     depth: stack.len(),
                     span,
+                    char_start: self.span_char_start,
                     text: String::new(),
                 });
             }
         }
         true
-    }
-}
-
-fn decode_input(bytes: &[u8]) -> (&str, usize) {
-    let valid = match std::str::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(e) => std::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or(""),
-    };
-    match valid.strip_prefix('\u{feff}') {
-        Some(text) => (text, 3),
-        None => (valid, 0),
     }
 }
 
@@ -1213,20 +1213,25 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
         carriers: Vec::new(),
         skip: None,
     };
-    let (text, base) = decode_input(bytes);
+    let Some(doc) = TextDoc::decode(bytes) else {
+        out.skip = Some(SkipReason::Unreadable);
+        return out;
+    };
+    let text = doc.text.as_str();
     let Some(pre) = prepass(text, budget, limits) else {
         out.skip = Some(SkipReason::Timeout);
         return out;
     };
     let mut scanner = Scanner {
         bytes,
+        doc: &doc,
         out,
-        locator: Locator {
-            bytes,
-            pos: 0,
-            line: 1,
-            column: 1,
+        cursor: CharCursor {
+            text,
+            byte: 0,
+            chars: 0,
         },
+        span_char_start: 0,
         pending: None,
         hidden_root: None,
         dtd: Dtd::default(),
@@ -1234,18 +1239,18 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
     let mut reader = Reader::from_str(text);
     let mut stack: Vec<Style> = Vec::new();
     let mut events = 0usize;
-    let mut last_end = base;
+    let mut last_end = 0;
     loop {
         if events.is_multiple_of(DEADLINE_STRIDE) && budget.deadline_exceeded() {
             scanner.out.skip = Some(SkipReason::Timeout);
             break;
         }
         events += 1;
-        let start = base + usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
+        let start = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
         let Ok(event) = reader.read_event() else {
             break;
         };
-        let end = base + usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
+        let end = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
         last_end = end;
         if !matches!(
             event,
@@ -1933,5 +1938,77 @@ mod tests {
         assert_eq!(rule(&out, "S004").len(), 1);
         assert_eq!(rule(&out, "S003").len(), 1);
         assert_eq!(out.carriers[0].text, "after");
+    }
+
+    fn utf16_with_bom(text: &str, big_endian: bool) -> Vec<u8> {
+        let mut bytes = if big_endian {
+            vec![0xFE, 0xFF]
+        } else {
+            vec![0xFF, 0xFE]
+        };
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&if big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            });
+        }
+        bytes
+    }
+
+    #[test]
+    fn utf16le_svg_with_bom_is_scanned_for_active_content() {
+        let src = "<svg onload=\"x()\"/>";
+        let out = scan_bytes(&utf16_with_bom(src, false), &Limits::default());
+        let found = rule(&out, "S003");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].payload.as_deref(), Some("onload=x()"));
+        assert_eq!(found[0].span.byte_start, 2);
+        assert_eq!(found[0].span.byte_end, 2 + 2 * src.len() as u64);
+        assert_eq!(found[0].span.line, Some(1));
+        assert_eq!(found[0].span.column, Some(1));
+        assert_eq!(found[0].evidence.len(), 2 * src.len());
+        assert_eq!(out.skip, None);
+    }
+
+    #[test]
+    fn utf16be_svg_with_bom_reports_hidden_text_in_original_bytes() {
+        let src = "<svg viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\" fill=\"white\"/><text x=\"1\" y=\"2\" fill=\"white\">hi</text></svg>";
+        let out = scan_bytes(&utf16_with_bom(src, true), &Limits::default());
+        let found = rule(&out, "S002");
+        assert_eq!(found.len(), 1);
+        let text_at = src.find("<text").unwrap() as u64;
+        let text_end = (src.find("</text>").unwrap() + "</text>".len()) as u64;
+        assert_eq!(found[0].span.byte_start, 2 + 2 * text_at);
+        assert_eq!(found[0].span.byte_end, 2 + 2 * text_end);
+        assert_eq!(found[0].span.column, Some(text_at as u32 + 1));
+        assert_eq!(found[0].payload.as_deref(), Some("hi"));
+        let hidden = hidden_carriers(&out);
+        assert_eq!(hidden.len(), 1);
+        let hi_at = src.find(">hi<").unwrap() as u64 + 1;
+        assert_eq!(hidden[0].span.byte_start, 2 + 2 * hi_at);
+        assert_eq!(hidden[0].span.byte_end, 2 + 2 * hi_at + 4);
+        assert_eq!(hidden[0].evidence, vec![0x00, b'h', 0x00, b'i']);
+    }
+
+    #[test]
+    fn utf8_bom_shifts_carrier_spans_by_three() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"<svg><title>Hi</title></svg>");
+        let out = scan_bytes(&bytes, &Limits::default());
+        let title = out.carriers.iter().find(|c| c.text == "Hi").unwrap();
+        assert_eq!(title.span.byte_start, 15);
+        assert_eq!(title.span.byte_end, 17);
+        assert_eq!(title.span.line, Some(1));
+        assert_eq!(title.span.column, Some(13));
+    }
+
+    #[test]
+    fn binary_garbage_is_unreadable_without_panic() {
+        let bytes: Vec<u8> = [0x80u8, 0x81, 0x02, 0x03, 0x90, 0x91, 0x05, 0x06].repeat(64);
+        let out = scan_bytes(&bytes, &Limits::default());
+        assert_eq!(out.skip, Some(SkipReason::Unreadable));
+        assert!(out.findings.is_empty());
+        assert!(out.carriers.is_empty());
     }
 }
