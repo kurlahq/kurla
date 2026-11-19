@@ -1,9 +1,11 @@
+pub mod bmff;
 pub mod exif;
 pub mod gif;
 pub mod jpeg;
 pub mod png;
 pub mod xmp;
 
+pub use bmff::{scan_avif, scan_webp};
 pub use exif::{ExifError, exif_text_fields};
 pub use gif::scan_gif;
 pub use jpeg::scan_jpeg;
@@ -96,6 +98,12 @@ pub fn sniff(bytes: &[u8], path: &str) -> FileKind {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Placement {
+    Mapped(usize),
+    Whole(usize, usize),
+}
+
 pub(crate) struct Sink {
     pub out: DetectorOutput,
     pub stop: bool,
@@ -172,14 +180,26 @@ impl Sink {
     }
 
     pub fn exif(&mut self, tiff: &[u8], base: usize, budget: &Budget) {
+        self.exif_at("EXIF", tiff, Placement::Mapped(base), budget);
+    }
+
+    pub fn exif_at(&mut self, label: &str, tiff: &[u8], placement: Placement, budget: &Budget) {
         let expired = || budget.deadline_exceeded();
+        let (block_start, block_end) = match placement {
+            Placement::Mapped(base) => (base, base + tiff.len()),
+            Placement::Whole(start, end) => (start, end),
+        };
         let mut emit = |value: exif::Value| {
             let evidence = tiff.get(value.start..value.end).unwrap_or_default();
+            let (start, end) = match placement {
+                Placement::Mapped(base) => (base + value.start, base + value.end),
+                Placement::Whole(start, end) => (start, end),
+            };
             self.carrier(
-                &format!("EXIF {}", value.name),
+                &format!("{label} {}", value.name),
                 &value.text,
-                base + value.start,
-                base + value.end,
+                start,
+                end,
                 evidence,
             )
         };
@@ -190,7 +210,7 @@ impl Sink {
             self.timed_out();
         }
         if outcome.entry_limit && !self.stop {
-            self.l001("EXIF entry limit", base, base + tiff.len());
+            self.l001("EXIF entry limit", block_start, block_end);
         }
     }
 
