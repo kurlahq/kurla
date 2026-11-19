@@ -356,7 +356,7 @@ fn decode_entities<'a>(raw: &'a str, subst: &Subst) -> Cow<'a, str> {
             && rest[end..].starts_with(';')
             && let Some(value) = subst.lookup(&rest[..end])
         {
-            out.push_str(value);
+            out.push_str(&decode_entities(value, &Subst::none()));
             rest = &rest[end + 1..];
             continue;
         }
@@ -834,6 +834,17 @@ fn skip_declaration(
     Some(i)
 }
 
+fn is_parameter_reference(body: &[u8], at: usize) -> bool {
+    if body[at] != b'%' {
+        return false;
+    }
+    let name = body[at + 1..]
+        .iter()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+        .count();
+    name > 0 && body.get(at + 1 + name) == Some(&b';')
+}
+
 fn skip_spaces(body: &[u8], mut i: usize) -> usize {
     while body.get(i).is_some_and(u8::is_ascii_whitespace) {
         i += 1;
@@ -856,6 +867,7 @@ struct Dtd {
     entities: HashMap<String, u64>,
     referenced: HashSet<String>,
     expansion: u64,
+    parameter_reference: bool,
 }
 
 impl Dtd {
@@ -903,6 +915,9 @@ impl Dtd {
                 };
                 i = next;
             } else {
+                if is_parameter_reference(body, i) {
+                    self.parameter_reference = true;
+                }
                 i += 1;
             }
         }
@@ -961,12 +976,16 @@ impl Dtd {
             self.entities
                 .entry(name.to_string())
                 .or_insert(value.map_or(0, |v| v.len() as u64));
+            if value.is_some_and(|v| (0..v.len()).any(|k| is_parameter_reference(v.as_bytes(), k)))
+            {
+                self.parameter_reference = true;
+            }
             for reference in value.into_iter().flat_map(entity_refs) {
                 self.referenced.insert(reference.to_string());
             }
             if first && let Some(raw) = value {
                 let decoded = decode_entities(raw, &Subst::none()).into_owned();
-                self.inspect(name, &decoded);
+                self.inspect(name, &decode_entities(&decoded, &Subst::none()));
                 self.values.insert(name.to_string(), decoded);
             }
         }
@@ -992,7 +1011,11 @@ impl Dtd {
             .referenced
             .iter()
             .any(|name| self.entities.contains_key(name));
-        if self.aborted || nested || self.declarations > MAX_ENTITY_DECLARATIONS {
+        if self.aborted
+            || nested
+            || self.parameter_reference
+            || self.declarations > MAX_ENTITY_DECLARATIONS
+        {
             return Subst::none();
         }
         Subst {
@@ -1024,10 +1047,11 @@ impl Dtd {
         if self.declarations > MAX_ENTITY_DECLARATIONS {
             reasons.push(format!("{} entity declarations", self.declarations));
         }
-        if self
-            .referenced
-            .iter()
-            .any(|name| self.entities.contains_key(name))
+        if self.parameter_reference
+            || self
+                .referenced
+                .iter()
+                .any(|name| self.entities.contains_key(name))
         {
             reasons.push("entity refers to another entity".to_string());
         }
@@ -1473,7 +1497,7 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
             Event::GeneralRef(r) => {
                 scanner.dtd.reference(&r);
                 let piece = match scanner.subst.lookup(&r) {
-                    Some(value) => value.to_string(),
+                    Some(value) => decode_entities(value, &Subst::none()).into_owned(),
                     None => decode_entities(&format!("&{};", &*r), &Subst::none()).into_owned(),
                 };
                 scanner.append(start, end, &piece);
@@ -2382,5 +2406,46 @@ mod tests {
         let out = scan_bytes(entity_doc(5000, "").as_bytes(), &limits);
         assert_eq!(out.skip, Some(SkipReason::Timeout));
         assert!(rule(&out, "S004").is_empty());
+    }
+
+    #[test]
+    fn double_escaped_scheme_in_entity_value_is_decoded_again_at_use() {
+        let out = scan(
+            "<!DOCTYPE svg [<!ENTITY j \"&#38;#106;avascript:x\">]><svg><a href=\"&j;\"/></svg>",
+        );
+        assert_eq!(rule(&out, "S003").len(), 2);
+        assert!(payloads(&out, "S003").contains(&"href=javascript:x"));
+    }
+
+    #[test]
+    fn replacement_text_is_decoded_once_more_and_never_expanded_again() {
+        let out = scan(
+            "<!DOCTYPE svg [<!ENTITY a \"&#38;amp;\"><!ENTITY b \"x\">]><svg><title>&a;</title><desc>&#38;b;</desc></svg>",
+        );
+        assert!(out.findings.is_empty());
+        let texts: Vec<_> = out.carriers.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["&", "&b;"]);
+    }
+
+    #[test]
+    fn parameter_entity_reference_is_s004_and_keeps_everything_literal() {
+        let out = scan(
+            "<!DOCTYPE svg [<!ENTITY % p \"<!ENTITY j 'javascript:x'>\"> %p;]><svg><a href=\"&j;\"/><title>&j;</title></svg>",
+        );
+        assert_eq!(rule(&out, "S004").len(), 1);
+        assert!(rule(&out, "S003").is_empty());
+        assert!(out.carriers.iter().any(|c| c.text == "&j;"));
+    }
+
+    #[test]
+    fn parameter_entity_reference_inside_an_entity_value_is_s004() {
+        let out = scan("<!DOCTYPE svg [<!ENTITY % p \"x\"><!ENTITY a \"%p;\">]><svg/>");
+        assert_eq!(rule(&out, "S004").len(), 1);
+    }
+
+    #[test]
+    fn parameter_entity_declaration_without_reference_adds_nothing() {
+        let out = scan("<!DOCTYPE svg [<!ENTITY % p \"x\"><!-- %p; -->]><svg/>");
+        assert!(out.findings.is_empty());
     }
 }
