@@ -1476,4 +1476,30 @@ mod tests {
         assert_eq!(s002.len(), 1);
         assert_eq!(s002[0].raw.payload.as_deref().unwrap().chars().count(), 256);
     }
+
+    #[test]
+    fn depth_limit_is_l001_without_malformed() {
+        let limits = Limits {
+            max_xml_depth: 4,
+            ..Limits::default()
+        };
+        let svg = format!("{}{}", "<g>".repeat(6), "</g>".repeat(6));
+        let (findings, coverage, _) = scan_file("a.svg", svg.as_bytes(), &limits);
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_ne!(findings[0].raw.message, "malformed XML");
+        assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+    }
+
+    #[test]
+    fn attribute_limit_is_l001_without_malformed() {
+        let limits = Limits {
+            max_xml_attributes: 2,
+            ..Limits::default()
+        };
+        let svg = "<svg><g a=\"1\" b=\"2\" c=\"3\"/></svg>";
+        let (findings, coverage, _) = scan_file("a.svg", svg.as_bytes(), &limits);
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_ne!(findings[0].raw.message, "malformed XML");
+        assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+    }
 }

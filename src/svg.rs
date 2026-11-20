@@ -1265,6 +1265,13 @@ fn tail_matches(tail: &str) -> Vec<(usize, usize, &'static str)> {
     found
 }
 
+fn boundary_at_or_before(text: &str, at: usize) -> usize {
+    (0..=at.min(text.len()))
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0)
+}
+
 struct Scanner<'a> {
     bytes: &'a [u8],
     doc: &'a TextDoc,
@@ -1381,7 +1388,8 @@ impl Scanner<'_> {
     }
 
     fn malformed_tail(&mut self, text: &str, start: usize) {
-        let tail = text.get(start..).unwrap_or("");
+        let start = boundary_at_or_before(text, start);
+        let tail = &text[start..];
         let mut cursor = CharCursor {
             text,
             byte: 0,
@@ -1602,7 +1610,7 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
             break;
         }
         events += 1;
-        let start = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
+        let start = usize::try_from(reader.buffer_position()).unwrap_or(0);
         let Ok(event) = reader.read_event() else {
             malformed_at = Some(start);
             break;
@@ -2774,5 +2782,52 @@ mod tests {
         let out = scan(src);
         assert_eq!(active(&out).len(), 2);
         assert_eq!(rule(&out, "L001").len(), 1);
+    }
+
+    #[test]
+    fn bad_attribute_is_malformed_and_tail_starts_at_its_tag() {
+        let src = "<svg><g a=1 b>secret words here</g></svg>";
+        let out = scan(src);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        let l001 = rule(&out, "L001");
+        assert_eq!(l001.len(), 1);
+        assert_eq!(l001[0].message, MALFORMED_XML);
+        let tail = out.carriers.iter().find(|c| c.hidden).unwrap();
+        assert_eq!(tail.text, "<g a=1 b>secret words here</g></svg>");
+        assert_eq!(tail.span.byte_start, 5);
+        assert_eq!(tail.span.byte_end, src.len() as u64);
+        assert_eq!(l001[0].span, tail.span);
+    }
+
+    #[test]
+    fn bad_attribute_on_empty_element_is_malformed() {
+        let src = "<svg><rect a=1 b/>secret words here</svg>";
+        let out = scan(src);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        assert_eq!(rule(&out, "L001").len(), 1);
+        let tail = out.carriers.iter().find(|c| c.hidden).unwrap();
+        assert_eq!(tail.text, "<rect a=1 b/>secret words here</svg>");
+        assert_eq!(tail.span.byte_start, 5);
+    }
+
+    #[test]
+    fn entity_error_is_malformed_with_tail() {
+        let src = "<svg><g>ok</g>&broken words<g/></svg>";
+        let out = scan(src);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        assert_eq!(rule(&out, "L001").len(), 1);
+        let tail = out.carriers.iter().find(|c| c.hidden).unwrap();
+        assert!(tail.text.starts_with('&'));
+        assert_eq!(tail.span.byte_start, 14);
+    }
+
+    #[test]
+    fn tail_start_backs_off_to_a_char_boundary() {
+        let text = "ab\u{e9}cd";
+        assert_eq!(boundary_at_or_before(text, 2), 2);
+        assert_eq!(boundary_at_or_before(text, 3), 2);
+        assert_eq!(boundary_at_or_before(text, 4), 4);
+        assert_eq!(boundary_at_or_before(text, 99), text.len());
+        assert_eq!(boundary_at_or_before("", 5), 0);
     }
 }
