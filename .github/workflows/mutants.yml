@@ -1,0 +1,85 @@
+name: mutants
+
+on:
+  pull_request:
+    paths:
+      - src/unicode/scan.rs
+      - src/unicode/context.rs
+      - src/text.rs
+      - src/markup.rs
+      - src/svg.rs
+      - src/binary/*.rs
+      - src/encoded.rs
+      - src/aimed.rs
+      - src/agent_files.rs
+      - src/location.rs
+      - src/severity.rs
+      - src/engine.rs
+      - src/walk.rs
+      - src/glob.rs
+      - src/decisions.rs
+      - src/cache.rs
+      - src/exit.rs
+      - src/limits.rs
+      - .cargo/mutants.toml
+      - docs/equivalent-mutants.md
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: Shard as k/n, for example 0/8
+        default: 0/1
+        type: string
+      mode:
+        description: diff tests the changes against the default branch, full tests every mutant in the shard
+        default: diff
+        type: choice
+        options:
+          - diff
+          - full
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    env:
+      MODE: ${{ github.event_name == 'pull_request' && 'diff' || inputs.mode }}
+      SHARD: ${{ inputs.shard }}
+      BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ (github.event_name == 'pull_request' || inputs.mode == 'diff') && 0 || 1 }}
+      - uses: ./.github/actions/dev-image
+      - name: Write the diff
+        id: diff
+        if: env.MODE == 'diff'
+        run: |
+          git diff "origin/$BASE_REF"...HEAD > mutants.diff
+          if [ -s mutants.diff ]; then
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "The diff against $BASE_REF is empty, so no mutants are tested."
+          fi
+      - name: Run cargo-mutants on the diff
+        if: env.MODE == 'diff' && steps.diff.outputs.empty != 'true'
+        run: docker run --rm --network none -v "$PWD":/src -w /src kurla-dev dev/mutants.sh diff mutants.diff
+      - name: Run cargo-mutants on the shard
+        if: env.MODE == 'full'
+        run: docker run --rm --network none -v "$PWD":/src -w /src kurla-dev dev/mutants.sh full "$SHARD"
+      - name: Count the outcomes
+        if: env.MODE == 'full' || steps.diff.outputs.empty != 'true'
+        run: |
+          jq -r '"caught: \(.caught)", "missed: \(.missed)", "timeout: \(.timeout)", "unviable: \(.unviable)"' mutants.out/outcomes.json
+      - name: Fail on a missed mutant that is not listed
+        if: env.MODE == 'full' || steps.diff.outputs.empty != 'true'
+        run: docker run --rm --network none -v "$PWD":/src -w /src kurla-dev cargo run --locked --offline -p xtask -- mutants-check mutants.out/missed.txt docs/equivalent-mutants.md
+      - name: Report the tests that are the sole catcher of nothing
+        if: env.MODE == 'full'
+        run: docker run --rm --network none -v "$PWD":/src -w /src kurla-dev cargo run --locked --offline -p xtask -- mutants-unique mutants.out
