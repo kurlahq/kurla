@@ -1,0 +1,91 @@
+[package]
+name = "kurla-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[package.metadata.vet]
+store = { path = "../supply-chain" }
+
+[workspace]
+
+[workspace.metadata.vet]
+store = { path = "../supply-chain" }
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+kurla = { path = "..", version = "=0.1.0" }
+
+[[bin]]
+name = "png"
+path = "fuzz_targets/png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jpeg"
+path = "fuzz_targets/jpeg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exif"
+path = "fuzz_targets/exif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gif"
+path = "fuzz_targets/gif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bmff"
+path = "fuzz_targets/bmff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "svg"
+path = "fuzz_targets/svg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "markup"
+path = "fuzz_targets/markup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encoded"
+path = "fuzz_targets/encoded.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_unicode"
+path = "fuzz_targets/text_unicode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_file"
+path = "fuzz_targets/scan_file.rs"
+test = false
+doc = false
+bench = false

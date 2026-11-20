@@ -74,8 +74,12 @@ jobs:
         run: rustup toolchain install --profile minimal
       - name: Deny
         run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo deny check
+      - name: Deny the fuzz workspace
+        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check
       - name: Vet
         run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo vet --locked
+      - name: Vet the fuzz workspace
+        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo vet --locked --manifest-path fuzz/Cargo.toml
       - name: Cooldown
         run: cargo xtask cooldown-check
 
@@ -89,3 +93,5 @@ jobs:
       - uses: ./.github/actions/dev-image
       - name: Audit
         run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo audit
+      - name: Audit the fuzz workspace
+        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo audit --file fuzz/Cargo.lock
