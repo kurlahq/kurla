@@ -277,6 +277,18 @@ impl TextDoc {
         None
     }
 
+    pub fn from_string(text: String) -> TextDoc {
+        let (text, offsets, _) = decode_utf8(text.as_bytes(), 0);
+        TextDoc {
+            line_starts: line_starts(&text),
+            text,
+            encoding: Encoding::Utf8,
+            invalid_utf8: false,
+            bom_len: 0,
+            offsets,
+        }
+    }
+
     pub fn position(&self, char_offset: usize) -> (u32, u32) {
         let line_index = self
             .line_starts
@@ -789,5 +801,22 @@ mod tests {
         let plain = TextDoc::decode(b"abcdefgh").unwrap();
         assert_eq!(plain.encoding, Encoding::Utf8);
         assert!(!plain.invalid_utf8);
+    }
+
+    #[test]
+    fn from_string_never_sniffs_or_strips_bom() {
+        let nuls: String = "a\0".repeat(300);
+        let doc = TextDoc::from_string(nuls.clone());
+        assert_eq!(doc.text, nuls);
+        assert_eq!(doc.encoding, Encoding::Utf8);
+        assert!(!doc.invalid_utf8);
+        assert_eq!(doc.bom_len, 0);
+        let bom = TextDoc::from_string("\u{FEFF}a\nb".to_string());
+        assert_eq!(bom.text, "\u{FEFF}a\nb");
+        assert_eq!(bom.bom_len, 0);
+        assert_eq!(bom.byte_span(0, 1), (0, 3));
+        assert_eq!(bom.byte_span(1, 2), (3, 4));
+        assert_eq!(bom.byte_span(0, 4), (0, 6));
+        assert_eq!(bom.position(3), (2, 1));
     }
 }
