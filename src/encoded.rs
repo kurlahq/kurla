@@ -154,16 +154,23 @@ fn payload_end(chars: &[char], at: usize, payload_start: usize, ticker: &mut Tic
     i
 }
 
-fn base64_prefix_end(chars: &[char], from: usize, limit: usize, ticker: &mut Ticker) -> usize {
+fn base64_prefix_end(
+    chars: &[char],
+    from: usize,
+    allow_whitespace: bool,
+    ticker: &mut Ticker,
+) -> usize {
     let mut i = from;
-    while i < limit && (is_base64_char(chars[i]) || chars[i].is_ascii_whitespace()) {
+    while i < chars.len()
+        && (is_base64_char(chars[i]) || (allow_whitespace && chars[i].is_ascii_whitespace()))
+    {
         if ticker.tick() {
             return i;
         }
         i += 1;
     }
     let mut padding = 0;
-    while i < limit && padding < 2 && chars[i] == '=' {
+    while i < chars.len() && padding < 2 && chars[i] == '=' {
         i += 1;
         padding += 1;
     }
@@ -196,10 +203,12 @@ fn find_uris(chars: &[char], ticker: &mut Ticker) -> Vec<Uri> {
         let mut parameters = header.split(';');
         let declared_type = parameters.next().unwrap_or("").to_ascii_lowercase();
         let base64 = parameters.any(|p| p.eq_ignore_ascii_case("base64"));
-        let mut end = payload_end(chars, i, j + 1, ticker);
-        if base64 {
-            end = base64_prefix_end(chars, j + 1, end, ticker);
-        }
+        let end = if base64 {
+            let quoted = i > 0 && (chars[i - 1] == '"' || chars[i - 1] == '\'');
+            base64_prefix_end(chars, j + 1, quoted, ticker)
+        } else {
+            payload_end(chars, i, j + 1, ticker)
+        };
         uris.push(Uri {
             start: i,
             payload_start: j + 1,
@@ -544,9 +553,7 @@ impl Scanner<'_> {
         } else {
             used_end
         };
-        if self.base64_piece(start, body_end, end) {
-            return;
-        }
+        self.base64_piece(start, body_end, end);
         let mut seen: HashSet<(usize, usize)> = HashSet::new();
         for separators in [['-', '_'], ['+', '/']] {
             let mut piece_start = start;
@@ -1260,6 +1267,44 @@ mod tests {
         let mut bytes = MSG.as_bytes().to_vec();
         bytes.push(0xFF);
         let out = run(&b64(&bytes), 0);
-        assert_eq!(texts(&out), vec![format!("{MSG}\u{FFFD}").as_str()]);
+        assert_eq!(texts(&out)[0], format!("{MSG}\u{FFFD}"));
+    }
+
+    #[test]
+    fn unclosed_paren_base64_uris_do_not_time_out() {
+        let limits = Limits {
+            per_file_time: Duration::from_secs(10),
+            ..Limits::default()
+        };
+        let out = run_with(&"(data:;base64,!".repeat(100_000), 0, &limits);
+        assert_eq!(out.out.skip, None);
+        assert_eq!(out.out.carriers.len(), 100_000);
+    }
+
+    #[test]
+    fn long_decoy_does_not_hide_a_dash_joined_payload() {
+        let decoy = "the quick brown fox jumps over the lazy dog ".repeat(24);
+        assert_eq!(decoy.len() % 3, 0);
+        let out = run(
+            &format!("{}-{}", b64(decoy.as_bytes()), b64(MSG.as_bytes())),
+            0,
+        );
+        assert!(out.out.carriers[0].text.starts_with(&decoy));
+        assert!(texts(&out).contains(&MSG));
+    }
+
+    #[test]
+    fn quoted_base64_uri_tail_after_whitespace_and_invalid_char_is_rescanned() {
+        let out = run(
+            &format!(
+                "\"data:text/plain;base64,aGVs\nbG8!{}\"",
+                b64(MSG.as_bytes())
+            ),
+            0,
+        );
+        assert_eq!(texts(&out), vec!["hello", MSG]);
+        assert_eq!(out.out.carriers[0].span.byte_start, 1);
+        assert_eq!(out.out.carriers[0].span.byte_end, 32);
+        assert_eq!(out.out.carriers[1].span.byte_start, 33);
     }
 }
