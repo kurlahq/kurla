@@ -34,3 +34,18 @@ A finding with a valid matching entry in the current decisions file always carri
 ### Reviewed findings are always shown
 
 Reviewing a finding never removes it from the output. Counted and uncounted reviews are both listed with their reviewer label, so a forged or self-approved entry is visible to a reader.
+
+### Duplicate keys and rejected files
+
+A repeated key in any JSON object of the file, at any depth, rejects the whole file, even when both values are identical. Keys are compared after JSON unescaping, so `"rule"` and `"rule"` collide. The message contains `duplicate key` and the key name.
+
+A decisions file that cannot be loaded for any reason (unreadable, not UTF-8, invalid JSON, a duplicate key, a schema violation) is reported as rejected, with its path and the message, and is then treated as absent:
+
+- a rejected current file reviews nothing, so every finding stays active;
+- a rejected base file counts nothing, so reviews from the current file are shown but not counted.
+
+### Invalid entries
+
+When an entry matches a finding but is not valid, the reason is chosen in this order: `longer than 365 days`, then `not yet valid`, then `expired`.
+
+Invalid entries from the current file that match a finding are reported with source `current`. An invalid entry in the base file is reported with source `base` when its finding was reviewed through the current file, since it could otherwise have counted. Each entry is reported once.

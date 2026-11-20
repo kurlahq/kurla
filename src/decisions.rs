@@ -2,7 +2,8 @@ use std::fmt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Map, Value};
+use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
 
 use crate::model::{Finding, Review};
 
@@ -154,8 +155,15 @@ pub struct Entry {
     pub expires: Date,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionsSource {
+    Current,
+    Base,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidDecision {
+    pub source: DecisionsSource,
     pub fingerprint: String,
     pub rule: String,
     pub path: String,
@@ -262,11 +270,80 @@ fn parse_entry(index: usize, value: &Value) -> Result<Entry, DecisionsError> {
     })
 }
 
+struct StrictValue(Value);
+
+struct StrictVisitor;
+
+impl<'de> Visitor<'de> for StrictVisitor {
+    type Value = StrictValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<StrictValue, E> {
+        Ok(StrictValue(Value::Bool(v)))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<StrictValue, E> {
+        Ok(StrictValue(Value::Number(Number::from(v))))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<StrictValue, E> {
+        Ok(StrictValue(Value::Number(Number::from(v))))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<StrictValue, E> {
+        Number::from_f64(v)
+            .map(|n| StrictValue(Value::Number(n)))
+            .ok_or_else(|| E::custom("number is not finite"))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<StrictValue, E> {
+        Ok(StrictValue(Value::String(v.to_string())))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<StrictValue, E> {
+        Ok(StrictValue(Value::String(v)))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<StrictValue, E> {
+        Ok(StrictValue(Value::Null))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<StrictValue, A::Error> {
+        let mut items = Vec::new();
+        while let Some(StrictValue(item)) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(StrictValue(Value::Array(items)))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<StrictValue, A::Error> {
+        let mut object = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(A::Error::custom(format!("duplicate key \"{key}\"")));
+            }
+            let StrictValue(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+        Ok(StrictValue(Value::Object(object)))
+    }
+}
+
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<StrictValue, D::Error> {
+        deserializer.deserialize_any(StrictVisitor)
+    }
+}
+
 impl Decisions {
     pub fn parse(text: &str) -> Result<Decisions, DecisionsError> {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        let value: Value = serde_json::from_str(text)
-            .map_err(|e| error(format!("decisions file is not valid JSON: {e}")))?;
+        let value = serde_json::from_str::<StrictValue>(text)
+            .map_err(|e| error(format!("decisions file rejected: {e}")))?
+            .0;
         let object = value
             .as_object()
             .ok_or_else(|| error("top level: must be an object".to_string()))?;
@@ -312,7 +389,8 @@ pub fn apply(
     let Some(current) = current else {
         return Vec::new();
     };
-    let mut invalid: Vec<(usize, InvalidDecision)> = Vec::new();
+    let mut current_invalid: Vec<(usize, InvalidDecision)> = Vec::new();
+    let mut base_invalid: Vec<(usize, InvalidDecision)> = Vec::new();
     for finding in findings.iter_mut() {
         let mut chosen: Option<&Entry> = None;
         for (index, entry) in current.entries.iter().enumerate() {
@@ -323,36 +401,110 @@ pub fn apply(
                 None => {
                     chosen = chosen.or(Some(entry));
                 }
-                Some(reason) => {
-                    if !invalid.iter().any(|(i, _)| *i == index) {
-                        invalid.push((
-                            index,
-                            InvalidDecision {
-                                fingerprint: entry.fingerprint.clone(),
-                                rule: entry.rule.clone(),
-                                path: entry.path.clone(),
-                                reason,
-                            },
-                        ));
-                    }
+                Some(reason) => record_invalid(
+                    &mut current_invalid,
+                    index,
+                    entry,
+                    DecisionsSource::Current,
+                    reason,
+                ),
+            }
+        }
+        let Some(entry) = chosen else {
+            continue;
+        };
+        let mut counted = false;
+        if let Some(base) = base {
+            for (index, base_entry) in base.entries.iter().enumerate() {
+                if !base_entry.matches(finding) {
+                    continue;
+                }
+                match base_entry.invalid_reason(today) {
+                    None => counted = true,
+                    Some(reason) => record_invalid(
+                        &mut base_invalid,
+                        index,
+                        base_entry,
+                        DecisionsSource::Base,
+                        reason,
+                    ),
                 }
             }
         }
-        if let Some(entry) = chosen {
-            let counted = base.is_some_and(|b| {
-                b.entries
-                    .iter()
-                    .any(|e| e.matches(finding) && e.invalid_reason(today).is_none())
+        finding.review = Some(Review {
+            reviewer: entry.reviewer.clone(),
+            reason: entry.reason.clone(),
+            counted,
+        });
+    }
+    current_invalid.sort_by_key(|(index, _)| *index);
+    base_invalid.sort_by_key(|(index, _)| *index);
+    current_invalid
+        .into_iter()
+        .chain(base_invalid)
+        .map(|(_, d)| d)
+        .collect()
+}
+
+fn record_invalid(
+    list: &mut Vec<(usize, InvalidDecision)>,
+    index: usize,
+    entry: &Entry,
+    source: DecisionsSource,
+    reason: &'static str,
+) {
+    if list.iter().any(|(i, _)| *i == index) {
+        return;
+    }
+    list.push((
+        index,
+        InvalidDecision {
+            source,
+            fingerprint: entry.fingerprint.clone(),
+            rule: entry.rule.clone(),
+            path: entry.path.clone(),
+            reason,
+        },
+    ));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedFile {
+    pub file: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Applied {
+    pub invalid: Vec<InvalidDecision>,
+    pub rejected: Vec<RejectedFile>,
+}
+
+fn load_or_reject(path: Option<&Path>, rejected: &mut Vec<RejectedFile>) -> Option<Decisions> {
+    let path = path?;
+    match Decisions::load(path) {
+        Ok(decisions) => Some(decisions),
+        Err(e) => {
+            rejected.push(RejectedFile {
+                file: path.to_string_lossy().into_owned(),
+                message: e.message,
             });
-            finding.review = Some(Review {
-                reviewer: entry.reviewer.clone(),
-                reason: entry.reason.clone(),
-                counted,
-            });
+            None
         }
     }
-    invalid.sort_by_key(|(index, _)| *index);
-    invalid.into_iter().map(|(_, d)| d).collect()
+}
+
+pub fn load_and_apply(
+    findings: &mut [Finding],
+    current: Option<&Path>,
+    base: Option<&Path>,
+    today: Date,
+) -> Applied {
+    let mut rejected = Vec::new();
+    let current = load_or_reject(current, &mut rejected);
+    let base = load_or_reject(base, &mut rejected);
+    let invalid = apply(findings, current.as_ref(), base.as_ref(), today);
+    Applied { invalid, rejected }
 }
 
 #[cfg(test)]
@@ -666,20 +818,20 @@ mod tests {
 
     #[test]
     fn impossible_date_is_error() {
-        for (date, expires) in [
-            ("2025-02-29", "2025-06-01"),
-            ("2026-01-01", "2026-13-01"),
-            ("2026-01-01", "2026-04-31"),
-            ("2026-1-01", "2026-06-01"),
-            ("2026-01-01", "2026-06-00"),
-            ("2026/01/01", "2026-06-01"),
+        for (date, expires, field) in [
+            ("2025-02-29", "2025-06-01", "date"),
+            ("2026-01-01", "2026-13-01", "expires"),
+            ("2026-01-01", "2026-04-31", "expires"),
+            ("2026-1-01", "2026-06-01", "date"),
+            ("2026-01-01", "2026-06-00", "expires"),
+            ("2026/01/01", "2026-06-01", "date"),
         ] {
             let bad = entry_json(FP_A, "S002", "rev", date, expires);
             let err =
                 Decisions::parse(&format!(r#"{{"version":1,"entries":[{bad}]}}"#)).unwrap_err();
             assert!(
-                err.message.contains("date") || err.message.contains("expires"),
-                "{}",
+                err.message.contains(&format!("field `{field}`")),
+                "{date} {expires}: {}",
                 err.message
             );
         }
@@ -756,5 +908,226 @@ mod tests {
         assert!(err.message.contains("KURLA_TODAY"), "{}", err.message);
         assert!(today_from(Some("2025-02-29"), now).is_err());
         assert!(today_from(Some(""), now).is_err());
+    }
+
+    fn scratch(test: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kurla-decisions-{}-{test}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn duplicate_key_that_would_review_a_finding_leaves_it_active_and_is_reported() {
+        let e = valid_entry(FP_A, "S002", "rev");
+        let dir = scratch("dup-review");
+        for (name, text) in [
+            (
+                "last-wins.json",
+                format!(r#"{{"version":1,"entries":[],"entries":[{e}]}}"#),
+            ),
+            (
+                "first-wins.json",
+                format!(r#"{{"version":1,"entries":[{e}],"entries":[]}}"#),
+            ),
+        ] {
+            let path = write(&dir, name, &text);
+            let mut findings = [finding("S002", FP_A)];
+            let applied = load_and_apply(&mut findings, Some(&path), None, today());
+            assert!(findings[0].review.is_none(), "{name}");
+            assert_eq!(applied.rejected.len(), 1, "{name}");
+            assert_eq!(applied.rejected[0].file, path.to_string_lossy(), "{name}");
+            assert!(
+                applied.rejected[0].message.contains("duplicate key"),
+                "{}",
+                applied.rejected[0].message
+            );
+            assert!(
+                applied.rejected[0].message.contains("entries"),
+                "{}",
+                applied.rejected[0].message
+            );
+            assert!(applied.invalid.is_empty());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_field_inside_entry_is_error() {
+        let bad = valid_entry(FP_A, "S002", "rev")
+            .replace(r#""rule":"S002""#, r#""rule":"X999","rule":"S002""#);
+        let err = Decisions::parse(&format!(r#"{{"version":1,"entries":[{bad}]}}"#)).unwrap_err();
+        assert!(err.message.contains("duplicate key"), "{}", err.message);
+        assert!(err.message.contains("rule"), "{}", err.message);
+    }
+
+    #[test]
+    fn duplicate_key_after_unescaping_is_error() {
+        for dup in [
+            r#""rule":"S002","rule":"S002""#,
+            r#""rule":"S002","rule":"S002""#,
+        ] {
+            let bad = valid_entry(FP_A, "S002", "rev").replace(r#""rule":"S002""#, dup);
+            let err =
+                Decisions::parse(&format!(r#"{{"version":1,"entries":[{bad}]}}"#)).unwrap_err();
+            assert!(err.message.contains("duplicate key"), "{}", err.message);
+            assert!(err.message.contains("rule"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn duplicate_version_is_error() {
+        let err = Decisions::parse(r#"{"version":1,"version":1,"entries":[]}"#).unwrap_err();
+        assert!(err.message.contains("duplicate key"), "{}", err.message);
+        assert!(err.message.contains("version"), "{}", err.message);
+    }
+
+    #[test]
+    fn trailing_content_after_object_is_error() {
+        assert!(Decisions::parse(r#"{"version":1,"entries":[]} x"#).is_err());
+        assert!(
+            Decisions::parse(r#"{"version":1,"entries":[]}{"version":1,"entries":[]}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn rejected_base_file_counts_nothing_and_is_reported() {
+        let e = valid_entry(FP_A, "S002", "rev");
+        let dir = scratch("rej-base");
+        let current = write(
+            &dir,
+            "current.json",
+            &format!(r#"{{"version":1,"entries":[{e}]}}"#),
+        );
+        let base = write(
+            &dir,
+            "base.json",
+            &format!(r#"{{"version":1,"entries":[{e}],"entries":[{e}]}}"#),
+        );
+        let mut findings = [finding("S002", FP_A)];
+        let applied = load_and_apply(&mut findings, Some(&current), Some(&base), today());
+        let review = findings[0].review.as_ref().unwrap();
+        assert!(!review.counted);
+        assert_eq!(applied.rejected.len(), 1);
+        assert_eq!(applied.rejected[0].file, base.to_string_lossy());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_current_file_reviews_nothing_even_with_valid_base() {
+        let e = valid_entry(FP_A, "S002", "rev");
+        let dir = scratch("rej-current");
+        let current = write(&dir, "current.json", "{not json");
+        let base = write(
+            &dir,
+            "base.json",
+            &format!(r#"{{"version":1,"entries":[{e}]}}"#),
+        );
+        let mut findings = [finding("S002", FP_A)];
+        let applied = load_and_apply(&mut findings, Some(&current), Some(&base), today());
+        assert!(findings[0].review.is_none());
+        assert_eq!(applied.rejected.len(), 1);
+        assert_eq!(applied.rejected[0].file, current.to_string_lossy());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_file_is_rejected_not_fatal() {
+        let dir = scratch("unreadable");
+        let missing = dir.join("missing.json");
+        let mut findings = [finding("S002", FP_A)];
+        let applied = load_and_apply(&mut findings, Some(&missing), None, today());
+        assert!(findings[0].review.is_none());
+        assert_eq!(applied.rejected.len(), 1);
+        assert!(applied.rejected[0].message.contains("cannot read"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_and_apply_with_valid_files_reviews_and_counts() {
+        let e = valid_entry(FP_A, "S002", "rev");
+        let dir = scratch("ok");
+        let text = format!(r#"{{"version":1,"entries":[{e}]}}"#);
+        let current = write(&dir, "current.json", &text);
+        let base = write(&dir, "base.json", &text);
+        let mut findings = [finding("S002", FP_A)];
+        let applied = load_and_apply(&mut findings, Some(&current), Some(&base), today());
+        assert!(findings[0].review.as_ref().unwrap().counted);
+        assert!(applied.rejected.is_empty());
+        assert!(applied.invalid.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_base_entry_is_reported_with_base_source() {
+        let current = file(&[valid_entry(FP_A, "S002", "rev")]);
+        let base = file(&[entry_json(FP_A, "S002", "old", "2026-01-01", "2026-06-01")]);
+        let mut findings = [finding("S002", FP_A), finding("S002", FP_A)];
+        let invalid = apply(&mut findings, Some(&current), Some(&base), today());
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].source, DecisionsSource::Base);
+        assert_eq!(invalid[0].reason, "expired");
+        assert_eq!(invalid[0].fingerprint, FP_A);
+        assert!(!findings[0].review.as_ref().unwrap().counted);
+    }
+
+    #[test]
+    fn invalid_base_entry_for_unreviewed_finding_is_not_reported() {
+        let current = file(&[valid_entry(FP_B, "S002", "rev")]);
+        let base = file(&[entry_json(FP_A, "S002", "old", "2026-01-01", "2026-06-01")]);
+        let mut findings = [finding("S002", FP_A)];
+        let invalid = apply(&mut findings, Some(&current), Some(&base), today());
+        assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn invalid_current_entry_has_current_source() {
+        let current = file(&[entry_json(FP_A, "S002", "rev", "2026-01-01", "2026-06-01")]);
+        let mut findings = [finding("S002", FP_A)];
+        let invalid = apply(&mut findings, Some(&current), None, today());
+        assert_eq!(invalid[0].source, DecisionsSource::Current);
+    }
+
+    #[test]
+    fn reason_priority_too_long_beats_expired() {
+        let current = file(&[entry_json(FP_A, "S002", "rev", "2024-01-01", "2025-06-01")]);
+        let mut findings = [finding("S002", FP_A)];
+        let invalid = apply(&mut findings, Some(&current), None, today());
+        assert_eq!(invalid[0].reason, "longer than 365 days");
+    }
+
+    #[test]
+    fn clock_before_1970_is_error() {
+        let err = today_from(None, UNIX_EPOCH - Duration::from_secs(1)).unwrap_err();
+        assert!(err.message.contains("1970"), "{}", err.message);
+    }
+
+    #[test]
+    fn leap_start_span_of_365_days_is_valid() {
+        let ok = file(&[entry_json(FP_A, "S002", "rev", "2028-02-29", "2029-02-28")]);
+        let long = file(&[entry_json(FP_A, "S002", "rev", "2028-02-29", "2029-03-01")]);
+        let mut findings = [finding("S002", FP_A)];
+        let invalid = apply(&mut findings, Some(&ok), None, d(2028, 6, 1));
+        assert!(findings[0].review.is_some());
+        assert!(invalid.is_empty());
+        let mut findings = [finding("S002", FP_A)];
+        let invalid = apply(&mut findings, Some(&long), None, d(2028, 6, 1));
+        assert!(findings[0].review.is_none());
+        assert_eq!(invalid[0].reason, "longer than 365 days");
+    }
+
+    #[test]
+    fn year_boundary_span_of_365_days_is_valid() {
+        let ok = file(&[entry_json(FP_A, "S002", "rev", "2026-12-31", "2027-12-31")]);
+        let mut findings = [finding("S002", FP_A)];
+        let invalid = apply(&mut findings, Some(&ok), None, d(2027, 3, 1));
+        assert!(findings[0].review.is_some());
+        assert!(invalid.is_empty());
     }
 }
