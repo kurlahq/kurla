@@ -10,13 +10,15 @@ use crate::model::{
     Finding, LocationKind, RawFinding, RuleStatus, Severity, SkipReason, Span,
 };
 use crate::severity::finalize;
-use crate::svg::scan_svg;
+use crate::svg::{MALFORMED_XML, scan_svg};
 use crate::text::TextDoc;
 use crate::unicode::scan_text;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 
 type Scanned = (Vec<Finding>, FileCoverage, BTreeMap<CarrierKind, u64>);
+
+pub const RULES_VERSION: &str = "1";
 
 const SNIFF_PREFIX: usize = 8192;
 const PAYLOAD_CAP: usize = 256;
@@ -47,6 +49,7 @@ struct Engine<'a> {
     skip: Option<SkipReason>,
     timed_out: bool,
     embedded: Vec<EmbeddedNotScanned>,
+    not_payload_runs: u64,
 }
 
 fn whole(len: usize) -> Span {
@@ -80,6 +83,25 @@ fn limit_finding(rule_id: &'static str, message: &str, span: Span) -> RawFinding
         message: message.to_string(),
         evidence: Vec::new(),
     }
+}
+
+fn not_scanned_reason(format: Option<&str>) -> String {
+    match format {
+        Some(name) => format!("{name} content not scanned"),
+        None => "unrecognised binary content".to_string(),
+    }
+}
+
+fn take_malformed_tail(out: &mut DetectorOutput) -> Option<Carrier> {
+    let span = out
+        .findings
+        .iter()
+        .find(|raw| raw.rule_id == "L001" && raw.message == MALFORMED_XML)?
+        .span;
+    let at = out.carriers.iter().position(|carrier| {
+        carrier.hidden && carrier.kind == CarrierKind::SvgText && carrier.span == span
+    })?;
+    Some(out.carriers.remove(at))
 }
 
 fn capped_evidence(text: &str) -> Vec<u8> {
@@ -149,6 +171,7 @@ impl<'a> Engine<'a> {
             skip: None,
             timed_out: false,
             embedded: Vec::new(),
+            not_payload_runs: 0,
         }
     }
 
@@ -194,7 +217,28 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn absorb(&mut self, out: DetectorOutput, depth: u8, remap: Option<Span>) {
+    fn malformed_tail(&mut self, carrier: &Carrier, remap: Option<Span>) {
+        if aimed::classify(&carrier.text).is_empty() {
+            return;
+        }
+        self.entries.push(Entry {
+            raw: RawFinding {
+                rule_id: "S002",
+                family: Family::S,
+                base: Severity::High,
+                status: RuleStatus::Stable,
+                span: remap.unwrap_or(carrier.span),
+                carrier: CarrierKind::HiddenText,
+                payload: Some(carrier.text.chars().take(PAYLOAD_CAP).collect()),
+                message: "text is present in the file but not visible when rendered".to_string(),
+                evidence: carrier.evidence.clone(),
+            },
+            instruction_like: true,
+        });
+    }
+
+    fn absorb(&mut self, mut out: DetectorOutput, depth: u8, remap: Option<Span>) {
+        let tail = take_malformed_tail(&mut out);
         self.note_skip(out.skip);
         if out.skip == Some(SkipReason::Unreadable) {
             self.unreadable(remap.unwrap_or(whole(self.len)));
@@ -234,6 +278,9 @@ impl<'a> Engine<'a> {
             }
         }
         self.entries.extend(entries);
+        if let Some(carrier) = &tail {
+            self.malformed_tail(carrier, remap);
+        }
         for (carrier, classified) in jobs {
             self.queue.push_back(Job {
                 carrier,
@@ -246,6 +293,7 @@ impl<'a> Engine<'a> {
 
     fn absorb_encoded(&mut self, encoded: EncodedOutput, depth: u8, remap: Option<Span>) {
         let next = depth.saturating_add(1);
+        self.not_payload_runs += encoded.not_payload_runs;
         self.absorb(encoded.out, next, remap);
         for blob in encoded.blobs {
             self.route_blob(blob, next, remap);
@@ -261,21 +309,12 @@ impl<'a> Engine<'a> {
             FileKind::Webp => scan_webp(&blob.bytes, &mut self.budget),
             FileKind::Avif => scan_avif(&blob.bytes, &mut self.budget),
             FileKind::Svg => scan_svg(&blob.bytes, &mut self.budget, self.limits),
-            FileKind::Pdf => {
+            FileKind::Pdf | FileKind::Text | FileKind::OtherImage | FileKind::UnknownBinary => {
                 self.embedded.push(EmbeddedNotScanned {
                     span,
                     declared_type: blob.declared_type,
                     kind: blob.kind,
-                    reason: "pdf content not scanned",
-                });
-                return;
-            }
-            FileKind::Text | FileKind::OtherImage | FileKind::UnknownBinary => {
-                self.embedded.push(EmbeddedNotScanned {
-                    span,
-                    declared_type: blob.declared_type,
-                    kind: blob.kind,
-                    reason: "unrecognised binary content",
+                    reason: not_scanned_reason(blob.format),
                 });
                 return;
             }
@@ -450,20 +489,34 @@ impl<'a> Engine<'a> {
             skip: self.skip,
             drawn_text_unscanned: self.kind.drawn_text_unscanned(),
             embedded_not_scanned: self.embedded,
+            encoded_runs_not_payloads: self.not_payload_runs,
         };
         (findings, coverage, self.counts)
     }
 }
 
+pub fn scan_oversize(rel_path: &str, prefix: &[u8], len: u64, limits: &Limits) -> Scanned {
+    let kind = binary::sniff(&prefix[..prefix.len().min(SNIFF_PREFIX)], rel_path);
+    let location = location::classify(rel_path, 0);
+    let size = usize::try_from(len).unwrap_or(usize::MAX);
+    let mut engine = Engine::new(rel_path, limits, kind, location, size);
+    engine.note_skip(Some(SkipReason::SizeLimit));
+    engine.push(limit_finding("L001", "file size limit", whole(size)));
+    engine.finish()
+}
+
+pub fn unreadable(rel_path: &str) -> Scanned {
+    let limits = Limits::default();
+    let location = location::classify(rel_path, 0);
+    let mut engine = Engine::new(rel_path, &limits, FileKind::UnknownBinary, location, 0);
+    engine.unreadable(whole(0));
+    engine.finish()
+}
+
 pub fn scan_file(rel_path: &str, bytes: &[u8], limits: &Limits) -> Scanned {
-    let oversize = u64::try_from(bytes.len()).map_or(true, |len| len > limits.max_file_bytes);
-    if oversize {
-        let kind = binary::sniff(&bytes[..bytes.len().min(SNIFF_PREFIX)], rel_path);
-        let location = location::classify(rel_path, 0);
-        let mut engine = Engine::new(rel_path, limits, kind, location, bytes.len());
-        engine.note_skip(Some(SkipReason::SizeLimit));
-        engine.push(limit_finding("L001", "file size limit", whole(bytes.len())));
-        return engine.finish();
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if len > limits.max_file_bytes {
+        return scan_oversize(rel_path, bytes, len, limits);
     }
     let kind = match binary::sniff(bytes, rel_path) {
         FileKind::UnknownBinary if is_svg_path(rel_path) => FileKind::Svg,
@@ -1242,5 +1295,256 @@ mod tests {
             .find(|f| f.raw.payload.as_deref() == Some("some quiet words"))
             .unwrap();
         assert_eq!(quiet.severity, Severity::High);
+    }
+
+    fn hash_bytes(seed: u16) -> Vec<u8> {
+        (0..64u16)
+            .map(|k| 0x80 | ((k * 5 + seed * 17) & 0x7F) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn data_uri_zip_reason_names_the_format() {
+        let mut zip = vec![b'P', b'K', 3, 4, 20, 0];
+        zip.extend((0..24u8).map(|i| 0x80 | i));
+        let (text, start, end) = data_uri_readme("application/zip", &zip);
+        let (findings, coverage, _) = scan("README.md", text.as_bytes());
+        assert!(findings.is_empty());
+        assert_eq!(coverage.embedded_not_scanned.len(), 1);
+        let entry = &coverage.embedded_not_scanned[0];
+        assert_eq!(entry.reason, "zip content not scanned");
+        assert_eq!(entry.kind, FileKind::UnknownBinary);
+        assert_eq!(entry.declared_type.as_deref(), Some("application/zip"));
+        assert_eq!(entry.span.byte_start, start as u64);
+        assert_eq!(entry.span.byte_end, end as u64);
+        assert_eq!(coverage.encoded_runs_not_payloads, 0);
+    }
+
+    #[test]
+    fn bare_gzip_run_reason_names_the_format_and_pdf_keeps_its_kind() {
+        let mut gzip = vec![0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0];
+        gzip.extend((0..40u8).map(|i| 0x80 | i));
+        let text = format!("blob {}\n", base64(&gzip));
+        let (_, coverage, _) = scan("notes.txt", text.as_bytes());
+        assert_eq!(coverage.embedded_not_scanned.len(), 1);
+        assert_eq!(
+            coverage.embedded_not_scanned[0].reason,
+            "gzip content not scanned"
+        );
+        assert_eq!(coverage.embedded_not_scanned[0].declared_type, None);
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        pdf.extend((0..40u8).map(|i| 0x80 | i));
+        let text = format!("blob {}\n", base64(&pdf));
+        let (_, coverage, _) = scan("notes.txt", text.as_bytes());
+        assert_eq!(coverage.embedded_not_scanned[0].kind, FileKind::Pdf);
+        assert_eq!(
+            coverage.embedded_not_scanned[0].reason,
+            "pdf content not scanned"
+        );
+        assert_eq!(coverage.encoded_runs_not_payloads, 0);
+    }
+
+    #[test]
+    fn lockfile_hashes_give_one_count_each_and_no_entries() {
+        let lock = format!(
+            "{{\n  \"a\": {{ \"integrity\": \"sha512-{}\" }},\n  \"b\": {{ \"integrity\": \"sha512-{}\" }},\n  \"c\": {{ \"integrity\": \"sha512-{}\" }}\n}}\n",
+            base64(&hash_bytes(0)),
+            base64(&hash_bytes(1)),
+            base64(&hash_bytes(2)),
+        );
+        let (findings, coverage, _) = scan("package-lock.json", lock.as_bytes());
+        assert!(findings.is_empty());
+        assert!(coverage.embedded_not_scanned.is_empty());
+        assert_eq!(coverage.encoded_runs_not_payloads, 3);
+        assert_eq!(coverage.skip, None);
+    }
+
+    #[test]
+    fn non_payload_runs_are_summed_over_every_encoded_scan() {
+        let hash = format!("sha512-{}", base64(&hash_bytes(3)));
+        let html = format!("<p>x</p><span style=\"display:none\">{hash}</span>\n");
+        let (findings, coverage, _) = scan("doc.html", html.as_bytes());
+        assert!(!of_rule(&findings, "M002").is_empty());
+        assert_eq!(coverage.encoded_runs_not_payloads, 2);
+    }
+
+    const SVG_OPEN: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\">";
+
+    #[test]
+    fn instruction_like_hidden_text_in_svg_file_is_critical() {
+        let svg = format!(
+            "{SVG_OPEN}\
+             <text x=\"1\" y=\"2\" display=\"none\">some quiet words</text>\
+             <text x=\"1\" y=\"4\" display=\"none\">{PHRASE}</text></svg>"
+        );
+        let (findings, coverage, _) = scan("a.svg", svg.as_bytes());
+        assert_eq!(coverage.kind, FileKind::Svg);
+        let s002 = of_rule(&findings, "S002");
+        assert_eq!(s002.len(), 2);
+        let hostile = s002
+            .iter()
+            .find(|f| f.raw.payload.as_deref() == Some(PHRASE))
+            .unwrap();
+        assert_eq!(hostile.severity, Severity::Critical);
+        let quiet = s002
+            .iter()
+            .find(|f| f.raw.payload.as_deref() == Some("some quiet words"))
+            .unwrap();
+        assert_eq!(quiet.severity, Severity::High);
+    }
+
+    #[test]
+    fn instruction_like_text_after_svg_parse_error_is_hidden_content() {
+        let svg = format!("{SVG_OPEN}<g></g></g>{PHRASE}");
+        let tail_start = SVG_OPEN.len() + 7;
+        let (findings, coverage, _) = scan("a.svg", svg.as_bytes());
+        let mut ids = rule_ids(&findings);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["L001", "S002"]);
+        let l001 = &of_rule(&findings, "L001")[0];
+        assert_eq!(l001.raw.message, "malformed XML");
+        assert_eq!(l001.severity, Severity::Low);
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+        let s002 = &of_rule(&findings, "S002")[0];
+        assert_eq!(s002.severity, Severity::Critical);
+        assert_eq!(s002.raw.family, Family::S);
+        assert_eq!(s002.raw.base, Severity::High);
+        assert_eq!(s002.raw.status, RuleStatus::Stable);
+        assert_eq!(s002.raw.carrier, CarrierKind::HiddenText);
+        assert_eq!(s002.raw.span.byte_start, tail_start as u64);
+        assert_eq!(s002.raw.span.byte_end, svg.len() as u64);
+        assert_eq!(s002.raw.span, l001.raw.span);
+        assert_eq!(
+            s002.raw.payload.as_deref(),
+            Some(format!("</g>{PHRASE}").as_str())
+        );
+        assert_eq!(s002.raw.evidence, format!("</g>{PHRASE}").as_bytes());
+    }
+
+    #[test]
+    fn truncated_svg_with_ordinary_text_gives_only_the_low_finding() {
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><text x=\"1\" y=\"2\">Hello wor";
+        let (findings, coverage, _) = scan("a.svg", svg.as_bytes());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].raw.rule_id, "L001");
+        assert_eq!(findings[0].raw.message, "malformed XML");
+        assert_eq!(findings[0].severity, Severity::Low);
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn ordinary_words_in_a_malformed_tail_give_only_the_low_finding() {
+        let svg = format!("{SVG_OPEN}<g></g></g>just some quiet words");
+        let (findings, coverage, _) = scan("a.svg", svg.as_bytes());
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn script_after_svg_parse_error_reaches_the_engine_as_s003() {
+        let svg = format!("{SVG_OPEN}<g></g></g><script>alert(1)</script>");
+        let (findings, _, _) = scan("a.svg", svg.as_bytes());
+        let s003 = of_rule(&findings, "S003");
+        assert_eq!(s003.len(), 1);
+        assert_eq!(s003[0].severity, Severity::High);
+        assert_eq!(s003[0].raw.evidence, b"<script");
+    }
+
+    #[test]
+    fn malformed_svg_tail_unicode_finding_is_reported_once() {
+        let svg = format!("{SVG_OPEN}<g></g></g>{}", tags("hello there friend"));
+        let (findings, coverage, _) = scan("a.svg", svg.as_bytes());
+        assert_eq!(of_rule(&findings, "U002").len(), 1);
+        assert_eq!(of_rule(&findings, "L001").len(), 1);
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn malformed_svg_in_data_uri_gives_tail_s002_at_uri_span() {
+        let svg = format!("{SVG_OPEN}<g></g></g>{PHRASE}");
+        let (text, start, end) = data_uri_readme("image/svg+xml", svg.as_bytes());
+        let (findings, coverage, _) = scan("README.md", text.as_bytes());
+        let s002 = of_rule(&findings, "S002");
+        assert_eq!(s002.len(), 1);
+        assert_uri_span(s002[0], start, end);
+        assert_eq!(s002[0].severity, Severity::Critical);
+        assert_eq!(s002[0].path, "README.md");
+        assert_eq!(
+            s002[0].raw.payload.as_deref(),
+            Some(format!("</g>{PHRASE}").as_str())
+        );
+        let l001 = of_rule(&findings, "L001");
+        assert_eq!(l001.len(), 1);
+        assert_eq!(l001[0].raw.message, "malformed XML");
+        assert_uri_span(l001[0], start, end);
+        assert_eq!(of_rule(&findings, "E001").len(), 1);
+        assert_eq!(of_rule(&findings, "A001").len(), 0);
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn s002_payload_from_a_malformed_tail_is_capped_at_256_characters() {
+        let long = format!("{PHRASE} {}", "w".repeat(400));
+        let svg = format!("{SVG_OPEN}<g></g></g>{long}");
+        let (findings, _, _) = scan("a.svg", svg.as_bytes());
+        let s002 = of_rule(&findings, "S002");
+        assert_eq!(s002.len(), 1);
+        assert_eq!(s002[0].raw.payload.as_deref().unwrap().chars().count(), 256);
+    }
+
+    #[test]
+    fn depth_limit_is_l001_without_malformed() {
+        let limits = Limits {
+            max_xml_depth: 4,
+            ..Limits::default()
+        };
+        let svg = format!("{}{}", "<g>".repeat(6), "</g>".repeat(6));
+        let (findings, coverage, _) = scan_file("a.svg", svg.as_bytes(), &limits);
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_ne!(findings[0].raw.message, "malformed XML");
+        assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+    }
+
+    #[test]
+    fn attribute_limit_is_l001_without_malformed() {
+        let limits = Limits {
+            max_xml_attributes: 2,
+            ..Limits::default()
+        };
+        let svg = "<svg><g a=\"1\" b=\"2\" c=\"3\"/></svg>";
+        let (findings, coverage, _) = scan_file("a.svg", svg.as_bytes(), &limits);
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_ne!(findings[0].raw.message, "malformed XML");
+        assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+    }
+
+    #[test]
+    fn scan_oversize_takes_kind_from_prefix_and_reports_declared_length() {
+        let limits = Limits::default();
+        let png = png_with_text("A", "hello");
+        let (findings, coverage, counts) = scan_oversize("big.dat", &png, 40_000_000, &limits);
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(findings[0].raw.message, "file size limit");
+        assert_eq!(findings[0].raw.span.byte_start, 0);
+        assert_eq!(findings[0].raw.span.byte_end, 40_000_000);
+        assert_eq!(coverage.kind, FileKind::Png);
+        assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(coverage.path, "big.dat");
+        assert!(counts.is_empty());
+        let (_, coverage, _) = scan_oversize("big.txt", b"plain words", 40_000_000, &limits);
+        assert_eq!(coverage.kind, FileKind::Text);
+    }
+
+    #[test]
+    fn unreadable_helper_is_unknown_binary_l001_unreadable() {
+        let (findings, coverage, counts) = unreadable("AGENTS.md");
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(findings[0].raw.message, "unreadable file");
+        assert_eq!(findings[0].path, "AGENTS.md");
+        assert_eq!(findings[0].location, LocationKind::AgentFile);
+        assert_eq!(coverage.kind, FileKind::UnknownBinary);
+        assert_eq!(coverage.category, Category::UnknownBinary);
+        assert_eq!(coverage.skip, Some(SkipReason::Unreadable));
+        assert!(counts.is_empty());
     }
 }

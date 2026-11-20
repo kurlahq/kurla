@@ -125,6 +125,7 @@ pub enum SkipReason {
     ExcludedByUser,
     SymlinkNotFollowed,
     PdfNotScanned,
+    Malformed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +180,7 @@ pub struct EmbeddedNotScanned {
     pub span: Span,
     pub declared_type: Option<String>,
     pub kind: FileKind,
-    pub reason: &'static str,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +191,7 @@ pub struct FileCoverage {
     pub skip: Option<SkipReason>,
     pub drawn_text_unscanned: bool,
     pub embedded_not_scanned: Vec<EmbeddedNotScanned>,
+    pub encoded_runs_not_payloads: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -19,6 +19,7 @@ const MIN_WORDS: usize = 3;
 pub struct EmbeddedBlob {
     pub kind: FileKind,
     pub declared_type: Option<String>,
+    pub format: Option<&'static str>,
     pub span: Span,
     pub bytes: Vec<u8>,
     pub evidence: Vec<u8>,
@@ -27,8 +28,99 @@ pub struct EmbeddedBlob {
 pub struct EncodedOutput {
     pub out: DetectorOutput,
     pub blobs: Vec<EmbeddedBlob>,
+    pub not_payload_runs: u64,
 }
 
+fn is_scannable_image(kind: FileKind) -> bool {
+    matches!(
+        kind,
+        FileKind::Png | FileKind::Jpeg | FileKind::Gif | FileKind::Webp | FileKind::Avif
+    )
+}
+
+fn le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let slice = bytes.get(at..at + 4)?;
+    Some(u32::from_le_bytes(slice.try_into().ok()?))
+}
+
+fn pe_header_present(bytes: &[u8]) -> bool {
+    le_u32(bytes, 0x3C)
+        .and_then(|at| usize::try_from(at).ok())
+        .and_then(|at| bytes.get(at..at.checked_add(4)?))
+        .is_some_and(|signature| signature == b"PE\0\0")
+}
+
+fn ftyp_format(bytes: &[u8]) -> Option<&'static str> {
+    let is_box = bytes.get(4..8) == Some(b"ftyp".as_slice());
+    (is_box && binary::sniff(bytes, "") != FileKind::Avif).then_some("mp4/mov")
+}
+pub fn unscannable_signature(bytes: &[u8]) -> Option<&'static str> {
+    const PREFIXES: [(&[u8], &str); 22] = [
+        (b"%PDF-", "pdf"),
+        (b"PK\x03\x04", "zip"),
+        (b"PK\x05\x06", "zip"),
+        (b"PK\x07\x08", "zip"),
+        (&[0x1F, 0x8B, 0x08], "gzip"),
+        (&[0xFD, b'7', b'z', b'X', b'Z', 0x00], "xz"),
+        (&[0x28, 0xB5, 0x2F, 0xFD], "zstd"),
+        (&[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C], "7z"),
+        (b"Rar!\x1A\x07", "rar"),
+        (b"\x7FELF", "elf"),
+        (&[0xFE, 0xED, 0xFA, 0xCE], "mach-o"),
+        (&[0xFE, 0xED, 0xFA, 0xCF], "mach-o"),
+        (&[0xCE, 0xFA, 0xED, 0xFE], "mach-o"),
+        (&[0xCF, 0xFA, 0xED, 0xFE], "mach-o"),
+        (&[0xCA, 0xFE, 0xBA, 0xBE], "java class or fat mach-o"),
+        (b"\0asm", "wasm"),
+        (b"SQLite format 3\0", "sqlite"),
+        (b"OTTO", "otf"),
+        (b"wOFF", "woff"),
+        (b"wOF2", "woff2"),
+        (b"OggS", "ogg"),
+        (b"fLaC", "flac"),
+    ];
+    if let Some((_, name)) = PREFIXES
+        .iter()
+        .find(|(prefix, _)| bytes.starts_with(prefix))
+    {
+        return Some(name);
+    }
+    if bytes.starts_with(b"ID3") {
+        return Some("mp3");
+    }
+    if bytes.starts_with(b"BZh")
+        && bytes
+            .get(3)
+            .is_some_and(|level| (b'1'..=b'9').contains(level))
+    {
+        return Some("bzip2");
+    }
+    if bytes.starts_with(b"MZ") && pe_header_present(bytes) {
+        return Some("pe");
+    }
+    if bytes.starts_with(b"RIFF") && matches!(bytes.get(8..12), Some(b"WAVE") | Some(b"AVI ")) {
+        return Some("riff");
+    }
+    if let Some(name) = ftyp_format(bytes) {
+        return Some(name);
+    }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return Some("tiff");
+    }
+    if bytes.starts_with(&[0, 0, 1, 0])
+        && bytes
+            .get(4..6)
+            .is_some_and(|count| u16::from_le_bytes([count[0], count[1]]) != 0)
+    {
+        return Some("ico");
+    }
+    if bytes.starts_with(b"BM")
+        && le_u32(bytes, 2).and_then(|size| usize::try_from(size).ok()) == Some(bytes.len())
+    {
+        return Some("bmp");
+    }
+    None
+}
 fn contains_ignore_ascii_case(text: &str, needle: &str) -> bool {
     text.to_ascii_lowercase().contains(needle)
 }
@@ -376,6 +468,7 @@ struct Scanner<'a> {
     blobs: Vec<EmbeddedBlob>,
     findings: Vec<RawFinding>,
     size_limited: bool,
+    not_payload_runs: u64,
 }
 
 impl Scanner<'_> {
@@ -430,13 +523,42 @@ impl Scanner<'_> {
         start: usize,
         end: usize,
     ) {
+        self.blob_formatted(kind, declared_type, None, bytes, start, end);
+    }
+
+    fn blob_formatted(
+        &mut self,
+        kind: FileKind,
+        declared_type: Option<String>,
+        format: Option<&'static str>,
+        bytes: Vec<u8>,
+        start: usize,
+        end: usize,
+    ) {
         self.blobs.push(EmbeddedBlob {
             kind,
             declared_type,
+            format,
             span: self.span(start, end),
             bytes,
             evidence: self.evidence(start, end),
         });
+    }
+
+    fn unscannable(
+        &mut self,
+        name: &'static str,
+        declared_type: Option<String>,
+        bytes: Vec<u8>,
+        start: usize,
+        end: usize,
+    ) {
+        let kind = if name == "pdf" {
+            FileKind::Pdf
+        } else {
+            FileKind::UnknownBinary
+        };
+        self.blob_formatted(kind, declared_type, Some(name), bytes, start, end);
     }
 
     fn uri(&mut self, uri: &Uri) {
@@ -452,18 +574,35 @@ impl Scanner<'_> {
             payload.len()
         };
         let payload = &self.chars[uri.payload_start..uri.payload_start + used];
-        let bytes = if uri.base64 {
+        let mut bytes = if uri.base64 {
             decode_base64(payload)
         } else {
             let text: String = payload.iter().collect();
             percent_decode(&decode_references(&text))
         };
         let kind = sniff_embedded(&bytes, Some(&uri.declared_type));
+        let declared = Some(uri.declared_type.clone());
+        let signature = if is_scannable_image(kind) {
+            None
+        } else {
+            unscannable_signature(&bytes)
+        };
+        if let Some(name) = signature {
+            let also_text = matches!(kind, FileKind::Text | FileKind::Svg);
+            let listed = if also_text {
+                bytes.clone()
+            } else {
+                std::mem::take(&mut bytes)
+            };
+            self.unscannable(name, declared.clone(), listed, uri.start, uri.end);
+            if !also_text {
+                return;
+            }
+        }
         let text = match kind {
             FileKind::Text | FileKind::Svg => TextDoc::decode(&bytes).map(|d| d.text),
             _ => None,
         };
-        let declared = Some(uri.declared_type.clone());
         match (kind, text) {
             (FileKind::Text, Some(text)) => self.carrier(text, uri.start, uri.end),
             (FileKind::Svg, text) => {
@@ -479,7 +618,7 @@ impl Scanner<'_> {
         }
     }
 
-    fn classify_bare(&mut self, bytes: Vec<u8>, start: usize, end: usize) -> bool {
+    fn classify_bare(&mut self, mut bytes: Vec<u8>, start: usize, end: usize) -> bool {
         let kind = sniff_embedded(&bytes, None);
         match kind {
             FileKind::Png | FileKind::Jpeg | FileKind::Gif | FileKind::Webp | FileKind::Avif => {
@@ -494,14 +633,27 @@ impl Scanner<'_> {
                 }
                 return true;
             }
-            FileKind::Pdf | FileKind::UnknownBinary | FileKind::OtherImage => return false,
-            FileKind::Text => {}
+            FileKind::Pdf | FileKind::UnknownBinary | FileKind::OtherImage | FileKind::Text => {}
+        }
+        let also_text = kind == FileKind::Text;
+        let mut listed = false;
+        if let Some(name) = unscannable_signature(&bytes) {
+            let kept = if also_text {
+                bytes.clone()
+            } else {
+                std::mem::take(&mut bytes)
+            };
+            self.unscannable(name, None, kept, start, end);
+            listed = true;
+        }
+        if !also_text {
+            return listed;
         }
         let Some(doc) = TextDoc::decode(&bytes) else {
-            return false;
+            return listed;
         };
         if !qualifies_as_payload(&doc.text) {
-            return false;
+            return listed;
         }
         self.carrier(doc.text, start, end);
         true
@@ -542,6 +694,7 @@ impl Scanner<'_> {
     }
 
     fn run(&mut self, start: usize, end: usize) {
+        let emitted_before = self.carriers.len() + self.blobs.len();
         let over = end - start > self.max_run;
         if over {
             self.limit("encoded run limit", start, end);
@@ -571,6 +724,9 @@ impl Scanner<'_> {
                 piece_start = k + 1;
             }
         }
+        if self.carriers.len() + self.blobs.len() == emitted_before {
+            self.not_payload_runs += 1;
+        }
     }
 }
 
@@ -593,6 +749,7 @@ pub fn scan_encoded(doc: &TextDoc, depth: u8, budget: &mut Budget) -> EncodedOut
         blobs: Vec::new(),
         findings: Vec::new(),
         size_limited: false,
+        not_payload_runs: 0,
     };
     for item in &items {
         if ticker.check_now() {
@@ -642,6 +799,11 @@ pub fn scan_encoded(doc: &TextDoc, depth: u8, budget: &mut Budget) -> EncodedOut
             skip,
         },
         blobs: scanner.blobs,
+        not_payload_runs: if at_limit {
+            0
+        } else {
+            scanner.not_payload_runs
+        },
     }
 }
 
@@ -1306,5 +1468,264 @@ mod tests {
         assert_eq!(out.out.carriers[0].span.byte_start, 1);
         assert_eq!(out.out.carriers[0].span.byte_end, 32);
         assert_eq!(out.out.carriers[1].span.byte_start, 33);
+    }
+
+    fn padded(head: &[u8], total: usize) -> Vec<u8> {
+        let mut v = head.to_vec();
+        v.extend(high_bytes((total - head.len()) as u8));
+        v
+    }
+
+    fn pe_image(e_lfanew: u32, signature_at: usize) -> Vec<u8> {
+        let mut v = vec![0u8; 0x100];
+        v[0] = b'M';
+        v[1] = b'Z';
+        v[0x3C..0x40].copy_from_slice(&e_lfanew.to_le_bytes());
+        v[signature_at..signature_at + 4].copy_from_slice(b"PE\0\0");
+        v
+    }
+
+    #[test]
+    fn every_unscannable_signature_names_its_format() {
+        let table: Vec<(Vec<u8>, &str)> = vec![
+            (b"%PDF-1.7".to_vec(), "pdf"),
+            (vec![b'P', b'K', 3, 4, 0], "zip"),
+            (vec![b'P', b'K', 5, 6, 0], "zip"),
+            (vec![b'P', b'K', 7, 8, 0], "zip"),
+            (vec![0x1F, 0x8B, 0x08, 0], "gzip"),
+            (b"BZh1".to_vec(), "bzip2"),
+            (b"BZh9".to_vec(), "bzip2"),
+            (vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00], "xz"),
+            (vec![0x28, 0xB5, 0x2F, 0xFD], "zstd"),
+            (vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C], "7z"),
+            (vec![0x52, 0x61, 0x72, 0x21, 0x1A, 0x07], "rar"),
+            (vec![0x7F, 0x45, 0x4C, 0x46], "elf"),
+            (vec![0xFE, 0xED, 0xFA, 0xCE], "mach-o"),
+            (vec![0xFE, 0xED, 0xFA, 0xCF], "mach-o"),
+            (vec![0xCE, 0xFA, 0xED, 0xFE], "mach-o"),
+            (vec![0xCF, 0xFA, 0xED, 0xFE], "mach-o"),
+            (vec![0xCA, 0xFE, 0xBA, 0xBE], "java class or fat mach-o"),
+            (vec![0x00, 0x61, 0x73, 0x6D], "wasm"),
+            (pe_image(0x80, 0x80), "pe"),
+            (b"SQLite format 3\0".to_vec(), "sqlite"),
+            (b"OTTO".to_vec(), "otf"),
+            (b"wOFF".to_vec(), "woff"),
+            (b"wOF2".to_vec(), "woff2"),
+            (b"OggS".to_vec(), "ogg"),
+            (b"fLaC".to_vec(), "flac"),
+            (b"ID3".to_vec(), "mp3"),
+            (b"RIFF\x10\0\0\0WAVEfmt ".to_vec(), "riff"),
+            (b"RIFF\x10\0\0\0AVI LIST".to_vec(), "riff"),
+            (b"\0\0\0\x14ftypisom\0\0\x02\0".to_vec(), "mp4/mov"),
+            (b"\0\0\0\x14ftypqt  \0\0\0\0".to_vec(), "mp4/mov"),
+            (vec![b'I', b'I', b'*', 0, 8, 0, 0, 0], "tiff"),
+            (vec![b'M', b'M', 0, b'*', 0, 0, 0, 8], "tiff"),
+            (vec![0, 0, 1, 0, 1, 0, 16, 16], "ico"),
+            (vec![b'B', b'M', 8, 0, 0, 0, 0, 0], "bmp"),
+        ];
+        for (bytes, name) in &table {
+            assert_eq!(unscannable_signature(bytes), Some(*name), "{name}");
+        }
+    }
+
+    #[test]
+    fn near_miss_signatures_are_not_unscannable() {
+        let misses: Vec<Vec<u8>> = vec![
+            vec![b'P', b'K', 1, 2, 0],
+            vec![b'P', b'K', 3],
+            vec![0x1F, 0x8B, 0x07, 0],
+            b"BZh0".to_vec(),
+            b"BZh".to_vec(),
+            b"BZhx".to_vec(),
+            vec![0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x01],
+            vec![0x7F, 0x45, 0x4C],
+            b"RIFF\x10\0\0\0WEBPVP8 ".to_vec(),
+            b"RIFF\x10\0\0\0WAV".to_vec(),
+            b"\0\0\0\x14ftypavif\0\0\0\0mif1".to_vec(),
+            b"\0\0\0\x14ftypheic\0\0\0\0heic".to_vec(),
+            vec![0, 0, 1, 0, 0, 0, 16, 16],
+            vec![0, 0, 1, 0, 1],
+            vec![b'I', b'I', b'*', 1],
+            b"II".to_vec(),
+            b"ID".to_vec(),
+            b"SQLite format 4\0".to_vec(),
+            Vec::new(),
+            b"plain words here".to_vec(),
+        ];
+        for bytes in &misses {
+            assert_eq!(unscannable_signature(bytes), None, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn pe_signature_needs_its_pe_header() {
+        assert_eq!(unscannable_signature(&pe_image(0x80, 0x80)), Some("pe"));
+        assert_eq!(unscannable_signature(&pe_image(0x40, 0x40)), Some("pe"));
+        let no_header = padded(b"MZ", 0x100);
+        assert_eq!(unscannable_signature(&no_header), None);
+        assert_eq!(unscannable_signature(&pe_image(0x80, 0x90)), None);
+        assert_eq!(unscannable_signature(&pe_image(0xFE, 0x80)), None);
+        assert_eq!(unscannable_signature(&pe_image(0x1000, 0x80)), None);
+        assert_eq!(unscannable_signature(b"MZ"), None);
+        let out = run(&b64(&no_header), 0);
+        assert!(out.blobs.is_empty());
+        assert!(out.out.carriers.is_empty());
+        assert_eq!(out.not_payload_runs, 1);
+    }
+
+    #[test]
+    fn bmp_signature_needs_its_own_length() {
+        let mut bmp = vec![b'B', b'M', 0, 0, 0, 0, 0, 0];
+        bmp.extend(high_bytes(24));
+        let len = bmp.len() as u32;
+        bmp[2..6].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(unscannable_signature(&bmp), Some("bmp"));
+        bmp[2..6].copy_from_slice(&(len + 1).to_le_bytes());
+        assert_eq!(unscannable_signature(&bmp), None);
+    }
+
+    #[test]
+    fn bare_base64_zip_is_listed_as_not_scanned() {
+        let zip = padded(&[b'P', b'K', 3, 4, 20, 0], 48);
+        let out = run(&format!("archive {}", b64(&zip)), 0);
+        assert!(out.out.carriers.is_empty());
+        assert_eq!(out.blobs.len(), 1);
+        assert_eq!(out.blobs[0].kind, FileKind::UnknownBinary);
+        assert_eq!(out.blobs[0].format, Some("zip"));
+        assert_eq!(out.blobs[0].declared_type, None);
+        assert_eq!(out.blobs[0].bytes, zip);
+        assert_eq!(out.blobs[0].span.byte_start, 8);
+        assert_eq!(out.not_payload_runs, 0);
+    }
+
+    #[test]
+    fn bare_base64_gzip_is_listed_as_not_scanned() {
+        let gzip = padded(&[0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0], 48);
+        let out = run(&b64(&gzip), 0);
+        assert!(out.out.carriers.is_empty());
+        assert_eq!(out.blobs.len(), 1);
+        assert_eq!(out.blobs[0].kind, FileKind::UnknownBinary);
+        assert_eq!(out.blobs[0].format, Some("gzip"));
+        assert_eq!(out.not_payload_runs, 0);
+    }
+
+    #[test]
+    fn bare_base64_pdf_is_listed_as_pdf() {
+        let pdf = padded(b"%PDF-1.7\n", 48);
+        let out = run(&b64(&pdf), 0);
+        assert_eq!(out.blobs.len(), 1);
+        assert_eq!(out.blobs[0].kind, FileKind::Pdf);
+        assert_eq!(out.blobs[0].format, Some("pdf"));
+        assert_eq!(out.not_payload_runs, 0);
+    }
+
+    #[test]
+    fn bare_hex_zip_is_listed_as_not_scanned() {
+        let zip = padded(&[b'P', b'K', 3, 4, 20, 0], 48);
+        let out = run(&hex(&zip), 0);
+        assert_eq!(out.blobs.len(), 1);
+        assert_eq!(out.blobs[0].format, Some("zip"));
+        assert_eq!(out.not_payload_runs, 0);
+    }
+
+    #[test]
+    fn data_uri_blob_carries_the_format_and_scannable_images_carry_none() {
+        let zip = padded(&[b'P', b'K', 3, 4, 20, 0], 24);
+        let out = run(&format!("data:application/zip;base64,{}", b64(&zip)), 0);
+        assert_eq!(out.blobs.len(), 1);
+        assert_eq!(out.blobs[0].kind, FileKind::UnknownBinary);
+        assert_eq!(out.blobs[0].format, Some("zip"));
+        assert_eq!(
+            out.blobs[0].declared_type.as_deref(),
+            Some("application/zip")
+        );
+        assert_eq!(out.not_payload_runs, 0);
+        let out = run(&format!("data:image/png;base64,{}", b64(&png())), 0);
+        assert_eq!(out.blobs[0].kind, FileKind::Png);
+        assert_eq!(out.blobs[0].format, None);
+        let random = high_bytes(16);
+        let out = run(
+            &format!("data:application/octet-stream;base64,{}", b64(&random)),
+            0,
+        );
+        assert_eq!(out.blobs[0].format, None);
+        let pdf = b"%PDF-1.4\n1 0 obj\n";
+        let out = run(&format!("data:application/pdf;base64,{}", b64(pdf)), 0);
+        assert_eq!(out.blobs[0].format, Some("pdf"));
+    }
+
+    #[test]
+    fn text_that_starts_with_a_signature_is_still_scanned_and_listed() {
+        let text = format!("OTTO {MSG}");
+        let out = run(&b64(text.as_bytes()), 0);
+        assert_eq!(texts(&out), vec![text.as_str()]);
+        assert_eq!(out.blobs.len(), 1);
+        assert_eq!(out.blobs[0].format, Some("otf"));
+        assert_eq!(out.not_payload_runs, 0);
+        let out = run(
+            &format!("data:text/plain;base64,{}", b64(text.as_bytes())),
+            0,
+        );
+        assert_eq!(texts(&out), vec![text.as_str()]);
+        assert_eq!(out.blobs.len(), 1);
+        assert_eq!(out.blobs[0].format, Some("otf"));
+    }
+
+    #[test]
+    fn random_hash_runs_are_counted_not_listed() {
+        let hashes: Vec<String> = (0..3u8)
+            .map(|i| {
+                let bytes: Vec<u8> = (0..64u16)
+                    .map(|k| 0x80 | ((k * 5 + u16::from(i) * 17) & 0x7F) as u8)
+                    .collect();
+                format!("sha512-{}", b64(&bytes))
+            })
+            .collect();
+        let out = run(&hashes.join("\n"), 0);
+        assert!(out.blobs.is_empty());
+        assert!(out.out.carriers.is_empty());
+        assert!(out.out.findings.is_empty());
+        assert_eq!(out.not_payload_runs, 3);
+    }
+
+    #[test]
+    fn a_run_counts_once_however_many_decode_attempts_it_took() {
+        let text = format!("{}-{}", "ff".repeat(40), "ee".repeat(30));
+        let out = run(&text, 0);
+        assert!(out.blobs.is_empty());
+        assert!(out.out.carriers.is_empty());
+        assert_eq!(out.not_payload_runs, 1);
+    }
+
+    #[test]
+    fn a_run_that_decodes_to_a_payload_is_not_counted() {
+        let hash = format!("sha512-{}", b64(&high_bytes(48)));
+        let out = run(&format!("{} {hash}", b64(MSG.as_bytes())), 0);
+        assert_eq!(texts(&out), vec![MSG]);
+        assert_eq!(out.not_payload_runs, 1);
+        let out = run(&b64(MSG.as_bytes()), 0);
+        assert_eq!(out.not_payload_runs, 0);
+    }
+
+    #[test]
+    fn runs_at_the_depth_limit_are_not_counted() {
+        let hash = format!("sha512-{}", b64(&high_bytes(48)));
+        assert_eq!(run(&hash, 0).not_payload_runs, 1);
+        assert_eq!(run(&hash, 1).not_payload_runs, 1);
+        assert_eq!(run(&hash, 2).not_payload_runs, 0);
+    }
+
+    #[test]
+    fn data_uris_and_short_runs_are_not_counted_as_runs() {
+        let random = high_bytes(16);
+        let out = run(
+            &format!(
+                "data:application/octet-stream;base64,{} short",
+                b64(&random)
+            ),
+            0,
+        );
+        assert_eq!(out.not_payload_runs, 0);
+        assert_eq!(run("abcdefghijklmnopqrstuvwxyz", 0).not_payload_runs, 0);
     }
 }

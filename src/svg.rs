@@ -12,6 +12,8 @@ use crate::model::{
 };
 use crate::text::TextDoc;
 
+pub const MALFORMED_XML: &str = "malformed XML";
+
 const EVIDENCE_CAP: usize = 4096;
 const DEADLINE_STRIDE: usize = 1024;
 const BYTE_STRIDE: usize = 4096;
@@ -1196,6 +1198,80 @@ fn is_hidden(style: &Style, pre: &Prepass) -> bool {
         || off_canvas
 }
 
+const TAIL_SCRIPT: &[u8] = b"<script";
+const TAIL_JAVASCRIPT: &[u8] = b"javascript:";
+
+fn is_handler_separator(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b'<' | b'/' | b'"' | b'\'')
+}
+
+fn tail_handler_end(bytes: &[u8], at: usize) -> Option<usize> {
+    if at == 0 || !is_handler_separator(bytes[at - 1]) {
+        return None;
+    }
+    if !bytes.get(at..at + 2)?.eq_ignore_ascii_case(b"on") {
+        return None;
+    }
+    let mut k = at + 2;
+    while bytes.get(k).is_some_and(u8::is_ascii_alphabetic) {
+        k += 1;
+    }
+    if k == at + 2 {
+        return None;
+    }
+    while bytes.get(k).is_some_and(u8::is_ascii_whitespace) {
+        k += 1;
+    }
+    (bytes.get(k) == Some(&b'=')).then_some(k + 1)
+}
+
+fn tail_javascript_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut k = at;
+    for (n, expected) in TAIL_JAVASCRIPT.iter().enumerate() {
+        if n > 0 {
+            while matches!(bytes.get(k), Some(b'\t' | b'\r' | b'\n')) {
+                k += 1;
+            }
+        }
+        if bytes.get(k)?.to_ascii_lowercase() != *expected {
+            return None;
+        }
+        k += 1;
+    }
+    Some(k)
+}
+
+fn tail_matches(tail: &str) -> Vec<(usize, usize, &'static str)> {
+    let bytes = tail.as_bytes();
+    let mut found = Vec::new();
+    for at in 0..bytes.len() {
+        if bytes
+            .get(at..at + TAIL_SCRIPT.len())
+            .is_some_and(|window| window.eq_ignore_ascii_case(TAIL_SCRIPT))
+        {
+            found.push((
+                at,
+                at + TAIL_SCRIPT.len(),
+                "script element in malformed SVG",
+            ));
+        }
+        if let Some(end) = tail_handler_end(bytes, at) {
+            found.push((at, end, "event handler attribute in malformed SVG"));
+        }
+        if let Some(end) = tail_javascript_end(bytes, at) {
+            found.push((at, end, "javascript URL in malformed SVG"));
+        }
+    }
+    found
+}
+
+fn boundary_at_or_before(text: &str, at: usize) -> usize {
+    (0..=at.min(text.len()))
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0)
+}
+
 struct Scanner<'a> {
     bytes: &'a [u8],
     doc: &'a TextDoc,
@@ -1206,6 +1282,7 @@ struct Scanner<'a> {
     hidden_root: Option<HiddenRoot>,
     dtd: Dtd,
     subst: Subst,
+    attribute_error: bool,
 }
 
 impl Scanner<'_> {
@@ -1310,6 +1387,30 @@ impl Scanner<'_> {
         }
     }
 
+    fn malformed_tail(&mut self, text: &str, start: usize) {
+        let start = boundary_at_or_before(text, start);
+        let tail = &text[start..];
+        let mut cursor = CharCursor {
+            text,
+            byte: 0,
+            chars: 0,
+        };
+        let tail_char_start = cursor.at(start);
+        for (from, to, message) in tail_matches(tail) {
+            let char_start = cursor.at(start + from);
+            let char_end = cursor.at(start + to);
+            let span = self.chars_span(char_start, char_end);
+            let matched: String = tail[from..to].chars().take(PAYLOAD_VALUE_CAP).collect();
+            self.finding(&ACTIVE_CONTENT, span, Some(matched), message);
+        }
+        let span = self.chars_span(tail_char_start, cursor.at(text.len()));
+        if !tail.trim().is_empty() {
+            self.carrier(tail.to_string(), span, true);
+        }
+        self.finding(&LIMIT_HIT, span, None, MALFORMED_XML);
+        self.out.skip = Some(SkipReason::Malformed);
+    }
+
     fn after_doctype(&mut self, span: Span) {
         for issue in std::mem::take(&mut self.dtd.issues) {
             match issue {
@@ -1395,7 +1496,10 @@ impl Scanner<'_> {
                 self.limit_hit(span, "element has more attributes than the limit");
                 return false;
             }
-            Err(AttrError::Malformed) => return false,
+            Err(AttrError::Malformed) => {
+                self.attribute_error = true;
+                return false;
+            }
         };
         let name = local_name(element);
         for attr in &attrs {
@@ -1493,19 +1597,22 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
         hidden_root: None,
         dtd: Dtd::default(),
         subst: Subst::none(),
+        attribute_error: false,
     };
     let mut reader = Reader::from_str(text);
     let mut stack: Vec<Style> = Vec::new();
     let mut events = 0usize;
     let mut last_end = 0;
+    let mut malformed_at: Option<usize> = None;
     loop {
         if events.is_multiple_of(DEADLINE_STRIDE) && budget.deadline_exceeded() {
             scanner.out.skip = Some(SkipReason::Timeout);
             break;
         }
         events += 1;
-        let start = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
+        let start = usize::try_from(reader.buffer_position()).unwrap_or(0);
         let Ok(event) = reader.read_event() else {
+            malformed_at = Some(start);
             break;
         };
         let end = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
@@ -1530,12 +1637,18 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
             Event::Start(e) => {
                 let span = scanner.span(start, end);
                 if !scanner.element(&e, span, true, &mut stack, &pre, limits) {
+                    if scanner.attribute_error {
+                        malformed_at = Some(start);
+                    }
                     break;
                 }
             }
             Event::Empty(e) => {
                 let span = scanner.span(start, end);
                 if !scanner.element(&e, span, false, &mut stack, &pre, limits) {
+                    if scanner.attribute_error {
+                        malformed_at = Some(start);
+                    }
                     break;
                 }
             }
@@ -1572,7 +1685,12 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
                 scanner.stylesheet(&p, span);
             }
             Event::Decl(_) => {}
-            Event::Eof => break,
+            Event::Eof => {
+                if !stack.is_empty() {
+                    malformed_at = Some(start);
+                }
+                break;
+            }
         }
     }
     scanner.flush();
@@ -1581,6 +1699,9 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
     if let (Some((payload, message)), Some(span)) = (scanner.dtd.verdict(cap_hit), scanner.dtd.span)
     {
         scanner.finding(&ENTITY_BOMB, span, Some(payload), message);
+    }
+    if let Some(start) = malformed_at {
+        scanner.malformed_tail(text, start);
     }
     scanner.out
 }
@@ -1722,7 +1843,7 @@ mod tests {
             max_xml_depth: 8,
             ..Limits::default()
         };
-        let at_limit = "<g>".repeat(8);
+        let at_limit = format!("{}{}", "<g>".repeat(8), "</g>".repeat(8));
         let out = scan_bytes(at_limit.as_bytes(), &limits);
         assert!(rule(&out, "L001").is_empty());
         assert_eq!(out.skip, None);
@@ -2111,11 +2232,27 @@ mod tests {
     }
 
     #[test]
-    fn malformed_xml_keeps_what_was_found_without_a_finding() {
+    fn malformed_xml_keeps_what_was_found_and_gives_l001() {
         let out = scan("<svg><title>kept</title><g></svg>");
-        assert!(out.findings.is_empty());
-        assert_eq!(out.skip, None);
         assert_eq!(out.carriers[0].text, "kept");
+        assert_eq!(out.findings.len(), 1);
+        let l001 = &out.findings[0];
+        assert_eq!(l001.rule_id, "L001");
+        assert_eq!(l001.family, Family::L);
+        assert_eq!(l001.base, Severity::Low);
+        assert_eq!(l001.status, RuleStatus::Stable);
+        assert_eq!(l001.carrier, CarrierKind::ResourceLimit);
+        assert_eq!(l001.message, MALFORMED_XML);
+        assert_eq!(l001.message, "malformed XML");
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        let tail = &out.carriers[1];
+        assert_eq!(tail.kind, CarrierKind::SvgText);
+        assert!(tail.hidden);
+        assert_eq!(tail.text, "</svg>");
+        assert_eq!(tail.evidence, b"</svg>");
+        assert_eq!(tail.span.byte_start, 27);
+        assert_eq!(tail.span.byte_end, 33);
+        assert_eq!(l001.span, tail.span);
         let out = scan_bytes(
             b"<svg><title>kept</title>\xff\xfe<g/></svg>",
             &Limits::default(),
@@ -2516,5 +2653,181 @@ mod tests {
         );
         assert_eq!(payloads(&out, "S002"), vec!["t"]);
         assert!(rule(&out, "S004").is_empty());
+    }
+
+    fn active(out: &DetectorOutput) -> Vec<&RawFinding> {
+        rule(out, "S003")
+    }
+
+    fn evidence_text(finding: &RawFinding) -> String {
+        String::from_utf8(finding.evidence.clone()).unwrap()
+    }
+
+    #[test]
+    fn tail_starts_at_the_failing_token() {
+        let src = "<svg><g>ok</g><text x=\"1>Hidden words live here</text></svg>";
+        let out = scan(src);
+        let tail = out.carriers.iter().find(|c| c.hidden).unwrap();
+        assert_eq!(tail.text, "<text x=\"1>Hidden words live here</text></svg>");
+        assert_eq!(tail.span.byte_start, 14);
+        assert_eq!(tail.span.byte_end, src.len() as u64);
+        assert_eq!(tail.span.line, Some(1));
+        assert_eq!(tail.span.column, Some(15));
+        let l001 = rule(&out, "L001");
+        assert_eq!(l001.len(), 1);
+        assert_eq!(l001[0].span, tail.span);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        assert!(out.carriers.iter().any(|c| c.text == "ok" && !c.hidden));
+    }
+
+    #[test]
+    fn truncated_document_with_open_elements_is_malformed_with_an_empty_tail_span() {
+        let src = "<svg xmlns=\"http://www.w3.org/2000/svg\"><text x=\"1\" y=\"2\">Hello wor";
+        let out = scan(src);
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].rule_id, "L001");
+        assert_eq!(out.findings[0].message, MALFORMED_XML);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        assert_eq!(out.findings[0].span.byte_start, src.len() as u64);
+        assert_eq!(out.findings[0].span.byte_end, src.len() as u64);
+        assert!(hidden_carriers(&out).is_empty());
+        assert!(out.carriers.iter().any(|c| c.text == "Hello wor"));
+    }
+
+    #[test]
+    fn well_formed_document_has_no_malformed_signal() {
+        let out = scan(&wrap("<text x=\"1\" y=\"2\">fine</text>"));
+        assert!(rule(&out, "L001").is_empty());
+        assert_eq!(out.skip, None);
+        assert!(hidden_carriers(&out).is_empty());
+    }
+
+    #[test]
+    fn open_element_followed_by_whitespace_signals_with_an_empty_tail() {
+        let out = scan("<svg><g>  \n ");
+        assert_eq!(rule(&out, "L001").len(), 1);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        assert!(hidden_carriers(&out).is_empty());
+        let l001 = rule(&out, "L001")[0];
+        assert_eq!(l001.span.byte_start, 12);
+        assert_eq!(l001.span.byte_end, 12);
+    }
+
+    #[test]
+    fn tail_evidence_is_capped_at_4096_bytes() {
+        let src = format!("<svg><g></g></g>{}", "x".repeat(5000));
+        let out = scan(&src);
+        let tail = out.carriers.iter().find(|c| c.hidden).unwrap();
+        assert_eq!(tail.text.len(), 5004);
+        assert_eq!(tail.evidence.len(), 4096);
+        assert_eq!(tail.span.byte_end - tail.span.byte_start, 5004);
+    }
+
+    #[test]
+    fn script_after_svg_parse_error_is_s003() {
+        let prefix = "<svg><title>t</title></g>";
+        let src = format!("{prefix}<g><SCRIPT>alert(1)</SCRIPT>");
+        let out = scan(&src);
+        let found = active(&out);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].family, Family::S);
+        assert_eq!(found[0].base, Severity::High);
+        assert_eq!(found[0].status, RuleStatus::Stable);
+        assert_eq!(found[0].carrier, CarrierKind::ActiveContent);
+        assert_eq!(found[0].span.byte_start, (prefix.len() + 3) as u64);
+        assert_eq!(found[0].span.byte_end, (prefix.len() + 10) as u64);
+        assert_eq!(evidence_text(found[0]), "<SCRIPT");
+    }
+
+    #[test]
+    fn event_handler_after_svg_parse_error_is_s003() {
+        let prefix = "<svg><title>t</title></g>";
+        let src = format!("{prefix}<rect onClick = \"x()\" /><a\tonload='y'/><b/onerror=z>");
+        let out = scan(&src);
+        let found = active(&out);
+        let texts: Vec<String> = found.iter().map(|f| evidence_text(f)).collect();
+        assert_eq!(texts, vec!["onClick =", "onload=", "onerror="]);
+        assert_eq!(found[0].span.byte_start, (prefix.len() + 6) as u64);
+        assert_eq!(found[0].span.byte_end, (prefix.len() + 15) as u64);
+    }
+
+    #[test]
+    fn plain_words_in_the_tail_are_not_s003() {
+        let prefix = "<svg><title>t</title></g>";
+        let src = format!(
+            "{prefix} xonclick=1 on=2 onclick ready=1 \"on\" java script: javascript </ script>"
+        );
+        assert!(active(&scan(&src)).is_empty());
+    }
+
+    #[test]
+    fn javascript_url_split_by_newline_after_svg_parse_error_is_s003() {
+        let prefix = "<svg><title>t</title></g>";
+        let src = format!("{prefix}<a href=\"java\r\n\tscript:alert(1)\"/>");
+        let out = scan(&src);
+        let found = active(&out);
+        assert_eq!(found.len(), 1);
+        assert_eq!(evidence_text(found[0]), "java\r\n\tscript:");
+        assert_eq!(found[0].span.byte_start, (prefix.len() + 9) as u64);
+        assert_eq!(found[0].span.byte_end, (prefix.len() + 23) as u64);
+        let plain = format!("{prefix}<a href=\"JavaScript:x\"/>");
+        assert_eq!(evidence_text(active(&scan(&plain))[0]), "JavaScript:");
+        let spaced = format!("{prefix}<a href=\"java script:x\"/>");
+        assert!(active(&scan(&spaced)).is_empty());
+    }
+
+    #[test]
+    fn findings_before_the_parse_error_are_kept_with_the_tail_findings() {
+        let src = "<svg onload=\"a()\"><g></g></g><script>x</script>";
+        let out = scan(src);
+        assert_eq!(active(&out).len(), 2);
+        assert_eq!(rule(&out, "L001").len(), 1);
+    }
+
+    #[test]
+    fn bad_attribute_is_malformed_and_tail_starts_at_its_tag() {
+        let src = "<svg><g a=1 b>secret words here</g></svg>";
+        let out = scan(src);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        let l001 = rule(&out, "L001");
+        assert_eq!(l001.len(), 1);
+        assert_eq!(l001[0].message, MALFORMED_XML);
+        let tail = out.carriers.iter().find(|c| c.hidden).unwrap();
+        assert_eq!(tail.text, "<g a=1 b>secret words here</g></svg>");
+        assert_eq!(tail.span.byte_start, 5);
+        assert_eq!(tail.span.byte_end, src.len() as u64);
+        assert_eq!(l001[0].span, tail.span);
+    }
+
+    #[test]
+    fn bad_attribute_on_empty_element_is_malformed() {
+        let src = "<svg><rect a=1 b/>secret words here</svg>";
+        let out = scan(src);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        assert_eq!(rule(&out, "L001").len(), 1);
+        let tail = out.carriers.iter().find(|c| c.hidden).unwrap();
+        assert_eq!(tail.text, "<rect a=1 b/>secret words here</svg>");
+        assert_eq!(tail.span.byte_start, 5);
+    }
+
+    #[test]
+    fn entity_error_is_malformed_with_tail() {
+        let src = "<svg><g>ok</g>&broken words<g/></svg>";
+        let out = scan(src);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        assert_eq!(rule(&out, "L001").len(), 1);
+        let tail = out.carriers.iter().find(|c| c.hidden).unwrap();
+        assert!(tail.text.starts_with('&'));
+        assert_eq!(tail.span.byte_start, 14);
+    }
+
+    #[test]
+    fn tail_start_backs_off_to_a_char_boundary() {
+        let text = "ab\u{e9}cd";
+        assert_eq!(boundary_at_or_before(text, 2), 2);
+        assert_eq!(boundary_at_or_before(text, 3), 2);
+        assert_eq!(boundary_at_or_before(text, 4), 4);
+        assert_eq!(boundary_at_or_before(text, 99), text.len());
+        assert_eq!(boundary_at_or_before("", 5), 0);
     }
 }
