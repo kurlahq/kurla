@@ -124,6 +124,11 @@ mod tests {
     }
 
     #[test]
+    fn markdown_under_github_workflows_is_docs_template() {
+        assert_eq!(classify(".github/workflows/notes.md", 0), DocsTemplate);
+    }
+
+    #[test]
     fn code_extensions() {
         for ext in [
             "rs", "js", "mjs", "cjs", "ts", "tsx", "jsx", "vue", "svelte", "py", "php", "rb", "go",

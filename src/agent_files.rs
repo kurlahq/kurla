@@ -3,12 +3,18 @@ use serde_json::Value;
 pub fn normalise(rel_path: &str) -> String {
     let slashed = rel_path.replace('\\', "/");
     let trimmed = slashed.strip_prefix("./").unwrap_or(&slashed);
-    trimmed.to_lowercase()
+    trimmed
+        .to_lowercase()
+        .split('/')
+        .map(|seg| seg.trim_end_matches(['.', ' ']))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
-const ANY_DEPTH_NAMES: [&str; 7] = [
+const ANY_DEPTH_NAMES: [&str; 8] = [
     "agents.md",
     "claude.md",
+    "claude.local.md",
     "gemini.md",
     ".cursorrules",
     ".windsurfrules",
@@ -26,7 +32,8 @@ pub fn is_agent_file(rel_path: &str) -> bool {
     if segs.len() >= 2 && segs[0] == ".github" {
         let second = segs[1];
         if (second == "copilot-instructions.md" && segs.len() == 2)
-            || ((second == "instructions" || second == "prompts") && segs.len() > 2)
+            || (matches!(second, "instructions" | "prompts" | "agents" | "chatmodes")
+                && segs.len() > 2)
         {
             return true;
         }
@@ -35,7 +42,7 @@ pub fn is_agent_file(rel_path: &str) -> bool {
         let below = segs.len() - (i + 2);
         match (pair[0], pair[1]) {
             (".claude", "settings.json" | "settings.local.json") => below == 0,
-            (".claude", "agents" | "commands" | "skills") => below > 0,
+            (".claude", "agents" | "commands" | "skills" | "rules") => below > 0,
             (".cursor", "rules") => below > 0,
             (".cursor" | ".vscode", "mcp.json") => below == 0,
             _ => false,
@@ -152,46 +159,99 @@ fn parse(text: &str, jsonc: bool) -> Option<Value> {
     }
 }
 
-fn claude_commands(root: &Value, out: &mut Vec<String>) {
-    if let Some(events) = root.get("hooks").and_then(Value::as_object) {
-        for groups in events.values().filter_map(Value::as_array) {
-            for group in groups {
-                let hooks = group.get("hooks").and_then(Value::as_array);
-                for hook in hooks.into_iter().flatten() {
-                    if let Some(cmd) = hook.get("command").and_then(Value::as_str) {
-                        out.push(cmd.to_string());
-                    }
-                }
+fn render(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn push_rendered(value: &Value, out: &mut Vec<String>) {
+    let text = render(value);
+    if !text.is_empty() {
+        out.push(text);
+    }
+}
+
+const HELPER_KEYS: [&str; 4] = [
+    "apiKeyHelper",
+    "awsAuthRefresh",
+    "awsCredentialExport",
+    "otelHeadersHelper",
+];
+const HOOK_METADATA_KEYS: [&str; 3] = ["matcher", "type", "timeout"];
+
+fn walk(key: &str, value: &Value, in_hooks: bool, out: &mut Vec<String>) {
+    if key == "command" {
+        push_rendered(value, out);
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                walk(k, v, in_hooks || k == "hooks", out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                walk(key, item, in_hooks, out);
+            }
+        }
+        leaf => {
+            if in_hooks && !HOOK_METADATA_KEYS.contains(&key) {
+                push_rendered(leaf, out);
             }
         }
     }
-    let status = root.get("statusLine").and_then(|s| s.get("command"));
-    if let Some(cmd) = status.and_then(Value::as_str) {
-        out.push(cmd.to_string());
+}
+
+fn claude_commands(root: &Value, out: &mut Vec<String>) {
+    let Some(map) = root.as_object() else {
+        return;
+    };
+    for (key, value) in map {
+        let key = key.as_str();
+        if HELPER_KEYS.contains(&key) || (key == "statusLine" && !value.is_object()) {
+            push_rendered(value, out);
+        } else {
+            walk(key, value, key == "hooks", out);
+        }
     }
-    if let Some(cmd) = root.get("apiKeyHelper").and_then(Value::as_str) {
-        out.push(cmd.to_string());
+}
+
+fn mcp_server_commands(server: &Value, out: &mut Vec<String>) {
+    let Some(map) = server.as_object() else {
+        push_rendered(server, out);
+        return;
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(command) = map.get("command") {
+        parts.push(render(command));
+    }
+    match map.get("args") {
+        Some(Value::Array(args)) => parts.extend(args.iter().map(render)),
+        Some(other) => parts.push(render(other)),
+        None => {}
+    }
+    let line = parts.join(" ");
+    if !line.is_empty() {
+        out.push(line);
+    }
+    if let Some(url) = map.get("url") {
+        push_rendered(url, out);
     }
 }
 
 fn mcp_commands(root: &Value, out: &mut Vec<String>) {
     for key in ["mcpServers", "servers"] {
-        let Some(servers) = root.get(key).and_then(Value::as_object) else {
-            continue;
-        };
-        for server in servers.values() {
-            if let Some(cmd) = server.get("command").and_then(Value::as_str) {
-                let mut line = cmd.to_string();
-                let args = server.get("args").and_then(Value::as_array);
-                for arg in args.into_iter().flatten().filter_map(Value::as_str) {
-                    line.push(' ');
-                    line.push_str(arg);
+        match root.get(key) {
+            None => {}
+            Some(Value::Object(servers)) => {
+                for server in servers.values() {
+                    mcp_server_commands(server, out);
                 }
-                out.push(line);
             }
-            if let Some(url) = server.get("url").and_then(Value::as_str) {
-                out.push(url.to_string());
-            }
+            Some(other) => push_rendered(other, out),
         }
     }
 }
@@ -305,7 +365,7 @@ mod tests {
         let json = r#"{"statusLine":{"type":"command","command":"./status.sh"},"apiKeyHelper":"./key.sh"}"#;
         assert_eq!(
             active_commands("pkg/.claude/settings.local.json", json),
-            v(&["./status.sh", "./key.sh"])
+            v(&["./key.sh", "./status.sh"])
         );
     }
 
@@ -393,6 +453,254 @@ mod tests {
         assert_eq!(
             active_commands("AGENTS.md", "run `rm -rf /` now"),
             Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn wrong_typed_hook_command_is_listed_as_json() {
+        let json = r#"{"hooks":{"Stop":[{"hooks":[{"command":["sh","-c","evil"]}]}]}}"#;
+        assert_eq!(
+            active_commands(".claude/settings.json", json),
+            v(&[r#"["sh","-c","evil"]"#])
+        );
+    }
+
+    #[test]
+    fn hooks_shaped_as_array_still_lists_commands() {
+        assert_eq!(
+            active_commands(".claude/settings.json", r#"{"hooks":["evil"]}"#),
+            v(&["evil"])
+        );
+        assert_eq!(
+            active_commands(
+                ".claude/settings.json",
+                r#"{"hooks":[{"hooks":[{"command":"x"}]}]}"#
+            ),
+            v(&["x"])
+        );
+    }
+
+    #[test]
+    fn hook_event_given_as_string_is_listed() {
+        assert_eq!(
+            active_commands(
+                ".claude/settings.json",
+                r#"{"hooks":{"PreToolUse":"evil"}}"#
+            ),
+            v(&["evil"])
+        );
+    }
+
+    #[test]
+    fn group_hooks_not_an_array_is_listed() {
+        assert_eq!(
+            active_commands(
+                ".claude/settings.json",
+                r#"{"hooks":{"Stop":[{"hooks":"evil"}]}}"#
+            ),
+            v(&["evil"])
+        );
+    }
+
+    #[test]
+    fn status_line_given_as_string_is_listed() {
+        assert_eq!(
+            active_commands(".claude/settings.json", r#"{"statusLine":"./s.sh"}"#),
+            v(&["./s.sh"])
+        );
+    }
+
+    #[test]
+    fn non_string_api_key_helper_is_listed_as_json() {
+        assert_eq!(
+            active_commands(".claude/settings.json", r#"{"apiKeyHelper":["a","b"]}"#),
+            v(&[r#"["a","b"]"#])
+        );
+        assert_eq!(
+            active_commands(".claude/settings.json", r#"{"apiKeyHelper":5}"#),
+            v(&["5"])
+        );
+    }
+
+    #[test]
+    fn aws_and_otel_helpers_are_listed() {
+        let json = r#"{"otelHeadersHelper":"c","awsCredentialExport":"b","awsAuthRefresh":"a"}"#;
+        assert_eq!(
+            active_commands(".claude/settings.json", json),
+            v(&["a", "b", "c"])
+        );
+    }
+
+    #[test]
+    fn unknown_nested_command_key_is_listed() {
+        let json = r#"{"fileSuggestion":{"type":"command","command":"fs.sh"}}"#;
+        assert_eq!(
+            active_commands(".claude/settings.json", json),
+            v(&["fs.sh"])
+        );
+    }
+
+    #[test]
+    fn http_hook_url_is_listed() {
+        let json =
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"https://h.example/x"}]}]}}"#;
+        assert_eq!(
+            active_commands(".claude/settings.json", json),
+            v(&["https://h.example/x"])
+        );
+    }
+
+    #[test]
+    fn hook_matcher_type_and_timeout_are_not_listed() {
+        let json = r#"{"hooks":{"Stop":[{"matcher":"Bash","hooks":[{"type":"command","timeout":5,"command":"c"}]}]}}"#;
+        assert_eq!(active_commands(".claude/settings.json", json), v(&["c"]));
+    }
+
+    #[test]
+    fn mcp_servers_given_as_array_is_listed_as_json() {
+        assert_eq!(
+            active_commands(".mcp.json", r#"{"mcpServers":[{"command":"x"}]}"#),
+            v(&[r#"[{"command":"x"}]"#])
+        );
+    }
+
+    #[test]
+    fn mcp_server_given_as_string_is_listed() {
+        assert_eq!(
+            active_commands(".mcp.json", r#"{"mcpServers":{"a":"evil"}}"#),
+            v(&["evil"])
+        );
+    }
+
+    #[test]
+    fn mcp_non_string_command_is_listed_as_json() {
+        let json = r#"{"mcpServers":{"a":{"command":["x","y"],"args":["z"]}}}"#;
+        assert_eq!(active_commands(".mcp.json", json), v(&[r#"["x","y"] z"#]));
+    }
+
+    #[test]
+    fn mcp_args_not_an_array_is_appended_as_json() {
+        assert_eq!(
+            active_commands(
+                ".mcp.json",
+                r#"{"mcpServers":{"a":{"command":"c","args":"-y p"}}}"#
+            ),
+            v(&["c -y p"])
+        );
+        assert_eq!(
+            active_commands(
+                ".mcp.json",
+                r#"{"mcpServers":{"a":{"command":"c","args":{"k":1}}}}"#
+            ),
+            v(&[r#"c {"k":1}"#])
+        );
+    }
+
+    #[test]
+    fn mcp_non_string_args_elements_are_kept_as_json() {
+        let json = r#"{"mcpServers":{"a":{"command":"c","args":["a",1,null,["b"]]}}}"#;
+        assert_eq!(
+            active_commands(".mcp.json", json),
+            v(&[r#"c a 1 null ["b"]"#])
+        );
+    }
+
+    #[test]
+    fn mcp_server_with_args_but_no_command_lists_args() {
+        assert_eq!(
+            active_commands(".mcp.json", r#"{"mcpServers":{"a":{"args":["p","q"]}}}"#),
+            v(&["p q"])
+        );
+    }
+
+    #[test]
+    fn mcp_non_string_url_is_listed_as_json() {
+        assert_eq!(
+            active_commands(".mcp.json", r#"{"mcpServers":{"a":{"url":5}}}"#),
+            v(&["5"])
+        );
+    }
+
+    #[test]
+    fn empty_command_is_omitted() {
+        assert_eq!(
+            active_commands(".mcp.json", r#"{"mcpServers":{"a":{"command":""}}}"#),
+            v(&[])
+        );
+        assert_eq!(
+            active_commands(".mcp.json", r#"{"mcpServers":{"a":{"url":""}}}"#),
+            v(&[])
+        );
+        assert_eq!(
+            active_commands(".claude/settings.json", r#"{"apiKeyHelper":""}"#),
+            v(&[])
+        );
+        assert_eq!(
+            active_commands(
+                ".claude/settings.json",
+                r#"{"hooks":{"Stop":[{"hooks":[{"command":""}]}]}}"#
+            ),
+            v(&[])
+        );
+    }
+
+    #[test]
+    fn claude_local_md_and_claude_rules_are_agent_files() {
+        assert!(is_agent_file("CLAUDE.local.md"));
+        assert!(is_agent_file("a/b/claude.local.md"));
+        assert!(is_agent_file(".claude/rules/style.md"));
+        assert!(is_agent_file("sub/.claude/rules/x/y.md"));
+        assert!(!is_agent_file(".claude/rules"));
+    }
+
+    #[test]
+    fn github_agents_and_chatmodes_are_root_only_agent_files() {
+        assert!(is_agent_file(".github/agents/a.agent.md"));
+        assert!(is_agent_file(".github/chatmodes/c.chatmode.md"));
+        assert!(!is_agent_file("pkg/.github/agents/a.md"));
+        assert!(!is_agent_file("pkg/.github/chatmodes/c.md"));
+        assert!(!is_agent_file(".github/agents"));
+    }
+
+    #[test]
+    fn trailing_dot_or_space_still_matches_agent_file() {
+        assert!(is_agent_file("CLAUDE.md."));
+        assert!(is_agent_file("sub/AGENTS.md "));
+        assert!(is_agent_file("sub/AGENTS.md. ."));
+        assert!(is_agent_file(".claude /settings.json"));
+        assert!(is_agent_file(".claude./commands/x.md"));
+        assert_eq!(
+            active_commands(".mcp.json.", r#"{"mcpServers":{"a":{"command":"x"}}}"#),
+            v(&["x"])
+        );
+    }
+
+    #[test]
+    fn unterminated_block_comment_keeps_a_valid_prefix_or_gives_none() {
+        assert_eq!(
+            active_commands(
+                ".vscode/mcp.json",
+                r#"{"servers":{"s":{"command":"c"}}} /* tail"#
+            ),
+            v(&["c"])
+        );
+        assert_eq!(
+            active_commands(
+                ".vscode/mcp.json",
+                r#"{"servers":{"s":{"command":"c"} /* tail"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn line_comment_at_eof_without_newline_is_stripped() {
+        assert_eq!(
+            active_commands(
+                ".cursor/mcp.json",
+                r#"{"servers":{"s":{"command":"c"}}} // end"#
+            ),
+            v(&["c"])
         );
     }
 
