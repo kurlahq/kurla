@@ -10,3 +10,4 @@
 vendor/** -text
 unicode-data/** -text
 tests/fixtures/** -text
+fuzz/corpus/** -text

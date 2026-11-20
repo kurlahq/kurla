@@ -2,4 +2,11 @@
 
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|_data: &[u8]| {});
+#[path = "../../tests/fuzz_props/spans.rs"]
+mod spans;
+#[path = "../../tests/fuzz_props/bmff.rs"]
+mod props;
+
+fuzz_target!(|data: &[u8]| {
+    props::check(data);
+});
