@@ -49,3 +49,34 @@ A decisions file that cannot be loaded for any reason (unreadable, not UTF-8, in
 When an entry matches a finding but is not valid, the reason is chosen in this order: `longer than 365 days`, then `not yet valid`, then `expired`.
 
 Invalid entries from the current file that match a finding are reported with source `current`. An invalid entry in the base file is reported with source `base` when its finding was reviewed through the current file, since it could otherwise have counted. Each entry is reported once.
+
+## Cache
+
+Kurla keeps a local cache of per-file scan results so that unchanged files are not scanned again. The cache directory comes from `--cache-dir`, then `KURLA_CACHE_DIR`, then the platform default. `--no-cache` turns the cache off.
+
+### The cache is trusted local state
+
+Anyone who can write to the cache directory can change scan results, because a stored entry is used in place of a scan. Use `--no-cache` wherever that is not acceptable, for example on a shared or untrusted machine or in a directory other users can write to.
+
+### What the key covers
+
+An entry is looked up by a SHA-256 key over these length-prefixed fields:
+
+- the SHA-256 of the file content;
+- the path used to classify the file;
+- the Kurla version;
+- the rules version, which changes whenever any rule changes;
+- every resource limit, including the per-file time limit.
+
+A change to any of them is a miss, and the file is scanned again. Each entry also records its own key, and an entry that is corrupt, has an unknown name or field, or does not match its key is treated as a miss.
+
+### What is never cached
+
+- A result that hit the per-file time limit, because time limits depend on machine load.
+- Files that were only partly read (over the size limit), unreadable files, and files that were excluded or not followed.
+
+### Problems are reported
+
+- A cache directory inside a scanned path is not used, and the run reports `cache disabled: cache directory is inside a scanned path`, so a scanned tree cannot supply its own results.
+- When entries cannot be written the scan result is unaffected and the run reports `cache writes failed: N`.
+- When no cache directory can be determined, the cache is disabled and the reason is reported.

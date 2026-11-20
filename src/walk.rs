@@ -1,3 +1,4 @@
+use crate::cache::Cache;
 use crate::engine::{scan_file, scan_oversize, unreadable};
 use crate::glob::Glob;
 use crate::limits::Limits;
@@ -19,6 +20,7 @@ pub struct ScanOptions {
     pub follow_symlinks: bool,
     pub jobs: usize,
     pub limits: Limits,
+    pub cache: Option<crate::cache::Cache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +28,7 @@ pub struct ScanResult {
     pub findings: Vec<Finding>,
     pub coverage: Vec<FileCoverage>,
     pub carrier_counts: BTreeMap<CarrierKind, u64>,
+    pub warnings: Vec<String>,
 }
 
 type Scanned = (Vec<Finding>, FileCoverage, BTreeMap<CarrierKind, u64>);
@@ -122,6 +125,28 @@ fn recorded(path: &str, skip: SkipReason) -> FileCoverage {
         embedded_not_scanned: Vec::new(),
         encoded_runs_not_payloads: 0,
     }
+}
+
+struct CacheUse<'a> {
+    cache: Option<&'a Cache>,
+    failed_writes: AtomicUsize,
+}
+
+fn active_cache<'a>(
+    opts: &'a ScanOptions,
+    roots: &[PathBuf],
+    warnings: &mut Vec<String>,
+) -> Option<&'a Cache> {
+    let cache = opts.cache.as_ref()?;
+    let Some(dir) = long_form(cache.dir()) else {
+        warnings.push("cache disabled: cache directory cannot be resolved".to_string());
+        return None;
+    };
+    if roots.iter().any(|root| dir.starts_with(root)) {
+        warnings.push("cache disabled: cache directory is inside a scanned path".to_string());
+        return None;
+    }
+    Some(cache)
 }
 
 struct Walker<'a> {
@@ -286,7 +311,7 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, u64)> {
     Ok((bytes, declared))
 }
 
-fn scan_regular(path: &Path, class: &str, opts: &ScanOptions) -> Scanned {
+fn scan_regular(path: &Path, class: &str, opts: &ScanOptions, cache: &CacheUse) -> Scanned {
     let meta = if opts.follow_symlinks {
         fs::metadata(path)
     } else {
@@ -319,11 +344,26 @@ fn scan_regular(path: &Path, class: &str, opts: &ScanOptions) -> Scanned {
                 let prefix_end = bytes.len().min(PREFIX_BYTES as usize);
                 scan_oversize(class, &bytes[..prefix_end], declared.max(len), &opts.limits)
             } else {
-                scan_file(class, &bytes, &opts.limits)
+                cached_scan(class, &bytes, &opts.limits, cache)
             }
         }
         Err(_) => unreadable(class),
     }
+}
+
+fn cached_scan(class: &str, bytes: &[u8], limits: &Limits, cache: &CacheUse) -> Scanned {
+    let Some(store) = cache.cache else {
+        return scan_file(class, bytes, limits);
+    };
+    let key = Cache::key(class, bytes, limits);
+    if let Some(hit) = store.get(&key) {
+        return hit;
+    }
+    let scanned = scan_file(class, bytes, limits);
+    if !store.put(&key, &scanned) {
+        cache.failed_writes.fetch_add(1, Ordering::SeqCst);
+    }
+    scanned
 }
 
 fn not_followed(class: &str) -> Scanned {
@@ -334,9 +374,9 @@ fn not_followed(class: &str) -> Scanned {
     )
 }
 
-fn run_one(item: &Work, opts: &ScanOptions) -> Scanned {
+fn run_one(item: &Work, opts: &ScanOptions, cache: &CacheUse) -> Scanned {
     let (mut findings, mut coverage, counts) = match &item.plan {
-        Plan::Scan(path) => scan_regular(path, &item.class, opts),
+        Plan::Scan(path) => scan_regular(path, &item.class, opts, cache),
         Plan::Record(skip) => (Vec::new(), recorded(&item.class, *skip), BTreeMap::new()),
         Plan::Unreadable => unreadable(&item.class),
     };
@@ -347,7 +387,7 @@ fn run_one(item: &Work, opts: &ScanOptions) -> Scanned {
     (findings, coverage, counts)
 }
 
-fn run_all(work: &[Work], opts: &ScanOptions) -> Vec<Scanned> {
+fn run_all(work: &[Work], opts: &ScanOptions, cache: &CacheUse) -> Vec<Scanned> {
     let wanted = if opts.jobs == 0 {
         default_jobs()
     } else {
@@ -365,7 +405,7 @@ fn run_all(work: &[Work], opts: &ScanOptions) -> Vec<Scanned> {
                     let Some(item) = work.get(index) else {
                         break;
                     };
-                    local.push((index, run_one(item, opts)));
+                    local.push((index, run_one(item, opts, cache)));
                 }
                 done.lock().unwrap_or_else(|e| e.into_inner()).extend(local);
             });
@@ -381,6 +421,7 @@ pub fn scan_paths(paths: &[PathBuf], opts: &ScanOptions) -> ScanResult {
     let mut roots: Vec<PathBuf> = paths.iter().filter_map(|path| long_form(path)).collect();
     roots.sort();
     roots.dedup();
+    let mut warnings = Vec::new();
     let mut walker = Walker {
         opts,
         cwd,
@@ -394,7 +435,15 @@ pub fn scan_paths(paths: &[PathBuf], opts: &ScanOptions) -> ScanResult {
     }
     let mut work = walker.work;
     work.sort_by(|a, b| a.display.cmp(&b.display));
-    let scanned = run_all(&work, opts);
+    let cache_use = CacheUse {
+        cache: active_cache(opts, &walker.roots, &mut warnings),
+        failed_writes: AtomicUsize::new(0),
+    };
+    let scanned = run_all(&work, opts, &cache_use);
+    let failed = cache_use.failed_writes.load(Ordering::SeqCst);
+    if failed > 0 {
+        warnings.push(format!("cache writes failed: {failed}"));
+    }
     let mut findings = Vec::new();
     let mut coverage = Vec::new();
     let mut carrier_counts: BTreeMap<CarrierKind, u64> = BTreeMap::new();
@@ -416,6 +465,7 @@ pub fn scan_paths(paths: &[PathBuf], opts: &ScanOptions) -> ScanResult {
         findings,
         coverage,
         carrier_counts,
+        warnings,
     }
 }
 

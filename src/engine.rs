@@ -18,6 +18,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 type Scanned = (Vec<Finding>, FileCoverage, BTreeMap<CarrierKind, u64>);
 
+pub const RULES_VERSION: &str = "1";
+
 const SNIFF_PREFIX: usize = 8192;
 const PAYLOAD_CAP: usize = 256;
 const EVIDENCE_CAP: usize = 4096;

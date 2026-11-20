@@ -1,7 +1,12 @@
+use kurla::cache::Cache;
 use kurla::glob::Glob;
 use kurla::limits::Limits;
-use kurla::model::{Category, FileCoverage, FileKind, LocationKind, SkipReason};
+use kurla::model::{
+    CarrierKind, Category, Family, FileCoverage, FileKind, Finding, LocationKind, RawFinding,
+    RuleStatus, Severity, SkipReason, Span,
+};
 use kurla::walk::{ScanOptions, ScanResult, scan_paths};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -817,4 +822,165 @@ fn non_utf8_names_with_same_lossy_form_have_distinct_fingerprints() {
         result.findings[0].fingerprint,
         result.findings[1].fingerprint
     );
+}
+
+fn planted() -> kurla::cache::Cached {
+    let finding = Finding {
+        raw: RawFinding {
+            rule_id: "U002",
+            family: Family::U,
+            base: Severity::High,
+            status: RuleStatus::Stable,
+            span: Span {
+                byte_start: 0,
+                byte_end: 1,
+                line: Some(1),
+                column: Some(1),
+            },
+            carrier: CarrierKind::HiddenText,
+            payload: Some("planted".to_string()),
+            message: "planted entry".to_string(),
+            evidence: Vec::new(),
+        },
+        path: String::new(),
+        location: LocationKind::Code,
+        severity: Severity::High,
+        fingerprint: "00".repeat(32),
+        review: None,
+    };
+    let coverage = FileCoverage {
+        path: String::new(),
+        kind: FileKind::Text,
+        category: Category::Text,
+        skip: None,
+        drawn_text_unscanned: false,
+        embedded_not_scanned: Vec::new(),
+        encoded_runs_not_payloads: 0,
+    };
+    (vec![finding], coverage, BTreeMap::new())
+}
+
+fn cache_opts(dir: &Path) -> ScanOptions {
+    ScanOptions {
+        cache: Some(Cache::open(Some(dir.to_path_buf()))),
+        ..ScanOptions::default()
+    }
+}
+
+#[test]
+fn walker_uses_cache_hit_without_rescanning() {
+    let dir = TestDir::new();
+    let cache_dir = TestDir::new();
+    dir.write("a.txt", b"plain words\n");
+    assert!(scan(&dir).findings.is_empty());
+    let key = Cache::key("a.txt", b"plain words\n", &Limits::default());
+    let opts = cache_opts(&cache_dir.path);
+    assert!(opts.cache.as_ref().unwrap().put(&key, &planted()));
+    let result = scan_with(&dir, &opts);
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].raw.message, "planted entry");
+    assert_eq!(result.findings[0].path, dir.shown("a.txt"));
+    assert_eq!(result.coverage[0].path, dir.shown("a.txt"));
+    assert!(result.warnings.is_empty());
+}
+
+#[test]
+fn walker_stores_results_and_a_second_run_matches_the_first() {
+    let dir = TestDir::new();
+    let cache_dir = TestDir::new();
+    dir.write("a.txt", &hidden());
+    dir.write("sub/b.txt", b"plain\n");
+    let opts = cache_opts(&cache_dir.path);
+    let first = scan_with(&dir, &opts);
+    let entries = fs::read_dir(&cache_dir.path).unwrap().count();
+    assert_eq!(entries, 2);
+    let second = scan_with(&dir, &opts);
+    assert_eq!(first, second);
+    assert_eq!(first, scan(&dir));
+    assert!(!first.findings.is_empty());
+}
+
+#[test]
+fn cache_inside_scan_root_is_refused_and_reported() {
+    let dir = TestDir::new();
+    dir.write("a.txt", b"plain words\n");
+    let inside = dir.path.join(".kurla-cache");
+    let opts = cache_opts(&inside);
+    let key = Cache::key("a.txt", b"plain words\n", &Limits::default());
+    assert!(opts.cache.as_ref().unwrap().put(&key, &planted()));
+    let result = scan_with(&dir, &opts);
+    assert!(
+        result
+            .findings
+            .iter()
+            .all(|f| f.raw.message != "planted entry")
+    );
+    assert_eq!(
+        result.warnings,
+        vec!["cache disabled: cache directory is inside a scanned path".to_string()]
+    );
+}
+
+#[test]
+fn cache_equal_to_scan_root_is_refused() {
+    let dir = TestDir::new();
+    dir.write("a.txt", b"plain words\n");
+    let opts = cache_opts(&dir.path);
+    let result = scan_with(&dir, &opts);
+    assert_eq!(result.warnings.len(), 1);
+    assert_eq!(fs::read_dir(&dir.path).unwrap().count(), 1);
+}
+
+#[test]
+fn failed_cache_writes_are_counted_in_warnings() {
+    let dir = TestDir::new();
+    let cache_dir = TestDir::new();
+    dir.write("a.txt", &hidden());
+    dir.write("b.txt", b"plain\n");
+    let blocker = cache_dir.write("blocker", b"x");
+    let result = scan_with(&dir, &cache_opts(&blocker));
+    assert_eq!(result.warnings, vec!["cache writes failed: 2".to_string()]);
+    assert_eq!(result.findings, scan(&dir).findings);
+    assert_eq!(result.coverage, scan(&dir).coverage);
+}
+
+#[test]
+fn oversize_file_is_not_cached() {
+    let dir = TestDir::new();
+    let cache_dir = TestDir::new();
+    dir.write("big.txt", &[b'a'; 64]);
+    let opts = ScanOptions {
+        limits: Limits {
+            max_file_bytes: 16,
+            ..Limits::default()
+        },
+        ..cache_opts(&cache_dir.path)
+    };
+    let result = scan_with(&dir, &opts);
+    assert_eq!(result.coverage[0].skip, Some(SkipReason::SizeLimit));
+    assert_eq!(fs::read_dir(&cache_dir.path).unwrap().count(), 0);
+    let key = Cache::key("big.txt", &[b'a'; 64], &opts.limits);
+    assert!(opts.cache.as_ref().unwrap().put(&key, &planted()));
+    let again = scan_with(&dir, &opts);
+    assert_eq!(again.coverage[0].skip, Some(SkipReason::SizeLimit));
+    assert!(
+        again
+            .findings
+            .iter()
+            .all(|f| f.raw.message != "planted entry")
+    );
+}
+
+#[test]
+fn records_are_never_cached() {
+    let dir = TestDir::new();
+    let cache_dir = TestDir::new();
+    dir.write("skip.txt", b"plain\n");
+    let opts = ScanOptions {
+        excludes: vec![Glob::new("skip.txt").unwrap()],
+        ..cache_opts(&cache_dir.path)
+    };
+    let result = scan_with(&dir, &opts);
+    assert_eq!(result.coverage[0].skip, Some(SkipReason::ExcludedByUser));
+    assert_eq!(fs::read_dir(&cache_dir.path).unwrap().count(), 0);
 }

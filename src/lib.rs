@@ -1,6 +1,7 @@
 pub mod agent_files;
 pub mod aimed;
 pub mod binary;
+pub mod cache;
 pub mod decisions;
 pub mod encoded;
 pub mod engine;
