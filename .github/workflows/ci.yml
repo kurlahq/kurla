@@ -28,9 +28,9 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --locked --offline -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --offline -- -D warnings
       - name: Test
-        run: cargo test --locked --offline
+        run: cargo test --workspace --locked --offline
 
   dev-image:
     runs-on: ubuntu-latest
