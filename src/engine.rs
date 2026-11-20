@@ -31,6 +31,7 @@ struct Job {
     carrier: Carrier,
     depth: u8,
     classified: bool,
+    aimed_only: bool,
 }
 
 struct Engine<'a> {
@@ -55,6 +56,16 @@ fn whole(len: usize) -> Span {
         line: None,
         column: None,
     }
+}
+
+fn covers(outer: &Span, inner: &Span) -> bool {
+    outer.byte_start <= inner.byte_start && inner.byte_end <= outer.byte_end
+}
+
+fn is_svg_path(rel_path: &str) -> bool {
+    rel_path
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("svg"))
 }
 
 fn limit_finding(rule_id: &'static str, message: &str, span: Span) -> RawFinding {
@@ -93,6 +104,14 @@ fn longest_line(doc: &TextDoc) -> usize {
         .map(|line| line.chars().count())
         .max()
         .unwrap_or(0)
+}
+
+fn fingerprint_evidence(raw: &RawFinding) -> &[u8] {
+    if raw.evidence.is_empty() {
+        raw.message.as_bytes()
+    } else {
+        &raw.evidence
+    }
 }
 
 fn fingerprint(rule_id: &str, rel_path: &str, evidence: &[u8]) -> String {
@@ -197,7 +216,7 @@ impl<'a> Engine<'a> {
                 for entry in &mut entries {
                     if hit
                         && entry.raw.carrier == CarrierKind::HiddenText
-                        && entry.raw.span == carrier.span
+                        && covers(&entry.raw.span, &carrier.span)
                     {
                         entry.instruction_like = true;
                         classified = true;
@@ -220,6 +239,7 @@ impl<'a> Engine<'a> {
                 carrier,
                 depth,
                 classified,
+                aimed_only: false,
             });
         }
     }
@@ -297,6 +317,7 @@ impl<'a> Engine<'a> {
             },
             depth: 0,
             classified: false,
+            aimed_only: true,
         });
         let (message, payload) = match active_commands(self.rel_path, &doc.text) {
             Some(commands) if commands.is_empty() => return,
@@ -373,11 +394,13 @@ impl<'a> Engine<'a> {
             carrier,
             depth,
             classified,
+            aimed_only,
         } = job;
-        let Some(doc) = TextDoc::decode(carrier.text.as_bytes()) else {
-            self.unreadable(carrier.span);
+        if aimed_only {
+            self.classify(&carrier);
             return;
-        };
+        }
+        let doc = TextDoc::from_string(carrier.text.clone());
         let found = scan_text(&doc, self.location);
         self.push_unicode(found, Some(&carrier));
         let encoded = scan_encoded(&doc, depth, &mut self.budget);
@@ -407,7 +430,11 @@ impl<'a> Engine<'a> {
             .map(|entry| {
                 let severity = finalize(&entry.raw, self.location, entry.instruction_like);
                 Finding {
-                    fingerprint: fingerprint(entry.raw.rule_id, self.rel_path, &entry.raw.evidence),
+                    fingerprint: fingerprint(
+                        entry.raw.rule_id,
+                        self.rel_path,
+                        fingerprint_evidence(&entry.raw),
+                    ),
                     raw: entry.raw,
                     path: self.rel_path.to_string(),
                     location: self.location,
@@ -438,7 +465,11 @@ pub fn scan_file(rel_path: &str, bytes: &[u8], limits: &Limits) -> Scanned {
         engine.push(limit_finding("L001", "file size limit", whole(bytes.len())));
         return engine.finish();
     }
-    scan_kind(rel_path, bytes, limits, binary::sniff(bytes, rel_path))
+    let kind = match binary::sniff(bytes, rel_path) {
+        FileKind::UnknownBinary if is_svg_path(rel_path) => FileKind::Svg,
+        kind => kind,
+    };
+    scan_kind(rel_path, bytes, limits, kind)
 }
 
 fn scan_kind(rel_path: &str, bytes: &[u8], limits: &Limits, kind: FileKind) -> Scanned {
@@ -570,11 +601,27 @@ mod tests {
         v
     }
 
-    fn webp_with_exif() -> Vec<u8> {
+    fn tiff_with_description(text: &str) -> Vec<u8> {
+        let mut v = vec![
+            b'I', b'I', 0x2A, 0x00, 0x08, 0, 0, 0, 0x01, 0, 0x0E, 0x01, 0x02, 0,
+        ];
+        v.extend_from_slice(&((text.len() + 1) as u32).to_le_bytes());
+        v.extend_from_slice(&26u32.to_le_bytes());
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v.extend_from_slice(text.as_bytes());
+        v.push(0);
+        v
+    }
+
+    fn webp_with_exif(text: &str) -> Vec<u8> {
+        let tiff = tiff_with_description(text);
         let mut body = b"WEBP".to_vec();
         body.extend_from_slice(b"EXIF");
-        body.extend_from_slice(&32u32.to_le_bytes());
-        body.extend_from_slice(&TIFF_HELLO);
+        body.extend_from_slice(&(tiff.len() as u32).to_le_bytes());
+        body.extend_from_slice(&tiff);
+        if tiff.len() % 2 == 1 {
+            body.push(0);
+        }
         let mut v = b"RIFF".to_vec();
         v.extend_from_slice(&(body.len() as u32).to_le_bytes());
         v.extend_from_slice(&body);
@@ -594,9 +641,9 @@ mod tests {
         bx(kind, &payload)
     }
 
-    fn avif_with_exif() -> Vec<u8> {
+    fn avif_with_exif(text: &str) -> Vec<u8> {
         let mut exif_item = vec![0, 0, 0, 0];
-        exif_item.extend_from_slice(&TIFF_HELLO);
+        exif_item.extend_from_slice(&tiff_with_description(text));
         let build = |base: u32| {
             let mut infe_body = 1u16.to_be_bytes().to_vec();
             infe_body.extend_from_slice(&[0, 0]);
@@ -612,7 +659,7 @@ mod tests {
             iloc_body.extend_from_slice(&[0, 0]);
             iloc_body.extend_from_slice(&1u16.to_be_bytes());
             iloc_body.extend_from_slice(&base.to_be_bytes());
-            iloc_body.extend_from_slice(&36u32.to_be_bytes());
+            iloc_body.extend_from_slice(&(exif_item.len() as u32).to_be_bytes());
             let mut children = full(b"iinf", &iinf_body);
             children.extend_from_slice(&full(b"iloc", &iloc_body));
             let mut v = bx(b"ftyp", b"avif\0\0\0\0mif1");
@@ -668,7 +715,7 @@ mod tests {
         let text = format!("# Notes{}\n", tags(PHRASE));
         let (findings, _, _) = scan("AGENTS.md", text.as_bytes());
         let u002 = of_rule(&findings, "U002");
-        assert!(!u002.is_empty());
+        assert_eq!(u002.len(), 1);
         assert!(u002.iter().all(|f| f.severity == Severity::Critical));
         assert!(u002.iter().all(|f| f.location == LocationKind::AgentFile));
         assert!(
@@ -832,8 +879,8 @@ mod tests {
             ("a.png", png_with_text("Comment", "hello"), FileKind::Png),
             ("a.jpg", jpeg_with_comment("hello"), FileKind::Jpeg),
             ("a.gif", gif_with_comment("hello"), FileKind::Gif),
-            ("a.webp", webp_with_exif(), FileKind::Webp),
-            ("a.avif", avif_with_exif(), FileKind::Avif),
+            ("a.webp", webp_with_exif("hello"), FileKind::Webp),
+            ("a.avif", avif_with_exif("hello"), FileKind::Avif),
         ];
         for (path, bytes, kind) in cases {
             let (findings, coverage, counts) = scan(path, &bytes);
@@ -848,6 +895,8 @@ mod tests {
             png_with_text("Comment", PHRASE),
             jpeg_with_comment(PHRASE),
             gif_with_comment(PHRASE),
+            webp_with_exif(PHRASE),
+            avif_with_exif(PHRASE),
         ];
         for bytes in hostile {
             let (findings, _, counts) = scan("x.bin", &bytes);
@@ -902,21 +951,6 @@ mod tests {
         assert_eq!(i002[0].severity, Severity::Medium);
         let (findings, _, _) = scan(".claude/settings.json", br#"{"model":"x"}"#);
         assert!(of_rule(&findings, "I002").is_empty());
-    }
-
-    #[test]
-    fn unreadable_required_file_is_l001_and_unreadable() {
-        let undecodable = [0xFFu8, 0x00, 0xFE, 0x00, 0x80, 0x00, 0xC3, 0x28];
-        for kind in [FileKind::Text, FileKind::Svg] {
-            let (findings, coverage, _) =
-                scan_kind("a.txt", &undecodable, &Limits::default(), kind);
-            let l001 = of_rule(&findings, "L001");
-            assert_eq!(l001.len(), 1, "{kind:?}");
-            assert_eq!(l001[0].raw.message, "unreadable file");
-            assert_eq!(l001[0].severity, Severity::Low);
-            assert_eq!(coverage.skip, Some(SkipReason::Unreadable));
-            assert_eq!(coverage.kind, kind);
-        }
     }
 
     #[test]
@@ -1096,8 +1130,117 @@ mod tests {
         let (text, _, _) = data_uri_readme("image/svg+xml", SCRIPT_SVG.as_bytes());
         let (findings, _, _) = scan("AGENTS.md", text.as_bytes());
         let s003 = of_rule(&findings, "S003");
-        assert!(!s003.is_empty());
+        assert_eq!(s003.len(), 1);
         assert!(s003.iter().all(|f| f.location == LocationKind::AgentFile));
         assert!(s003.iter().all(|f| f.severity == Severity::Critical));
+    }
+
+    #[test]
+    fn unreadable_required_file_is_l001_and_unreadable() {
+        let undecodable = [0x80u8, 0x01, 0xC3, 0x28, 0x00, 0x81, 0xFF, 0x02];
+        assert!(TextDoc::decode(&undecodable).is_none());
+        for path in ["a.svg", "dir/B.SVG"] {
+            let (findings, coverage, _) = scan(path, &undecodable);
+            let l001 = of_rule(&findings, "L001");
+            assert_eq!(l001.len(), 1, "{path}");
+            assert_eq!(l001[0].raw.message, "unreadable file");
+            assert_eq!(l001[0].severity, Severity::Low);
+            assert_eq!(coverage.skip, Some(SkipReason::Unreadable), "{path}");
+            assert_eq!(coverage.kind, FileKind::Svg, "{path}");
+            assert_eq!(coverage.category, Category::Svg, "{path}");
+        }
+        let (findings, coverage, _) = scan("a.dat", &undecodable);
+        assert!(findings.is_empty());
+        assert_eq!(coverage.kind, FileKind::UnknownBinary);
+        assert_eq!(coverage.skip, None);
+    }
+
+    #[test]
+    fn agent_file_with_two_tag_runs_has_two_distinct_fingerprints() {
+        let text = format!(
+            "one{}\ntwo{}\n",
+            tags("first hidden words"),
+            tags("second hidden words")
+        );
+        let (findings, _, _) = scan("AGENTS.md", text.as_bytes());
+        let u002 = of_rule(&findings, "U002");
+        assert_eq!(u002.len(), 2);
+        assert_ne!(u002[0].fingerprint, u002[1].fingerprint);
+        assert!(u002.iter().all(|f| !f.raw.evidence.is_empty()));
+    }
+
+    #[test]
+    fn carrier_with_interleaved_nuls_keeps_its_tag_payload() {
+        let filler = "x".repeat(3000);
+        let nuls = "a\0".repeat(400);
+        let html = format!(
+            "{filler}\n<span style=\"display:none\">{nuls}{}</span>",
+            tags("hidden words")
+        );
+        let (findings, _, _) = scan("doc.html", html.as_bytes());
+        let m002 = of_rule(&findings, "M002");
+        assert_eq!(m002.len(), 1);
+        let at_carrier: Vec<&Finding> = of_rule(&findings, "U002")
+            .into_iter()
+            .filter(|f| f.raw.span == m002[0].raw.span)
+            .collect();
+        assert_eq!(at_carrier.len(), 1);
+        assert_eq!(at_carrier[0].raw.payload.as_deref(), Some("hidden words"));
+    }
+
+    #[test]
+    fn empty_evidence_findings_fingerprint_on_their_message() {
+        let inner = base64(base64(base64(PHRASE.as_bytes()).as_bytes()).as_bytes());
+        let text = format!("{inner}\n{}\n", "A".repeat(300));
+        let limits = Limits {
+            max_base64_run_bytes: 130,
+            ..Limits::default()
+        };
+        let (findings, _, _) = scan_file("README.md", text.as_bytes(), &limits);
+        let l001 = of_rule(&findings, "L001");
+        let depth: Vec<&&Finding> = l001
+            .iter()
+            .filter(|f| f.raw.message == "decode depth limit")
+            .collect();
+        let run: Vec<&&Finding> = l001
+            .iter()
+            .filter(|f| f.raw.message == "encoded run limit")
+            .collect();
+        assert_eq!(depth.len(), 1);
+        assert_eq!(run.len(), 1);
+        assert!(depth[0].raw.evidence.is_empty());
+        assert!(run[0].raw.evidence.is_empty());
+        assert_eq!(
+            depth[0].fingerprint,
+            "62df8bc327d3312e0dd229ba9159d8175cac8a4a759c915de80549554be06eec"
+        );
+        assert_eq!(
+            run[0].fingerprint,
+            "c791f321b7a59c2dec9c608673c1e44930cf3deb4e8e3ecdeaedd0d6f9e1fe3f"
+        );
+    }
+
+    #[test]
+    fn two_hidden_carriers_in_one_blob_each_match_their_own_finding() {
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\">\
+             <text x=\"1\" y=\"2\" display=\"none\">some quiet words</text>\
+             <text x=\"1\" y=\"4\" display=\"none\">{PHRASE}</text></svg>"
+        );
+        let (text, start, end) = data_uri_readme("image/svg+xml", svg.as_bytes());
+        let (findings, _, _) = scan("README.md", text.as_bytes());
+        let s002 = of_rule(&findings, "S002");
+        assert_eq!(s002.len(), 2);
+        for finding in &s002 {
+            assert_uri_span(finding, start, end);
+        }
+        let mut severities: Vec<Severity> = s002.iter().map(|f| f.severity).collect();
+        severities.sort();
+        assert_eq!(severities, vec![Severity::High, Severity::Critical]);
+        let quiet = s002
+            .iter()
+            .find(|f| f.raw.payload.as_deref() == Some("some quiet words"))
+            .unwrap();
+        assert_eq!(quiet.severity, Severity::High);
     }
 }
