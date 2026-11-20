@@ -89,8 +89,16 @@ fn display_of(path: &Path, cwd: Option<&Path>) -> String {
     }
 }
 
-fn relative_slashed(path: &Path) -> String {
-    slashed(&path.to_string_lossy())
+fn text_or_hex(path: &Path) -> String {
+    match path.to_str() {
+        Some(text) => slashed(text),
+        None => format!("hex:{}", hex(&path_bytes(path))),
+    }
+}
+
+fn error_site<'a>(path: Option<&'a Path>, open_dirs: &'a [PathBuf], root: &'a Path) -> &'a Path {
+    path.or_else(|| open_dirs.last().map(PathBuf::as_path))
+        .unwrap_or(root)
 }
 
 fn long_form(path: &Path) -> Option<PathBuf> {
@@ -121,6 +129,7 @@ struct Walker<'a> {
     cwd: Option<PathBuf>,
     roots: Vec<PathBuf>,
     seen: HashSet<PathBuf>,
+    recorded: HashSet<String>,
     work: Vec<Work>,
 }
 
@@ -131,7 +140,7 @@ impl Walker<'_> {
 
     fn class_of(&self, root: &Path, root_is_dir: bool, path: &Path) -> String {
         if root_is_dir {
-            return relative_slashed(path.strip_prefix(root).unwrap_or(path));
+            return text_or_hex(path.strip_prefix(root).unwrap_or(path));
         }
         let display = self.display(path);
         let under_cwd = self
@@ -142,19 +151,30 @@ impl Walker<'_> {
             return display;
         }
         path.file_name()
-            .map_or(display, |name| name.to_string_lossy().into_owned())
+            .map_or(display, |name| text_or_hex(Path::new(name)))
     }
 
-    fn push(&mut self, path: &Path, class: String, plan: Plan) {
+    fn push_scan(&mut self, path: &Path, class: String) {
         let display = self.display(path);
         self.work.push(Work {
             display,
             class,
-            plan,
+            plan: Plan::Scan(path.to_path_buf()),
         });
     }
 
-    fn first_visit(&mut self, path: &Path) -> bool {
+    fn record(&mut self, path: &Path, class: String, plan: Plan) {
+        let display = self.display(path);
+        if self.recorded.insert(display.clone()) {
+            self.work.push(Work {
+                display,
+                class,
+                plan,
+            });
+        }
+    }
+
+    fn first_scan(&mut self, path: &Path) -> bool {
         let key = if self.opts.follow_symlinks {
             long_form(path).unwrap_or_else(|| path.to_path_buf())
         } else {
@@ -173,16 +193,12 @@ impl Walker<'_> {
 
     fn walk_root(&mut self, given: &Path) {
         let Some(root) = long_form(given) else {
-            let display = display_of(given, None);
-            let class = relative_slashed(given);
-            self.work.push(Work {
-                display,
-                class,
-                plan: Plan::Unreadable,
-            });
+            let class = text_or_hex(given);
+            self.record(given, class, Plan::Unreadable);
             return;
         };
         let root_is_dir = root.is_dir();
+        let mut open_dirs: Vec<PathBuf> = Vec::new();
         let mut walk = WalkDir::new(&root)
             .follow_links(self.opts.follow_symlinks)
             .sort_by_file_name()
@@ -191,13 +207,17 @@ impl Walker<'_> {
             let entry = match next {
                 Ok(entry) => entry,
                 Err(error) => {
-                    self.walk_error(&root, root_is_dir, &error);
+                    self.walk_error(&root, root_is_dir, &open_dirs, &error);
                     continue;
                 }
             };
             let path = entry.path().to_path_buf();
             let file_type = entry.file_type();
             let is_dir = file_type.is_dir();
+            open_dirs.truncate(entry.depth());
+            if is_dir {
+                open_dirs.push(path.clone());
+            }
             if entry.depth() == 0 && is_dir {
                 continue;
             }
@@ -210,15 +230,11 @@ impl Walker<'_> {
                 if is_dir {
                     walk.skip_current_dir();
                 }
-                if self.first_visit(&path) {
-                    self.push(&path, class, Plan::Record(SkipReason::ExcludedByUser));
-                }
+                self.record(&path, class, Plan::Record(SkipReason::ExcludedByUser));
                 continue;
             }
             if file_type.is_symlink() {
-                if self.first_visit(&path) {
-                    self.push(&path, class, Plan::Record(SkipReason::SymlinkNotFollowed));
-                }
+                self.record(&path, class, Plan::Record(SkipReason::SymlinkNotFollowed));
                 continue;
             }
             if self.opts.follow_symlinks && entry.path_is_symlink() {
@@ -227,39 +243,38 @@ impl Walker<'_> {
                     if is_dir {
                         walk.skip_current_dir();
                     }
-                    if self.first_visit(&path) {
-                        self.push(&path, class, Plan::Record(SkipReason::SymlinkNotFollowed));
-                    }
+                    self.record(&path, class, Plan::Record(SkipReason::SymlinkNotFollowed));
                     continue;
                 }
             }
             if is_dir {
                 continue;
             }
-            if !self.first_visit(&path) {
-                continue;
-            }
             if file_type.is_file() {
-                self.push(&path, class, Plan::Scan(path.clone()));
+                if self.first_scan(&path) {
+                    self.push_scan(&path, class);
+                }
             } else {
-                self.push(&path, class, Plan::Record(SkipReason::Unreadable));
+                self.record(&path, class, Plan::Record(SkipReason::Unreadable));
             }
         }
     }
 
-    fn walk_error(&mut self, root: &Path, root_is_dir: bool, error: &walkdir::Error) {
-        let Some(path) = error.path() else {
-            return;
-        };
+    fn walk_error(
+        &mut self,
+        root: &Path,
+        root_is_dir: bool,
+        open_dirs: &[PathBuf],
+        error: &walkdir::Error,
+    ) {
+        let path = error_site(error.path(), open_dirs, root);
         let class = self.class_of(root, root_is_dir, path);
         let plan = if error.loop_ancestor().is_some() {
             Plan::Record(SkipReason::SymlinkNotFollowed)
         } else {
             Plan::Unreadable
         };
-        if self.first_visit(path) {
-            self.push(path, class, plan);
-        }
+        self.record(path, class, plan);
     }
 }
 
@@ -371,6 +386,7 @@ pub fn scan_paths(paths: &[PathBuf], opts: &ScanOptions) -> ScanResult {
         cwd,
         roots,
         seen: HashSet::new(),
+        recorded: HashSet::new(),
         work: Vec::new(),
     };
     for given in paths {
@@ -400,5 +416,48 @@ pub fn scan_paths(paths: &[PathBuf], opts: &ScanOptions) -> ScanResult {
         findings,
         coverage,
         carrier_counts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_site_prefers_the_error_path() {
+        let root = PathBuf::from("root");
+        let dirs = vec![PathBuf::from("root"), PathBuf::from("root/a")];
+        let own = PathBuf::from("root/a/b");
+        assert_eq!(error_site(Some(&own), &dirs, &root), own.as_path());
+    }
+
+    #[test]
+    fn pathless_error_is_attributed_to_the_deepest_open_directory() {
+        let root = PathBuf::from("root");
+        let dirs = vec![PathBuf::from("root"), PathBuf::from("root/a")];
+        assert_eq!(error_site(None, &dirs, &root), Path::new("root/a"));
+    }
+
+    #[test]
+    fn pathless_error_with_no_open_directory_is_attributed_to_the_root() {
+        let root = PathBuf::from("root/file.txt");
+        assert_eq!(error_site(None, &[], &root), root.as_path());
+    }
+
+    #[test]
+    fn text_or_hex_keeps_utf8_and_hex_encodes_the_rest() {
+        assert_eq!(text_or_hex(Path::new("a/b.txt")), "a/b.txt");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let odd = Path::new(std::ffi::OsStr::from_bytes(b"a\xff"));
+            assert_eq!(text_or_hex(odd), "hex:61ff");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let odd = std::ffi::OsString::from_wide(&[0x61, 0xD800]);
+            assert_eq!(text_or_hex(Path::new(&odd)), "hex:610000d8");
+        }
     }
 }

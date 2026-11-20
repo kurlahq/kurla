@@ -36,6 +36,10 @@ impl TestDir {
         full
     }
 
+    fn mkdir_for_link(&self, rel: &str) {
+        fs::create_dir_all(self.path.join(rel)).unwrap();
+    }
+
     fn shown(&self, rel: &str) -> String {
         let canonical = fs::canonicalize(&self.path).unwrap();
         let text = canonical.to_str().unwrap();
@@ -691,4 +695,126 @@ fn non_utf8_name_is_hex_encoded() {
     bytes.extend_from_slice(b"/bad\xff.txt");
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(result.coverage[0].path, format!("hex:{hex}"));
+}
+
+#[test]
+fn two_links_to_one_outside_target_both_listed() {
+    let outside = TestDir::new();
+    outside.write("secret.txt", &hidden());
+    let dir = TestDir::new();
+    dir.write("in.txt", b"plain\n");
+    link_dir(&outside.path, &dir.path.join("one"));
+    link_dir(&outside.path, &dir.path.join("two"));
+    let opts = ScanOptions {
+        follow_symlinks: true,
+        ..ScanOptions::default()
+    };
+    let result = scan_with(&dir, &opts);
+    assert_eq!(
+        paths(&result),
+        vec![dir.shown("in.txt"), dir.shown("one"), dir.shown("two")]
+    );
+    assert_eq!(
+        result.coverage[1].skip,
+        Some(SkipReason::SymlinkNotFollowed)
+    );
+    assert_eq!(
+        result.coverage[2].skip,
+        Some(SkipReason::SymlinkNotFollowed)
+    );
+    assert!(result.findings.is_empty());
+}
+
+#[test]
+fn excluded_link_does_not_hide_its_real_target() {
+    let dir = TestDir::new();
+    dir.write("src/payload.txt", &hidden());
+    dir.mkdir_for_link("docs");
+    link_dir(&dir.path.join("src"), &dir.path.join("docs").join("alias"));
+    let opts = ScanOptions {
+        excludes: vec![Glob::new("docs/alias").unwrap()],
+        follow_symlinks: true,
+        ..ScanOptions::default()
+    };
+    let result = scan_with(&dir, &opts);
+    assert_eq!(
+        paths(&result),
+        vec![dir.shown("docs/alias"), dir.shown("src/payload.txt")]
+    );
+    assert_eq!(result.coverage[0].skip, Some(SkipReason::ExcludedByUser));
+    assert_eq!(result.coverage[1].skip, None);
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].path, dir.shown("src/payload.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn excluded_file_link_does_not_hide_its_real_target() {
+    let dir = TestDir::new();
+    dir.write("src/payload.txt", &hidden());
+    dir.write("docs/placeholder.txt", b"plain\n");
+    std::os::unix::fs::symlink(
+        dir.path.join("src/payload.txt"),
+        dir.path.join("docs/aaa.txt"),
+    )
+    .unwrap();
+    let opts = ScanOptions {
+        excludes: vec![Glob::new("docs/aaa.txt").unwrap()],
+        follow_symlinks: true,
+        ..ScanOptions::default()
+    };
+    let result = scan_with(&dir, &opts);
+    assert_eq!(
+        paths(&result),
+        vec![
+            dir.shown("docs/aaa.txt"),
+            dir.shown("docs/placeholder.txt"),
+            dir.shown("src/payload.txt")
+        ]
+    );
+    assert_eq!(result.coverage[0].skip, Some(SkipReason::ExcludedByUser));
+    assert_eq!(result.coverage[2].skip, None);
+    assert_eq!(result.findings.len(), 1);
+}
+
+#[test]
+fn missing_root_listed_twice_is_recorded_once() {
+    let dir = TestDir::new();
+    let missing = dir.path.join("nope");
+    let result = scan_paths(&[missing.clone(), missing], &ScanOptions::default());
+    assert_eq!(result.coverage.len(), 1);
+    assert_eq!(result.findings.len(), 1);
+}
+
+#[test]
+fn trailing_slash_glob_excludes_directory() {
+    let dir = TestDir::new();
+    dir.write("keep.txt", b"plain\n");
+    dir.write("node_modules/a.js", &hidden());
+    let opts = ScanOptions {
+        excludes: vec![Glob::new("node_modules/").unwrap()],
+        ..ScanOptions::default()
+    };
+    let result = scan_with(&dir, &opts);
+    assert_eq!(
+        paths(&result),
+        vec![dir.shown("keep.txt"), dir.shown("node_modules")]
+    );
+    assert_eq!(result.coverage[1].skip, Some(SkipReason::ExcludedByUser));
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_names_with_same_lossy_form_have_distinct_fingerprints() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TestDir::new();
+    fs::write(dir.path.join(OsStr::from_bytes(b"bad\xfe.txt")), hidden()).unwrap();
+    fs::write(dir.path.join(OsStr::from_bytes(b"bad\xff.txt")), hidden()).unwrap();
+    let result = scan(&dir);
+    assert_eq!(result.findings.len(), 2);
+    assert_ne!(
+        result.findings[0].fingerprint,
+        result.findings[1].fingerprint
+    );
 }

@@ -3,6 +3,7 @@ pub enum GlobError {
     Empty,
     TripleStar,
     PartialDoubleStar,
+    EmptySegment,
 }
 
 impl std::fmt::Display for GlobError {
@@ -13,6 +14,7 @@ impl std::fmt::Display for GlobError {
             GlobError::PartialDoubleStar => {
                 f.write_str("`**` must be a whole path segment in a glob pattern")
             }
+            GlobError::EmptySegment => f.write_str("empty path segment in a glob pattern"),
         }
     }
 }
@@ -47,6 +49,9 @@ fn fold(text: &str) -> String {
 }
 
 fn parse_segment(segment: &str) -> Result<Segment, GlobError> {
+    if segment.is_empty() {
+        return Err(GlobError::EmptySegment);
+    }
     if segment.contains("***") {
         return Err(GlobError::TripleStar);
     }
@@ -120,11 +125,17 @@ impl Glob {
             return Err(GlobError::Empty);
         }
         let folded = fold(pattern);
-        let segments = folded
+        let rooted = folded.starts_with('/');
+        let body = folded.strip_prefix('/').unwrap_or(&folded);
+        let body = body.strip_suffix('/').unwrap_or(body);
+        if body.is_empty() {
+            return Err(GlobError::Empty);
+        }
+        let segments = body
             .split('/')
             .map(parse_segment)
             .collect::<Result<Vec<_>, _>>()?;
-        let anywhere = !folded.contains('/');
+        let anywhere = !rooted && !body.contains('/');
         Ok(Glob { segments, anywhere })
     }
 
@@ -212,6 +223,55 @@ mod tests {
         assert_eq!(glob("readme.md").matches("README.MD"), cfg!(windows));
         assert_eq!(glob("Docs/*.md").matches("dOCS/a.md"), cfg!(windows));
         assert!(glob("readme.md").matches("readme.md"));
+    }
+
+    #[test]
+    fn leading_slash_glob_is_anchored() {
+        let g = glob("/docs");
+        assert!(g.matches("docs"));
+        assert!(!g.matches("x/docs"));
+        assert!(glob("/a/*.md").matches("a/b.md"));
+        assert!(!glob("/a/*.md").matches("z/a/b.md"));
+    }
+
+    #[test]
+    fn double_slash_glob_is_error() {
+        assert_eq!(Glob::new("a//b"), Err(GlobError::EmptySegment));
+        assert_eq!(Glob::new("//a"), Err(GlobError::EmptySegment));
+        assert_eq!(Glob::new("a//"), Err(GlobError::EmptySegment));
+        assert_eq!(Glob::new("/"), Err(GlobError::Empty));
+    }
+
+    #[test]
+    fn trailing_slash_is_stripped() {
+        assert!(glob("node_modules/").matches("pkg/node_modules"));
+        assert!(glob("a/b/").matches("a/b"));
+    }
+
+    #[test]
+    fn question_mark_matches_one_multibyte_char() {
+        assert!(glob("a?c").matches("a\u{e9}c"));
+        assert!(glob("?").matches("\u{1F600}"));
+        assert!(!glob("a?c").matches("ac"));
+    }
+
+    #[test]
+    fn star_backtracks() {
+        assert!(glob("*a").matches("aa"));
+        assert!(!glob("*a").matches("aab"));
+        assert!(glob("a*a").matches("aaa"));
+        assert!(glob("*ab").matches("aab"));
+        assert!(!glob("a*a").matches("ab"));
+    }
+
+    #[test]
+    fn bare_double_star_matches_everything() {
+        let g = glob("**");
+        assert!(g.matches("a"));
+        assert!(g.matches("a/b/c"));
+        assert!(glob("a/**").matches("a"));
+        assert!(glob("a/**").matches("a/b/c"));
+        assert!(!glob("a/**").matches("b/c"));
     }
 
     #[test]
