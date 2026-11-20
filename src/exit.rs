@@ -6,7 +6,6 @@ fn limit_skip(skip: SkipReason) -> bool {
         SkipReason::SizeLimit
             | SkipReason::DecompressionLimit
             | SkipReason::Timeout
-            | SkipReason::Unreadable
             | SkipReason::Malformed
     )
 }
@@ -19,7 +18,9 @@ fn required(category: Category) -> bool {
 }
 
 fn file_incomplete(file: &FileCoverage, require_complete: bool) -> bool {
-    if required(file.category) && file.skip.is_some_and(limit_skip) {
+    if file.skip == Some(SkipReason::Unreadable)
+        || (required(file.category) && file.skip.is_some_and(limit_skip))
+    {
         return true;
     }
     if !require_complete {
@@ -261,7 +262,21 @@ mod tests {
                 "unread fifo",
                 vec![],
                 vec![file(FileKind::UnknownBinary, Some(SkipReason::Unreadable))],
-                0,
+                2,
+                2,
+            ),
+            row(
+                "unreadable pdf",
+                vec![],
+                vec![file(FileKind::Pdf, Some(SkipReason::Unreadable))],
+                2,
+                2,
+            ),
+            row(
+                "unreadable other image",
+                vec![],
+                vec![file(FileKind::OtherImage, Some(SkipReason::Unreadable))],
+                2,
                 2,
             ),
             row(
@@ -421,6 +436,8 @@ mod tests {
     fn complete_flag_is_independent_of_require_complete() {
         let binary = [file(FileKind::UnknownBinary, None)];
         assert!(!incomplete(&binary, false));
+        let unreadable = [file(FileKind::UnknownBinary, Some(SkipReason::Unreadable))];
+        assert!(incomplete(&unreadable, false));
         assert!(incomplete(&binary, true));
         let text = [file(FileKind::Text, Some(SkipReason::SizeLimit))];
         assert!(incomplete(&text, false));

@@ -1028,4 +1028,157 @@ mod tests {
         let out = human::render(&fixture.report());
         assert_eq!(out.lines().last().unwrap(), "incomplete, exit code 2");
     }
+
+    fn unknown_binary_fixture(require_complete: bool, skip: Option<SkipReason>) -> Fixture {
+        let mut fixture = rich();
+        fixture.findings.clear();
+        fixture.rejected.clear();
+        fixture.coverage = vec![
+            coverage_entry("a.txt", FileKind::Text, None),
+            coverage_entry("blob.bin", FileKind::UnknownBinary, skip),
+        ];
+        fixture.require_complete = require_complete;
+        fixture
+    }
+
+    fn all_formats(fixture: &Fixture) -> (Value, Value, String) {
+        let report = fixture.report();
+        (
+            serde_json::from_str(&json::render(&report)).unwrap(),
+            serde_json::from_str(&sarif::render(&report, &no_source)).unwrap(),
+            human::render(&report),
+        )
+    }
+
+    #[test]
+    fn require_complete_flag_changes_exit_code_but_not_complete() {
+        let (json, sarif, human) = all_formats(&unknown_binary_fixture(false, None));
+        assert_eq!(json["complete"], false);
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
+        assert_eq!(sarif["runs"][0]["properties"]["complete"], false);
+        assert_eq!(sarif["runs"][0]["properties"]["exit_code"], 0);
+        assert_eq!(human.lines().last().unwrap(), "incomplete, exit code 0");
+        let (json, sarif, human) = all_formats(&unknown_binary_fixture(true, None));
+        assert_eq!(json["complete"], false);
+        assert_eq!(json["exit_code"], 2);
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
+        assert_eq!(sarif["runs"][0]["properties"]["exit_code"], 2);
+        assert_eq!(human.lines().last().unwrap(), "incomplete, exit code 2");
+    }
+
+    #[test]
+    fn unreadable_unknown_binary_is_incomplete_without_the_flag() {
+        let fixture = unknown_binary_fixture(false, Some(SkipReason::Unreadable));
+        let (json, sarif, human) = all_formats(&fixture);
+        assert_eq!(json["complete"], false);
+        assert_eq!(json["exit_code"], 2);
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
+        assert_eq!(human.lines().last().unwrap(), "incomplete, exit code 2");
+        assert!(!fixture.report().complete());
+    }
+
+    #[test]
+    fn sarif_regions_correct_across_several_files() {
+        let mut fixture = rich();
+        fixture.findings = vec![
+            finding(
+                "U002",
+                Severity::High,
+                "f2.txt",
+                text_span(2, 4, 1, 2),
+                None,
+            ),
+            finding(
+                "U002",
+                Severity::High,
+                "f1.txt",
+                text_span(4, 6, 2, 2),
+                None,
+            ),
+            finding(
+                "U002",
+                Severity::High,
+                "f3.txt",
+                text_span(1, 4, 1, 2),
+                None,
+            ),
+            finding(
+                "U002",
+                Severity::High,
+                "f1.txt",
+                text_span(0, 2, 1, 1),
+                None,
+            ),
+            finding(
+                "U002",
+                Severity::High,
+                "f2.txt",
+                text_span(0, 2, 1, 1),
+                None,
+            ),
+            finding(
+                "U002",
+                Severity::High,
+                "f3.txt",
+                text_span(3, 5, 2, 1),
+                None,
+            ),
+        ];
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |path: &str| {
+            reads.borrow_mut().push(path.to_string());
+            let content: &[u8] = match path {
+                "f1.txt" => b"ab\ncdef\n",
+                "f2.txt" => "\u{e9}ab".as_bytes(),
+                "f3.txt" => b"ab\ncd\n",
+                _ => return None,
+            };
+            Some(content.to_vec())
+        };
+        let sarif: Value = serde_json::from_str(&sarif::render(&fixture.report(), &read)).unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let regions: Vec<(String, u64, u64, u64, u64)> = results
+            .iter()
+            .map(|result| {
+                let location = &result["locations"][0]["physicalLocation"];
+                let region = &location["region"];
+                (
+                    location["artifactLocation"]["uri"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    region["startLine"].as_u64().unwrap(),
+                    region["startColumn"].as_u64().unwrap(),
+                    region["endLine"].as_u64().unwrap(),
+                    region["endColumn"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        let expected = vec![
+            ("f2.txt", 1, 2, 1, 4),
+            ("f1.txt", 2, 2, 2, 4),
+            ("f3.txt", 1, 2, 2, 2),
+            ("f1.txt", 1, 1, 1, 3),
+            ("f2.txt", 1, 1, 1, 2),
+            ("f3.txt", 2, 1, 2, 3),
+        ];
+        let expected: Vec<(String, u64, u64, u64, u64)> = expected
+            .into_iter()
+            .map(|(path, a, b, c, d)| (path.to_string(), a, b, c, d))
+            .collect();
+        assert_eq!(regions, expected);
+        let mut seen = reads.borrow().clone();
+        seen.sort();
+        assert_eq!(seen, vec!["f1.txt", "f2.txt", "f3.txt"]);
+    }
 }

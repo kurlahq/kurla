@@ -1388,10 +1388,21 @@ fn duplicate_key_decisions_file_leaves_finding_active_e2e() {
         ".kurla/decisions.json",
         decisions_entry(&fingerprint, &rule, &path, duplicate).as_bytes(),
     );
+    dir.write(
+        "base.json",
+        decisions_entry(&fingerprint, &rule, &path, "").as_bytes(),
+    );
     let output = kurla_today(
         &dir,
         "2026-11-20",
-        &["scan", "--no-cache", "--format", "json"],
+        &[
+            "scan",
+            "--no-cache",
+            "--format",
+            "json",
+            "--decisions-base",
+            "base.json",
+        ],
     );
     assert_eq!(code_of(&output), 1, "{}", stderr_of(&output));
     let json = json_of(&output);
@@ -1562,6 +1573,62 @@ fn unresolvable_cache_dir_warns_and_still_scans() {
         .to_string();
     assert!(warning.starts_with("cache disabled: "), "{warning}");
     assert!(stderr_of(&output).contains(&warning));
+}
+
+#[test]
+fn e2e_require_complete_flag_changes_exit_not_complete() {
+    let dir = TestDir::new();
+    dir.write("a.txt", b"hello\n");
+    dir.write("blob.bin", &[0u8, 159, 146, 150, 0, 1, 2, 255, 254, 0, 7]);
+    let default = kurla(&dir, &["scan", "--no-cache", "--format", "json"]);
+    assert_eq!(code_of(&default), 0, "{}", stderr_of(&default));
+    let default_json = json_of(&default);
+    assert_eq!(default_json["complete"], false);
+    assert_eq!(default_json["exit_code"], 0);
+    let strict = kurla(
+        &dir,
+        &[
+            "scan",
+            "--no-cache",
+            "--format",
+            "json",
+            "--require-complete",
+        ],
+    );
+    assert_eq!(code_of(&strict), 2, "{}", stderr_of(&strict));
+    let strict_json = json_of(&strict);
+    assert_eq!(strict_json["complete"], false);
+    assert_eq!(strict_json["exit_code"], 2);
+}
+
+#[cfg(unix)]
+struct RestoreMode {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_permission_denied_text_file_exits_2() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TestDir::new();
+    let secret = dir.write("README.md", b"hello\n");
+    dir.write("a.txt", b"hello\n");
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = RestoreMode { path: secret };
+    let output = kurla(&dir, &["scan", "--no-cache", "--format", "json"]);
+    assert_eq!(code_of(&output), 2, "{}", stderr_of(&output));
+    let json = json_of(&output);
+    assert_eq!(json["complete"], false);
+    assert_eq!(json["coverage"]["skipped"][0]["path"], "README.md");
+    assert_eq!(json["coverage"]["skipped"][0]["reason"], "unreadable");
 }
 
 #[test]

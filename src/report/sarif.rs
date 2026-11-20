@@ -5,7 +5,7 @@ use super::{
 use crate::model::{Finding, RuleStatus, Severity};
 use crate::text::TextDoc;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 const SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
 
@@ -29,16 +29,25 @@ fn security_severity(severity: Severity) -> &'static str {
 
 struct Docs<'a> {
     source: &'a dyn Fn(&str) -> Option<Vec<u8>>,
-    loaded: HashMap<String, Option<TextDoc>>,
+    current: Option<(String, Option<TextDoc>)>,
 }
 
 impl Docs<'_> {
     fn doc(&mut self, path: &str) -> Option<&TextDoc> {
-        if !self.loaded.contains_key(path) {
+        let loaded = self
+            .current
+            .as_ref()
+            .is_some_and(|(current, _)| current == path);
+        if !loaded {
             let doc = (self.source)(path).and_then(|bytes| TextDoc::decode(&bytes));
-            self.loaded.insert(path.to_string(), doc);
+            self.current = Some((path.to_string(), doc));
         }
-        self.loaded.get(path).and_then(Option::as_ref)
+        self.current.as_ref().and_then(|(_, doc)| doc.as_ref())
+    }
+
+    #[cfg(test)]
+    fn resident(&self) -> usize {
+        usize::from(self.current.is_some())
     }
 
     fn end_position(&mut self, finding: &Finding, line: u32, column: u32) -> Option<(u32, u32)> {
@@ -144,13 +153,15 @@ fn notifications(report: &Report) -> Vec<Value> {
 pub fn render(report: &Report, source: &dyn Fn(&str) -> Option<Vec<u8>>) -> String {
     let mut docs = Docs {
         source,
-        loaded: HashMap::new(),
+        current: None,
     };
-    let results: Vec<Value> = report
-        .findings
-        .iter()
-        .map(|finding| result(finding, &mut docs))
-        .collect();
+    let mut order: Vec<usize> = (0..report.findings.len()).collect();
+    order.sort_by(|a, b| report.findings[*a].path.cmp(&report.findings[*b].path));
+    let mut slots: Vec<Option<Value>> = vec![None; report.findings.len()];
+    for index in order {
+        slots[index] = Some(result(&report.findings[index], &mut docs));
+    }
+    let results: Vec<Value> = slots.into_iter().flatten().collect();
     json!({
         "$schema": SCHEMA,
         "version": "2.1.0",
@@ -178,4 +189,32 @@ pub fn render(report: &Report, source: &dyn Fn(&str) -> Option<Vec<u8>>) -> Stri
         }],
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn docs_keep_one_decoded_file_at_a_time() {
+        let reads = RefCell::new(Vec::new());
+        let source = |path: &str| {
+            reads.borrow_mut().push(path.to_string());
+            Some(b"ab\n".to_vec())
+        };
+        let mut docs = Docs {
+            source: &source,
+            current: None,
+        };
+        assert!(docs.doc("a").is_some());
+        assert_eq!(docs.resident(), 1);
+        assert!(docs.doc("a").is_some());
+        assert_eq!(reads.borrow().len(), 1);
+        assert!(docs.doc("b").is_some());
+        assert_eq!(docs.resident(), 1);
+        assert!(docs.doc("c").is_some());
+        assert_eq!(docs.resident(), 1);
+        assert_eq!(*reads.borrow(), vec!["a", "b", "c"]);
+    }
 }

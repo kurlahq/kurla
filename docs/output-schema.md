@@ -97,9 +97,10 @@ Every string that came from a scanned repository or from a decisions file is esc
 - `2`: otherwise, when the run is incomplete or a decisions file was rejected, and also for every usage error and every error that stops the run (a missing path, an invalid `--exclude` glob, an unusable `KURLA_TODAY` when a decisions file is given, a report that cannot be written).
 - `0`: otherwise.
 
-The run is incomplete when either of these holds:
+The run is incomplete when any of these holds:
 
-- a file in the text, SVG or image metadata category has the skip reason `size_limit`, `decompression_limit`, `timeout`, `unreadable` or `malformed`;
+- any file, in any category, has the skip reason `unreadable`: the category of content that could not be read is unknown, so an unreadable file always fails closed (this covers read errors, unreadable directories and special files that were not opened);
+- a file in the text, SVG or image metadata category has the skip reason `size_limit`, `decompression_limit`, `timeout` or `malformed`;
 - `--require-complete` is given and any file is in the unknown binary category (other images and unread special files included, but not files excluded by `--exclude` and not links that were not followed), or any `embedded_not_scanned` entry has a kind other than `pdf`.
 
 PDF files, embedded PDFs, files with unscanned drawn text, excluded files and links that were not followed never make a run incomplete. They stay listed in the coverage.
@@ -187,4 +188,4 @@ A `coverage:` section follows. It lists the scanned counts, every skipped file, 
 - A value may be given as `--flag value` or `--flag=value`. A value that starts with `--` is not taken as a value, and `--` ends the flags.
 - An unknown flag, a missing value, a number that does not parse, `--jobs 0`, or an unknown `--format` or `--fail-on` value prints the usage text on standard error and exits `2`.
 - The current decisions file is `./.kurla/decisions.json` when anything exists at that path. The base file is the one named by `--decisions-base`. A file that is rejected is reported in all three formats and on standard error, and the run goes on with no entries from it.
-- `--output` fails the run with exit `2` when the report cannot be written.
+- `--output` writes through an exclusively created temporary file next to the target, which is renamed into place; a name that already exists is never reused or followed. It fails the run with exit `2` when the report cannot be written.

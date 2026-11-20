@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -223,6 +224,9 @@ fn parse_scan(args: &[OsString]) -> Result<Command, String> {
     Ok(Command::Scan(options))
 }
 
+const MAX_TEMP_ATTEMPTS: u32 = 16;
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 const CURRENT_DECISIONS: &str = ".kurla/decisions.json";
 
 pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -254,17 +258,55 @@ fn read_source(path: &str, cap: u64) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+fn write_atomic_with(
+    target: &Path,
+    bytes: &[u8],
+    names: &mut dyn FnMut(u32) -> PathBuf,
+) -> std::io::Result<()> {
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let temp = names(attempt);
+        let opened = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp);
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let result = file
+            .write_all(bytes)
+            .and_then(|()| file.flush())
+            .and_then(|()| fs::rename(&temp, target));
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        return result;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free temporary file name",
+    ))
+}
+
 fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(target, bytes, &mut |_| {
+        temp_path(target, TEMP_COUNTER.fetch_add(1, Ordering::SeqCst))
+    })
+}
+
+fn temp_path(target: &Path, counter: u64) -> PathBuf {
     let name = target
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let temp = target.with_file_name(format!(".{name}.kurla-tmp-{}", std::process::id()));
-    let result = fs::write(&temp, bytes).and_then(|()| fs::rename(&temp, target));
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    target.with_file_name(format!(
+        ".{name}.kurla-tmp-{}-{counter}-{nanos}",
+        std::process::id()
+    ))
 }
 
 fn scan(options: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -525,5 +567,112 @@ mod tests {
         let message = usage_error(&["scan", "--bog\u{202E}us"]);
         assert!(!message.contains('\u{202E}'));
         assert!(message.contains("\\u{202E}"));
+    }
+
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Scratch {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("kurla-cli-{}-{nanos}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Scratch { path }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn create_new_retries_past_an_existing_regular_file_at_the_first_name() {
+        let scratch = Scratch::new();
+        let target = scratch.path.join("report.json");
+        let taken = scratch.path.join("first");
+        fs::write(&taken, b"planted").unwrap();
+        let second = scratch.path.join("second");
+        let mut offered = Vec::new();
+        let mut names = |attempt: u32| {
+            offered.push(attempt);
+            if attempt == 0 {
+                taken.clone()
+            } else {
+                second.clone()
+            }
+        };
+        write_atomic_with(&target, b"report", &mut names).unwrap();
+        assert_eq!(offered, vec![0, 1]);
+        assert_eq!(fs::read(&taken).unwrap(), b"planted");
+        assert_eq!(fs::read(&target).unwrap(), b"report");
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn create_new_gives_up_after_sixteen_taken_names() {
+        let scratch = Scratch::new();
+        let target = scratch.path.join("report.json");
+        let taken = scratch.path.join("taken");
+        fs::write(&taken, b"planted").unwrap();
+        let mut calls = 0u32;
+        let mut names = |_: u32| {
+            calls += 1;
+            taken.clone()
+        };
+        let error = write_atomic_with(&target, b"report", &mut names).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(calls, 16);
+        assert_eq!(fs::read(&taken).unwrap(), b"planted");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn temp_names_differ_by_counter_and_stay_beside_the_target() {
+        let target = Path::new("out").join("report.json");
+        let first = temp_path(&target, 0);
+        let second = temp_path(&target, 1);
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), target.parent());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_temp_never_follows_a_planted_symlink() {
+        let scratch = Scratch::new();
+        let target = scratch.path.join("report.json");
+        let victim = scratch.path.join("victim");
+        fs::write(&victim, b"precious").unwrap();
+        let planted = scratch.path.join("first");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let second = scratch.path.join("second");
+        let mut names = |attempt: u32| {
+            if attempt == 0 {
+                planted.clone()
+            } else {
+                second.clone()
+            }
+        };
+        write_atomic_with(&target, b"report", &mut names).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(fs::read(&target).unwrap(), b"report");
+    }
+
+    #[test]
+    fn a_failed_rename_removes_only_the_temp_file_it_created() {
+        let scratch = Scratch::new();
+        let target = scratch.path.join("occupied");
+        fs::create_dir(&target).unwrap();
+        let temp = scratch.path.join("temp");
+        let mut names = |_: u32| temp.clone();
+        assert!(write_atomic_with(&target, b"report", &mut names).is_err());
+        assert!(!temp.exists());
+        assert!(target.is_dir());
     }
 }
