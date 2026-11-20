@@ -365,7 +365,7 @@ impl Drop for Unreadable {
 fn make_unreadable(path: &Path) -> Unreadable {
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(path).unwrap().permissions().mode();
-    fs::set_permissions(path, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
     assert!(fs::File::open(path).is_err() || fs::read_dir(path).is_err());
     Unreadable {
         path: path.to_path_buf(),
