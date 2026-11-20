@@ -493,15 +493,28 @@ impl<'a> Engine<'a> {
     }
 }
 
+pub fn scan_oversize(rel_path: &str, prefix: &[u8], len: u64, limits: &Limits) -> Scanned {
+    let kind = binary::sniff(&prefix[..prefix.len().min(SNIFF_PREFIX)], rel_path);
+    let location = location::classify(rel_path, 0);
+    let size = usize::try_from(len).unwrap_or(usize::MAX);
+    let mut engine = Engine::new(rel_path, limits, kind, location, size);
+    engine.note_skip(Some(SkipReason::SizeLimit));
+    engine.push(limit_finding("L001", "file size limit", whole(size)));
+    engine.finish()
+}
+
+pub fn unreadable(rel_path: &str) -> Scanned {
+    let limits = Limits::default();
+    let location = location::classify(rel_path, 0);
+    let mut engine = Engine::new(rel_path, &limits, FileKind::UnknownBinary, location, 0);
+    engine.unreadable(whole(0));
+    engine.finish()
+}
+
 pub fn scan_file(rel_path: &str, bytes: &[u8], limits: &Limits) -> Scanned {
-    let oversize = u64::try_from(bytes.len()).map_or(true, |len| len > limits.max_file_bytes);
-    if oversize {
-        let kind = binary::sniff(&bytes[..bytes.len().min(SNIFF_PREFIX)], rel_path);
-        let location = location::classify(rel_path, 0);
-        let mut engine = Engine::new(rel_path, limits, kind, location, bytes.len());
-        engine.note_skip(Some(SkipReason::SizeLimit));
-        engine.push(limit_finding("L001", "file size limit", whole(bytes.len())));
-        return engine.finish();
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if len > limits.max_file_bytes {
+        return scan_oversize(rel_path, bytes, len, limits);
     }
     let kind = match binary::sniff(bytes, rel_path) {
         FileKind::UnknownBinary if is_svg_path(rel_path) => FileKind::Svg,
@@ -1501,5 +1514,35 @@ mod tests {
         assert_eq!(rule_ids(&findings), vec!["L001"]);
         assert_ne!(findings[0].raw.message, "malformed XML");
         assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+    }
+
+    #[test]
+    fn scan_oversize_takes_kind_from_prefix_and_reports_declared_length() {
+        let limits = Limits::default();
+        let png = png_with_text("A", "hello");
+        let (findings, coverage, counts) = scan_oversize("big.dat", &png, 40_000_000, &limits);
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(findings[0].raw.message, "file size limit");
+        assert_eq!(findings[0].raw.span.byte_start, 0);
+        assert_eq!(findings[0].raw.span.byte_end, 40_000_000);
+        assert_eq!(coverage.kind, FileKind::Png);
+        assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(coverage.path, "big.dat");
+        assert!(counts.is_empty());
+        let (_, coverage, _) = scan_oversize("big.txt", b"plain words", 40_000_000, &limits);
+        assert_eq!(coverage.kind, FileKind::Text);
+    }
+
+    #[test]
+    fn unreadable_helper_is_unknown_binary_l001_unreadable() {
+        let (findings, coverage, counts) = unreadable("AGENTS.md");
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(findings[0].raw.message, "unreadable file");
+        assert_eq!(findings[0].path, "AGENTS.md");
+        assert_eq!(findings[0].location, LocationKind::AgentFile);
+        assert_eq!(coverage.kind, FileKind::UnknownBinary);
+        assert_eq!(coverage.category, Category::UnknownBinary);
+        assert_eq!(coverage.skip, Some(SkipReason::Unreadable));
+        assert!(counts.is_empty());
     }
 }
