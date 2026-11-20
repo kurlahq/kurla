@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -147,7 +147,14 @@ fn feed(hasher: &mut Sha256, field: &[u8]) {
     hasher.update(field);
 }
 
-fn key_for(version: &str, rules: &str, rel_path: &str, bytes: &[u8], limits: &Limits) -> String {
+fn key_for(
+    version: &str,
+    rules: &str,
+    rel_path: &str,
+    bytes: &[u8],
+    limits: &Limits,
+    binary: &[u8; 32],
+) -> String {
     let mut hasher = Sha256::new();
     feed(&mut hasher, &Sha256::digest(bytes));
     feed(&mut hasher, rel_path.as_bytes());
@@ -160,7 +167,31 @@ fn key_for(version: &str, rules: &str, rel_path: &str, bytes: &[u8], limits: &Li
     feed(&mut hasher, &limits.max_base64_run_bytes.to_le_bytes());
     feed(&mut hasher, &limits.max_decode_depth.to_le_bytes());
     feed(&mut hasher, &limits.per_file_time.as_nanos().to_le_bytes());
+    feed(&mut hasher, binary);
     hex(&hasher.finalize())
+}
+
+const HASH_BUFFER: usize = 64 * 1024;
+
+pub fn hash_file(path: &Path) -> Result<[u8; 32], String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; HASH_BUFFER];
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+pub fn executable_hash() -> Result<[u8; 32], String> {
+    let path = std::env::current_exe().map_err(|error| error.to_string())?;
+    hash_file(&path)
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -198,13 +229,13 @@ fn resolve_from(
 #[derive(Debug, Clone)]
 pub struct Cache {
     dir: PathBuf,
+    binary: [u8; 32],
 }
 
 impl Cache {
-    pub fn open(dir: Option<PathBuf>) -> Cache {
-        let dir = dir.unwrap_or_default();
+    pub fn open(dir: PathBuf, binary: [u8; 32]) -> Cache {
         let _ = fs::create_dir_all(&dir);
-        Cache { dir }
+        Cache { dir, binary }
     }
 
     pub fn resolve_dir(cli: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -222,13 +253,14 @@ impl Cache {
         &self.dir
     }
 
-    pub fn key(rel_path: &str, bytes: &[u8], limits: &Limits) -> String {
+    pub fn key(&self, rel_path: &str, bytes: &[u8], limits: &Limits) -> String {
         key_for(
             env!("CARGO_PKG_VERSION"),
             RULES_VERSION,
             rel_path,
             bytes,
             limits,
+            &self.binary,
         )
     }
 
@@ -519,6 +551,9 @@ fn decode_entry(text: &str, key: &str) -> Option<Cached> {
     let coverage = read_coverage(take_object(&mut entry, "coverage")?)?;
     let counts = read_counts(take_object(&mut entry, "carrier_counts")?)?;
     finish(entry)?;
+    if findings.iter().any(|finding| finding.review.is_some()) {
+        return None;
+    }
     let value = (findings, coverage, counts);
     is_cacheable(&value).then_some(value)
 }
@@ -610,11 +645,13 @@ mod tests {
     }
 
     fn open(dir: &TestDir) -> Cache {
-        Cache::open(Some(dir.path.join("c")))
+        Cache::open(dir.path.join("c"), BIN)
     }
 
-    fn base_key() -> String {
-        Cache::key("a.txt", b"hello", &Limits::default())
+    const BIN: [u8; 32] = [7; 32];
+
+    fn base_key(cache: &Cache) -> String {
+        cache.key("a.txt", b"hello", &Limits::default())
     }
 
     fn entry_file(cache: &Cache, key: &str) -> PathBuf {
@@ -625,10 +662,10 @@ mod tests {
     fn changed_content_misses_cache() {
         let dir = TestDir::new();
         let cache = open(&dir);
-        let key = Cache::key("a.txt", b"hello", &Limits::default());
+        let key = cache.key("a.txt", b"hello", &Limits::default());
         assert!(cache.put(&key, &value()));
         assert_eq!(cache.get(&key), Some(value()));
-        let other = Cache::key("a.txt", b"hellp", &Limits::default());
+        let other = cache.key("a.txt", b"hellp", &Limits::default());
         assert_ne!(key, other);
         assert_eq!(cache.get(&other), None);
     }
@@ -637,9 +674,9 @@ mod tests {
     fn same_content_different_path_misses_cache() {
         let dir = TestDir::new();
         let cache = open(&dir);
-        let key = Cache::key("a.txt", b"hello", &Limits::default());
+        let key = cache.key("a.txt", b"hello", &Limits::default());
         assert!(cache.put(&key, &value()));
-        let other = Cache::key("b.txt", b"hello", &Limits::default());
+        let other = cache.key("b.txt", b"hello", &Limits::default());
         assert_ne!(key, other);
         assert_eq!(cache.get(&other), None);
     }
@@ -647,22 +684,25 @@ mod tests {
     #[test]
     fn changed_rules_version_misses_cache() {
         let limits = Limits::default();
-        let now = key_for("0.1.0", RULES_VERSION, "a.txt", b"hello", &limits);
-        let bumped = key_for("0.1.0", "2", "a.txt", b"hello", &limits);
-        let newer = key_for("0.1.1", RULES_VERSION, "a.txt", b"hello", &limits);
+        let dir = TestDir::new();
+        let cache = open(&dir);
+        let now = key_for("0.1.0", RULES_VERSION, "a.txt", b"hello", &limits, &BIN);
+        let bumped = key_for("0.1.0", "2", "a.txt", b"hello", &limits, &BIN);
+        let newer = key_for("0.1.1", RULES_VERSION, "a.txt", b"hello", &limits, &BIN);
         assert_ne!(now, bumped);
         assert_ne!(now, newer);
         assert_ne!(bumped, newer);
-        assert_eq!(base_key().len(), 64);
-        assert!(base_key().bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(base_key(&cache).len(), 64);
+        assert!(base_key(&cache).bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(
-            base_key(),
+            base_key(&cache),
             key_for(
                 env!("CARGO_PKG_VERSION"),
                 RULES_VERSION,
                 "a.txt",
                 b"hello",
-                &limits
+                &limits,
+                &BIN
             )
         );
     }
@@ -702,11 +742,11 @@ mod tests {
         ];
         let dir = TestDir::new();
         let cache = open(&dir);
-        let key = Cache::key("a.txt", b"hello", &d);
+        let key = cache.key("a.txt", b"hello", &d);
         assert!(cache.put(&key, &value()));
         let mut seen = vec![key];
         for limits in &variants {
-            let other = Cache::key("a.txt", b"hello", limits);
+            let other = cache.key("a.txt", b"hello", limits);
             assert!(!seen.contains(&other));
             assert_eq!(cache.get(&other), None);
             seen.push(other);
@@ -716,11 +756,13 @@ mod tests {
     #[test]
     fn field_boundaries_are_unambiguous() {
         let limits = Limits::default();
-        let one = Cache::key("ab", b"c", &limits);
-        let two = Cache::key("a", b"bc", &limits);
+        let dir = TestDir::new();
+        let cache = open(&dir);
+        let one = cache.key("ab", b"c", &limits);
+        let two = cache.key("a", b"bc", &limits);
         assert_ne!(one, two);
-        let first = key_for("1", "23", "p", b"x", &limits);
-        let second = key_for("12", "3", "p", b"x", &limits);
+        let first = key_for("1", "23", "p", b"x", &limits, &BIN);
+        let second = key_for("12", "3", "p", b"x", &limits, &BIN);
         assert_ne!(first, second);
     }
 
@@ -728,7 +770,7 @@ mod tests {
     fn corrupt_entry_is_ignored() {
         let dir = TestDir::new();
         let cache = open(&dir);
-        let key = base_key();
+        let key = base_key(&cache);
         assert!(cache.put(&key, &value()));
         let file = entry_file(&cache, &key);
         let good = fs::read_to_string(&file).unwrap();
@@ -746,7 +788,7 @@ mod tests {
     fn trailing_value_is_a_miss() {
         let dir = TestDir::new();
         let cache = open(&dir);
-        let key = base_key();
+        let key = base_key(&cache);
         assert!(cache.put(&key, &value()));
         let file = entry_file(&cache, &key);
         let good = fs::read_to_string(&file).unwrap();
@@ -758,7 +800,7 @@ mod tests {
     fn missing_extra_and_mistyped_fields_are_misses() {
         let dir = TestDir::new();
         let cache = open(&dir);
-        let key = base_key();
+        let key = base_key(&cache);
         assert!(cache.put(&key, &value()));
         let file = entry_file(&cache, &key);
         let good = fs::read_to_string(&file).unwrap();
@@ -782,8 +824,8 @@ mod tests {
     fn entry_with_wrong_key_inside_is_a_miss() {
         let dir = TestDir::new();
         let cache = open(&dir);
-        let key = base_key();
-        let other = Cache::key("other.txt", b"hello", &Limits::default());
+        let key = base_key(&cache);
+        let other = cache.key("other.txt", b"hello", &Limits::default());
         assert!(cache.put(&key, &value()));
         fs::copy(entry_file(&cache, &key), entry_file(&cache, &other)).unwrap();
         assert_eq!(cache.get(&other), None);
@@ -794,7 +836,7 @@ mod tests {
     fn entry_with_unknown_enum_is_a_miss() {
         let dir = TestDir::new();
         let cache = open(&dir);
-        let key = base_key();
+        let key = base_key(&cache);
         assert!(cache.put(&key, &value()));
         let file = entry_file(&cache, &key);
         let good = fs::read_to_string(&file).unwrap();
@@ -843,20 +885,6 @@ mod tests {
             column: None,
         };
         findings.push(bare);
-        let mut reviewed = finding(Severity::High, Some("p"));
-        reviewed.review = Some(Review {
-            reviewer: "rev".to_string(),
-            reason: "why".to_string(),
-            counted: true,
-        });
-        findings.push(reviewed);
-        let mut uncounted = finding(Severity::High, Some("q"));
-        uncounted.review = Some(Review {
-            reviewer: "rev2".to_string(),
-            reason: "why2".to_string(),
-            counted: false,
-        });
-        findings.push(uncounted);
         let cov = FileCoverage {
             path: String::new(),
             kind: FileKind::Png,
@@ -885,11 +913,87 @@ mod tests {
             (CarrierKind::ResourceLimit, u64::MAX),
         ]);
         let stored: Cached = (findings, cov, counts);
-        let key = base_key();
+        let key = base_key(&cache);
         assert!(cache.put(&key, &stored));
         assert_eq!(cache.get(&key), Some(stored));
     }
 
+    #[test]
+    fn different_executable_hash_misses_cache() {
+        let dir = TestDir::new();
+        let path = dir.path.join("c");
+        let first = Cache::open(path.clone(), [1; 32]);
+        let key = first.key("a.txt", b"hello", &Limits::default());
+        assert!(first.put(&key, &value()));
+        let second = Cache::open(path.clone(), [2; 32]);
+        let other = second.key("a.txt", b"hello", &Limits::default());
+        assert_ne!(key, other);
+        assert_eq!(second.get(&other), None);
+        assert_eq!(second.get(&key), Some(value()));
+        let same = Cache::open(path, [1; 32]);
+        assert_eq!(same.key("a.txt", b"hello", &Limits::default()), key);
+        assert_eq!(same.get(&key), Some(value()));
+    }
+
+    #[test]
+    fn hash_file_matches_the_published_sha256_test_vector() {
+        let dir = TestDir::new();
+        let file = dir.path.join("abc.bin");
+        fs::write(&file, b"abc").unwrap();
+        assert_eq!(
+            hex(&hash_file(&file).unwrap()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn hash_file_streams_content_larger_than_its_buffer() {
+        let dir = TestDir::new();
+        let file = dir.path.join("big.bin");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&file, &bytes).unwrap();
+        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(hash_file(&file).unwrap(), expected);
+    }
+
+    #[test]
+    fn hash_file_of_a_missing_path_is_an_error() {
+        let dir = TestDir::new();
+        let error = hash_file(&dir.path.join("absent")).unwrap_err();
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn executable_hash_is_the_hash_of_the_running_executable() {
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(executable_hash().unwrap(), hash_file(&exe).unwrap());
+    }
+
+    #[test]
+    fn entry_with_review_is_a_miss() {
+        let dir = TestDir::new();
+        let cache = open(&dir);
+        let key = base_key(&cache);
+        let mut reviewed = value();
+        reviewed.0[0].review = Some(Review {
+            reviewer: "rev".to_string(),
+            reason: "why".to_string(),
+            counted: true,
+        });
+        fs::create_dir_all(cache.dir()).unwrap();
+        fs::write(
+            entry_file(&cache, &key),
+            encode_entry(&key, &reviewed).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache.get(&key), None);
+        fs::write(
+            entry_file(&cache, &key),
+            encode_entry(&key, &value()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache.get(&key), Some(value()));
+    }
     #[test]
     fn every_enum_name_round_trips() {
         let dir = TestDir::new();
@@ -921,7 +1025,7 @@ mod tests {
             cov.category = category;
             cov.skip = skips.get(index).copied();
             let stored: Cached = (Vec::new(), cov, BTreeMap::new());
-            let key = Cache::key("n.txt", &[u8::try_from(index).unwrap()], &Limits::default());
+            let key = cache.key("n.txt", &[u8::try_from(index).unwrap()], &Limits::default());
             assert!(cache.put(&key, &stored));
             assert_eq!(cache.get(&key), Some(stored));
         }
@@ -968,7 +1072,7 @@ mod tests {
         }
         let counts = carriers.into_iter().map(|c| (c, 1)).collect();
         let stored: Cached = (findings, coverage(), counts);
-        let key = base_key();
+        let key = base_key(&cache);
         assert!(cache.put(&key, &stored));
         assert_eq!(cache.get(&key), Some(stored));
     }
@@ -983,7 +1087,7 @@ mod tests {
         };
         let scanned = scan_file("a.txt", b"some plain words here", &limits);
         assert_eq!(scanned.1.skip, Some(SkipReason::Timeout));
-        let key = Cache::key("a.txt", b"some plain words here", &limits);
+        let key = cache.key("a.txt", b"some plain words here", &limits);
         assert!(cache.put(&key, &scanned));
         assert_eq!(cache.get(&key), None);
         assert!(!entry_file(&cache, &key).exists());
@@ -995,7 +1099,7 @@ mod tests {
         let cache = open(&dir);
         let mut stored = value();
         stored.0[0].raw.rule_id = "L002";
-        let key = base_key();
+        let key = base_key(&cache);
         assert!(cache.put(&key, &stored));
         assert_eq!(cache.get(&key), None);
         assert!(!entry_file(&cache, &key).exists());
@@ -1005,12 +1109,12 @@ mod tests {
     fn put_leaves_no_temporary_files() {
         let dir = TestDir::new();
         let cache = open(&dir);
-        assert!(cache.put(&base_key(), &value()));
+        assert!(cache.put(&base_key(&cache), &value()));
         let names: Vec<String> = fs::read_dir(cache.dir())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(names, vec![format!("{}.json", base_key())]);
+        assert_eq!(names, vec![format!("{}.json", base_key(&cache))]);
     }
 
     #[test]
@@ -1018,9 +1122,9 @@ mod tests {
         let dir = TestDir::new();
         let blocker = dir.path.join("blocker");
         fs::write(&blocker, b"x").unwrap();
-        let cache = Cache::open(Some(blocker));
-        assert!(!cache.put(&base_key(), &value()));
-        assert_eq!(cache.get(&base_key()), None);
+        let cache = Cache::open(blocker, BIN);
+        assert!(!cache.put(&base_key(&cache), &value()));
+        assert_eq!(cache.get(&base_key(&cache)), None);
     }
 
     #[test]

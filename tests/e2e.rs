@@ -868,7 +868,7 @@ fn planted() -> kurla::cache::Cached {
 
 fn cache_opts(dir: &Path) -> ScanOptions {
     ScanOptions {
-        cache: Some(Cache::open(Some(dir.to_path_buf()))),
+        cache: Some(Cache::open(dir.to_path_buf(), [9; 32])),
         ..ScanOptions::default()
     }
 }
@@ -879,8 +879,12 @@ fn walker_uses_cache_hit_without_rescanning() {
     let cache_dir = TestDir::new();
     dir.write("a.txt", b"plain words\n");
     assert!(scan(&dir).findings.is_empty());
-    let key = Cache::key("a.txt", b"plain words\n", &Limits::default());
     let opts = cache_opts(&cache_dir.path);
+    let key = opts
+        .cache
+        .as_ref()
+        .unwrap()
+        .key("a.txt", b"plain words\n", &Limits::default());
     assert!(opts.cache.as_ref().unwrap().put(&key, &planted()));
     let result = scan_with(&dir, &opts);
     assert_eq!(result.findings.len(), 1);
@@ -912,7 +916,11 @@ fn cache_inside_scan_root_is_refused_and_reported() {
     dir.write("a.txt", b"plain words\n");
     let inside = dir.path.join(".kurla-cache");
     let opts = cache_opts(&inside);
-    let key = Cache::key("a.txt", b"plain words\n", &Limits::default());
+    let key = opts
+        .cache
+        .as_ref()
+        .unwrap()
+        .key("a.txt", b"plain words\n", &Limits::default());
     assert!(opts.cache.as_ref().unwrap().put(&key, &planted()));
     let result = scan_with(&dir, &opts);
     assert!(
@@ -965,7 +973,11 @@ fn oversize_file_is_not_cached() {
     let result = scan_with(&dir, &opts);
     assert_eq!(result.coverage[0].skip, Some(SkipReason::SizeLimit));
     assert_eq!(fs::read_dir(&cache_dir.path).unwrap().count(), 0);
-    let key = Cache::key("big.txt", &[b'a'; 64], &opts.limits);
+    let key = opts
+        .cache
+        .as_ref()
+        .unwrap()
+        .key("big.txt", &[b'a'; 64], &opts.limits);
     assert!(opts.cache.as_ref().unwrap().put(&key, &planted()));
     let again = scan_with(&dir, &opts);
     assert_eq!(again.coverage[0].skip, Some(SkipReason::SizeLimit));
