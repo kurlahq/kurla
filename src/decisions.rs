@@ -969,10 +969,8 @@ mod tests {
 
     #[test]
     fn duplicate_key_after_unescaping_is_error() {
-        for dup in [
-            r#""rule":"S002","rule":"S002""#,
-            r#""rule":"S002","rule":"S002""#,
-        ] {
+        let escaped_rule = format!(r#""rule":"S002","r{}u0075le":"S002""#, char::from(92u8));
+        for dup in [r#""rule":"S002","rule":"S002""#, escaped_rule.as_str()] {
             let bad = valid_entry(FP_A, "S002", "rev").replace(r#""rule":"S002""#, dup);
             let err =
                 Decisions::parse(&format!(r#"{{"version":1,"entries":[{bad}]}}"#)).unwrap_err();

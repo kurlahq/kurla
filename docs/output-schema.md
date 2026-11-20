@@ -37,7 +37,7 @@ Reviewing a finding never removes it from the output. Counted and uncounted revi
 
 ### Duplicate keys and rejected files
 
-A repeated key in any JSON object of the file, at any depth, rejects the whole file, even when both values are identical. Keys are compared after JSON unescaping, so `"rule"` and `"rule"` collide. The message contains `duplicate key` and the key name.
+A repeated key in any JSON object of the file, at any depth, rejects the whole file, even when both values are identical. Keys are compared after JSON unescaping, so a key spelled with a JSON unicode escape collides with the same key spelled plainly. The message contains `duplicate key` and the key name.
 
 A decisions file that cannot be loaded for any reason (unreadable, not UTF-8, invalid JSON, a duplicate key, a schema violation) is reported as rejected, with its path and the message, and is then treated as absent:
 
