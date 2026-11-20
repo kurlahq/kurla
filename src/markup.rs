@@ -203,7 +203,7 @@ fn decode_numeric_reference(rest: &[char]) -> Option<(char, usize)> {
     Some((code_point(value), used))
 }
 
-fn decode_references(text: &str) -> String {
+pub(crate) fn decode_references(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
