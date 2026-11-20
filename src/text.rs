@@ -304,6 +304,10 @@ impl TextDoc {
     pub fn byte_span(&self, char_start: usize, char_end: usize) -> (u64, u64) {
         (self.offsets[char_start], self.offsets[char_end])
     }
+
+    pub fn char_index_of_byte(&self, byte: u64) -> Option<usize> {
+        self.offsets.binary_search(&byte).ok()
+    }
 }
 
 #[cfg(test)]
@@ -818,5 +822,20 @@ mod tests {
         assert_eq!(bom.byte_span(1, 2), (3, 4));
         assert_eq!(bom.byte_span(0, 4), (0, 6));
         assert_eq!(bom.position(3), (2, 1));
+    }
+
+    #[test]
+    fn char_index_of_byte_maps_only_character_boundaries() {
+        let doc = TextDoc::decode("\u{e9}\nab".as_bytes()).unwrap();
+        assert_eq!(doc.char_index_of_byte(0), Some(0));
+        assert_eq!(doc.char_index_of_byte(1), None);
+        assert_eq!(doc.char_index_of_byte(2), Some(1));
+        assert_eq!(doc.char_index_of_byte(4), Some(3));
+        assert_eq!(doc.char_index_of_byte(5), Some(4));
+        assert_eq!(doc.char_index_of_byte(6), None);
+        let bom = TextDoc::decode(b"\xEF\xBB\xBFab").unwrap();
+        assert_eq!(bom.char_index_of_byte(0), None);
+        assert_eq!(bom.char_index_of_byte(3), Some(0));
+        assert_eq!(bom.char_index_of_byte(5), Some(2));
     }
 }

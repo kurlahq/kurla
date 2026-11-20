@@ -1,0 +1,529 @@
+use crate::cache::Cache;
+use crate::decisions::{self, Applied};
+use crate::glob::Glob;
+use crate::limits::Limits;
+use crate::model::Severity;
+use crate::report::{Report, escape, human, json, sarif};
+use crate::walk::{ScanOptions, scan_paths};
+use std::ffi::OsString;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Human,
+    Json,
+    Sarif,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    pub paths: Vec<PathBuf>,
+    pub format: Format,
+    pub output: Option<PathBuf>,
+    pub fail_on: Severity,
+    pub require_complete: bool,
+    pub excludes: Vec<String>,
+    pub follow_symlinks: bool,
+    pub decisions_base: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
+    pub no_cache: bool,
+    pub jobs: usize,
+    pub max_file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Version,
+    Help,
+    Scan(Options),
+}
+
+pub const USAGE: &str = "usage:
+  kurla scan [PATH]... [--format human|json|sarif] [--output FILE]
+             [--fail-on info|low|medium|high|critical] [--require-complete]
+             [--exclude GLOB]... [--follow-symlinks] [--decisions-base FILE]
+             [--cache-dir DIR] [--no-cache] [--jobs N] [--max-file-size BYTES]
+  kurla --version
+  kurla --help";
+
+fn shown(text: &std::ffi::OsStr) -> String {
+    escape(&text.to_string_lossy())
+}
+
+pub fn parse(args: &[OsString]) -> Result<Command, String> {
+    let Some(first) = args.first() else {
+        return Err("missing command".to_string());
+    };
+    match first.to_str() {
+        Some("--version") if args.len() == 1 => Ok(Command::Version),
+        Some("--version") => Err("unexpected argument after --version".to_string()),
+        Some("--help" | "-h") => Ok(Command::Help),
+        Some("scan") => parse_scan(&args[1..]),
+        _ => Err(format!("unknown command `{}`", shown(first))),
+    }
+}
+
+fn value_of(
+    name: &str,
+    inline: Option<OsString>,
+    rest: &mut std::slice::Iter<OsString>,
+) -> Result<OsString, String> {
+    if let Some(value) = inline {
+        return Ok(value);
+    }
+    match rest.as_slice().first() {
+        Some(next) if !next.to_string_lossy().starts_with("--") => {
+            rest.next();
+            Ok(next.clone())
+        }
+        _ => Err(format!("missing value for {name}")),
+    }
+}
+
+fn text_of(name: &str, value: OsString) -> Result<String, String> {
+    value
+        .into_string()
+        .map_err(|value| format!("invalid value for {name}: `{}`", shown(&value)))
+}
+
+fn severity_of(name: &str) -> Option<Severity> {
+    Some(match name {
+        "info" => Severity::Info,
+        "low" => Severity::Low,
+        "medium" => Severity::Medium,
+        "high" => Severity::High,
+        "critical" => Severity::Critical,
+        _ => return None,
+    })
+}
+
+fn parse_scan(args: &[OsString]) -> Result<Command, String> {
+    let mut options = Options {
+        paths: Vec::new(),
+        format: Format::Human,
+        output: None,
+        fail_on: Severity::High,
+        require_complete: false,
+        excludes: Vec::new(),
+        follow_symlinks: false,
+        decisions_base: None,
+        cache_dir: None,
+        no_cache: false,
+        jobs: 0,
+        max_file_size: None,
+    };
+    let mut rest = args.iter();
+    let mut flags_ended = false;
+    while let Some(arg) = rest.next() {
+        let text = arg.to_string_lossy();
+        if flags_ended || !text.starts_with('-') || text.len() == 1 {
+            options.paths.push(PathBuf::from(arg));
+            continue;
+        }
+        if text == "--" {
+            flags_ended = true;
+            continue;
+        }
+        if text == "--help" {
+            return Ok(Command::Help);
+        }
+        let (name, inline) = match text.split_once('=') {
+            Some((name, value)) if text.starts_with("--") => {
+                (name.to_string(), Some(OsString::from(value)))
+            }
+            _ => (text.to_string(), None),
+        };
+        match name.as_str() {
+            "--require-complete" | "--follow-symlinks" | "--no-cache" => {
+                if inline.is_some() {
+                    return Err(format!("{} takes no value", escape(&name)));
+                }
+                match name.as_str() {
+                    "--require-complete" => options.require_complete = true,
+                    "--follow-symlinks" => options.follow_symlinks = true,
+                    _ => options.no_cache = true,
+                }
+            }
+            "--format" => {
+                let value = text_of("--format", value_of("--format", inline, &mut rest)?)?;
+                options.format = match value.as_str() {
+                    "human" => Format::Human,
+                    "json" => Format::Json,
+                    "sarif" => Format::Sarif,
+                    _ => {
+                        return Err(format!(
+                            "invalid value for --format: `{}` (expected human, json or sarif)",
+                            escape(&value)
+                        ));
+                    }
+                };
+            }
+            "--fail-on" => {
+                let value = text_of("--fail-on", value_of("--fail-on", inline, &mut rest)?)?;
+                options.fail_on = severity_of(&value).ok_or_else(|| {
+                    format!(
+                        "invalid value for --fail-on: `{}` (expected info, low, medium, high or critical)",
+                        escape(&value)
+                    )
+                })?;
+            }
+            "--output" => {
+                options.output = Some(PathBuf::from(value_of("--output", inline, &mut rest)?));
+            }
+            "--exclude" => {
+                options.excludes.push(text_of(
+                    "--exclude",
+                    value_of("--exclude", inline, &mut rest)?,
+                )?);
+            }
+            "--decisions-base" => {
+                options.decisions_base = Some(PathBuf::from(value_of(
+                    "--decisions-base",
+                    inline,
+                    &mut rest,
+                )?));
+            }
+            "--cache-dir" => {
+                options.cache_dir =
+                    Some(PathBuf::from(value_of("--cache-dir", inline, &mut rest)?));
+            }
+            "--jobs" => {
+                let value = text_of("--jobs", value_of("--jobs", inline, &mut rest)?)?;
+                options.jobs = match value.parse::<usize>() {
+                    Ok(jobs) if jobs > 0 => jobs,
+                    _ => {
+                        return Err(format!(
+                            "invalid value for --jobs: `{}` (expected a positive number)",
+                            escape(&value)
+                        ));
+                    }
+                };
+            }
+            "--max-file-size" => {
+                let value = text_of(
+                    "--max-file-size",
+                    value_of("--max-file-size", inline, &mut rest)?,
+                )?;
+                options.max_file_size = Some(value.parse::<u64>().map_err(|_| {
+                    format!(
+                        "invalid value for --max-file-size: `{}` (expected a number of bytes)",
+                        escape(&value)
+                    )
+                })?);
+            }
+            _ => return Err(format!("unknown flag `{}`", escape(&name))),
+        }
+    }
+    if options.paths.is_empty() {
+        options.paths.push(PathBuf::from("."));
+    }
+    Ok(Command::Scan(options))
+}
+
+const CURRENT_DECISIONS: &str = ".kurla/decisions.json";
+
+pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    match parse(args) {
+        Err(message) => {
+            let _ = writeln!(err, "error: {message}\n{USAGE}");
+            2
+        }
+        Ok(Command::Version) => {
+            let written = writeln!(out, "kurla {}", env!("CARGO_PKG_VERSION"));
+            if written.is_ok() { 0 } else { 2 }
+        }
+        Ok(Command::Help) => {
+            let written = writeln!(out, "{USAGE}");
+            if written.is_ok() { 0 } else { 2 }
+        }
+        Ok(Command::Scan(options)) => scan(&options, out, err),
+    }
+}
+
+fn exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn read_source(path: &str, cap: u64) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(cap).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = target.with_file_name(format!(".{name}.kurla-tmp-{}", std::process::id()));
+    let result = fs::write(&temp, bytes).and_then(|()| fs::rename(&temp, target));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn scan(options: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let mut excludes = Vec::new();
+    for pattern in &options.excludes {
+        match Glob::new(pattern) {
+            Ok(glob) => excludes.push(glob),
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "error: invalid --exclude pattern `{}`: {error}\n{USAGE}",
+                    escape(pattern)
+                );
+                return 2;
+            }
+        }
+    }
+    for path in &options.paths {
+        let missing = fs::symlink_metadata(path)
+            .err()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if missing {
+            let _ = writeln!(
+                err,
+                "error: path does not exist: {}",
+                shown(path.as_os_str())
+            );
+            return 2;
+        }
+    }
+    let current = Path::new(CURRENT_DECISIONS);
+    let current = exists(current).then_some(current);
+    let base = options.decisions_base.as_deref();
+    let today = if current.is_some() || base.is_some() {
+        match decisions::today() {
+            Ok(today) => Some(today),
+            Err(error) => {
+                let _ = writeln!(err, "error: {}", escape(&error.message));
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    let mut warnings = Vec::new();
+    let cache = if options.no_cache {
+        None
+    } else {
+        match Cache::resolve_dir(options.cache_dir.clone()) {
+            Ok(dir) => Some(Cache::open(Some(dir))),
+            Err(reason) => {
+                warnings.push(format!("cache disabled: {reason}"));
+                None
+            }
+        }
+    };
+    let mut limits = Limits::default();
+    if let Some(max) = options.max_file_size {
+        limits.max_file_bytes = max;
+    }
+    let cap = limits.max_file_bytes;
+    let scan_options = ScanOptions {
+        excludes,
+        follow_symlinks: options.follow_symlinks,
+        jobs: options.jobs,
+        limits,
+        cache,
+    };
+    let mut result = scan_paths(&options.paths, &scan_options);
+    warnings.append(&mut result.warnings);
+    let applied = match today {
+        Some(today) => decisions::load_and_apply(&mut result.findings, current, base, today),
+        None => Applied::default(),
+    };
+    let report = Report {
+        findings: &result.findings,
+        coverage: &result.coverage,
+        carrier_counts: &result.carrier_counts,
+        threshold: options.fail_on,
+        require_complete: options.require_complete,
+        invalid: &applied.invalid,
+        rejected: &applied.rejected,
+        warnings: &warnings,
+    };
+    let mut rendered = match options.format {
+        Format::Human => human::render(&report),
+        Format::Json => json::render(&report),
+        Format::Sarif => sarif::render(&report, &|path| read_source(path, cap)),
+    };
+    if options.format != Format::Human {
+        rendered.push('\n');
+    }
+    for warning in &warnings {
+        let _ = writeln!(err, "warning: {}", escape(warning));
+    }
+    for file in &applied.rejected {
+        let _ = writeln!(
+            err,
+            "error: decisions file {}: {}",
+            escape(&file.file),
+            escape(&file.message)
+        );
+    }
+    let written = match &options.output {
+        Some(target) => write_atomic(target, rendered.as_bytes()).map_err(|error| {
+            format!(
+                "cannot write {}: {}",
+                shown(target.as_os_str()),
+                escape(&error.to_string())
+            )
+        }),
+        None => out
+            .write_all(rendered.as_bytes())
+            .and_then(|()| out.flush())
+            .map_err(|error| format!("cannot write the report: {}", escape(&error.to_string()))),
+    };
+    if let Err(message) = written {
+        let _ = writeln!(err, "error: {message}");
+        return 2;
+    }
+    report.exit_code()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    fn scan(list: &[&str]) -> Options {
+        match parse(&args(list)).unwrap() {
+            Command::Scan(options) => options,
+            other => panic!("expected a scan, got {other:?}"),
+        }
+    }
+
+    fn usage_error(list: &[&str]) -> String {
+        parse(&args(list)).unwrap_err()
+    }
+
+    #[test]
+    fn defaults_scan_the_current_directory_and_fail_on_high() {
+        let options = scan(&["scan"]);
+        assert_eq!(options.paths, vec![PathBuf::from(".")]);
+        assert_eq!(options.format, Format::Human);
+        assert_eq!(options.fail_on, Severity::High);
+        assert_eq!(options.output, None);
+        assert!(!options.require_complete);
+        assert!(options.excludes.is_empty());
+        assert!(!options.follow_symlinks);
+        assert_eq!(options.decisions_base, None);
+        assert_eq!(options.cache_dir, None);
+        assert!(!options.no_cache);
+        assert_eq!(options.jobs, 0);
+        assert_eq!(options.max_file_size, None);
+    }
+
+    #[test]
+    fn every_flag_is_parsed() {
+        let options = scan(&[
+            "scan",
+            "a",
+            "b",
+            "--format",
+            "sarif",
+            "--output",
+            "out.sarif",
+            "--fail-on",
+            "low",
+            "--require-complete",
+            "--exclude",
+            "*.log",
+            "--exclude",
+            "build/**",
+            "--follow-symlinks",
+            "--decisions-base",
+            "base.json",
+            "--cache-dir",
+            "cache",
+            "--no-cache",
+            "--jobs",
+            "3",
+            "--max-file-size",
+            "1024",
+        ]);
+        assert_eq!(options.paths, vec![PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(options.format, Format::Sarif);
+        assert_eq!(options.output, Some(PathBuf::from("out.sarif")));
+        assert_eq!(options.fail_on, Severity::Low);
+        assert!(options.require_complete);
+        assert_eq!(options.excludes, vec!["*.log", "build/**"]);
+        assert!(options.follow_symlinks);
+        assert_eq!(options.decisions_base, Some(PathBuf::from("base.json")));
+        assert_eq!(options.cache_dir, Some(PathBuf::from("cache")));
+        assert!(options.no_cache);
+        assert_eq!(options.jobs, 3);
+        assert_eq!(options.max_file_size, Some(1024));
+    }
+
+    #[test]
+    fn flags_and_paths_may_be_mixed_and_equals_form_works() {
+        let options = scan(&["scan", "--format=json", "a", "--fail-on=critical", "b"]);
+        assert_eq!(options.paths, vec![PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(options.format, Format::Json);
+        assert_eq!(options.fail_on, Severity::Critical);
+    }
+
+    #[test]
+    fn double_dash_ends_the_flags() {
+        let options = scan(&["scan", "--", "--odd-name", "-x"]);
+        assert_eq!(
+            options.paths,
+            vec![PathBuf::from("--odd-name"), PathBuf::from("-x")]
+        );
+    }
+
+    #[test]
+    fn every_severity_is_accepted_by_fail_on() {
+        for (name, severity) in [
+            ("info", Severity::Info),
+            ("low", Severity::Low),
+            ("medium", Severity::Medium),
+            ("high", Severity::High),
+            ("critical", Severity::Critical),
+        ] {
+            assert_eq!(scan(&["scan", "--fail-on", name]).fail_on, severity);
+        }
+    }
+
+    #[test]
+    fn version_and_help_are_commands() {
+        assert_eq!(parse(&args(&["--version"])), Ok(Command::Version));
+        assert_eq!(parse(&args(&["--help"])), Ok(Command::Help));
+        assert_eq!(parse(&args(&["-h"])), Ok(Command::Help));
+    }
+
+    #[test]
+    fn usage_errors_name_the_problem() {
+        assert!(usage_error(&[]).contains("missing command"));
+        assert!(usage_error(&["frobnicate"]).contains("unknown command"));
+        assert!(usage_error(&["--version", "x"]).contains("unexpected"));
+        assert!(usage_error(&["scan", "--bogus"]).contains("unknown flag `--bogus`"));
+        assert!(usage_error(&["scan", "--format"]).contains("missing value for --format"));
+        assert!(usage_error(&["scan", "--exclude"]).contains("missing value for --exclude"));
+        assert!(usage_error(&["scan", "--format", "xml"]).contains("--format"));
+        assert!(usage_error(&["scan", "--fail-on", "severe"]).contains("--fail-on"));
+        assert!(usage_error(&["scan", "--jobs", "many"]).contains("--jobs"));
+        assert!(usage_error(&["scan", "--jobs", "0"]).contains("--jobs"));
+        assert!(usage_error(&["scan", "--jobs", "-1"]).contains("--jobs"));
+        assert!(usage_error(&["scan", "--max-file-size", "big"]).contains("--max-file-size"));
+        assert!(usage_error(&["scan", "--require-complete=yes"]).contains("takes no value"));
+    }
+
+    #[test]
+    fn usage_error_text_escapes_what_the_user_typed() {
+        let message = usage_error(&["scan", "--bog\u{202E}us"]);
+        assert!(!message.contains('\u{202E}'));
+        assert!(message.contains("\\u{202E}"));
+    }
+}
