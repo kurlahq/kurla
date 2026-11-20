@@ -107,7 +107,7 @@ pub fn rgi_tag_sequence_len(s: &str) -> Option<usize> {
     None
 }
 
-fn combining_class(c: char) -> u8 {
+pub(crate) fn combining_class(c: char) -> u8 {
     tables::COMBINING_CLASS
         .binary_search_by(|&(lo, hi, _)| range_order(lo, hi, c))
         .map_or(0, |i| tables::COMBINING_CLASS[i].2)
