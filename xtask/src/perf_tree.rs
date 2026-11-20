@@ -331,6 +331,38 @@ mod tests {
     }
 
     #[test]
+    fn the_first_file_for_count_one_matches_the_golden_kind_size_and_crc() {
+        let dir = scratch("golden");
+        generate(&dir, 1).unwrap();
+        let files = tree(&dir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "d0000/f0000000.json");
+        assert_eq!(files[0].1.len(), 9215);
+        assert_eq!(crc32(&files[0].1), 0x3168_B07A);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_png_text_chunk_carries_a_correct_crc() {
+        let dir = scratch("pngcrc");
+        generate(&dir, 200).unwrap();
+        let mut checked = 0;
+        for (rel, bytes) in tree(&dir) {
+            if !rel.ends_with(".png") {
+                continue;
+            }
+            let length = u32::from_be_bytes(bytes[33..37].try_into().unwrap()) as usize;
+            assert_eq!(&bytes[37..41], b"tEXt", "{rel}");
+            let body = &bytes[37..41 + length];
+            let stored = u32::from_be_bytes(bytes[41 + length..45 + length].try_into().unwrap());
+            assert_eq!(stored, crc32(body), "{rel}");
+            checked += 1;
+        }
+        assert!(checked > 10, "{checked}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn splitmix64_from_seed_zero_matches_the_published_first_outputs() {
         let mut rng = SplitMix64(0);
         assert_eq!(rng.next(), 0xE220_A839_7B1D_CDAF);

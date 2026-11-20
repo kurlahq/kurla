@@ -25,61 +25,136 @@ on:
       - docs/equivalent-mutants.md
   workflow_dispatch:
     inputs:
-      shard:
-        description: Shard as k/n, for example 0/8
-        default: 0/1
-        type: string
       mode:
-        description: diff tests the changes against the default branch, full tests every mutant in the shard
+        description: diff tests the changes against the default branch, full tests every mutant across the shards
         default: diff
         type: choice
         options:
           - diff
           - full
+      shards:
+        description: Number of shards for a full run, from 1 to 64
+        default: "8"
+        type: string
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  DEV_RUN: docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/tmp/cargo-home -v "$PWD":/src -w /src kurla-dev
 
 jobs:
-  mutants:
+  diff:
+    if: github.event_name == 'pull_request' || inputs.mode == 'diff'
     runs-on: ubuntu-latest
     env:
-      MODE: ${{ github.event_name == 'pull_request' && 'diff' || inputs.mode }}
-      SHARD: ${{ inputs.shard }}
       BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          fetch-depth: ${{ (github.event_name == 'pull_request' || inputs.mode == 'diff') && 0 || 1 }}
+          fetch-depth: 0
       - uses: ./.github/actions/dev-image
       - name: Write the diff
-        id: diff
-        if: env.MODE == 'diff'
         run: |
           git diff "origin/$BASE_REF"...HEAD > mutants.diff
-          if [ -s mutants.diff ]; then
-            echo "empty=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "empty=true" >> "$GITHUB_OUTPUT"
-            echo "The diff against $BASE_REF is empty, so no mutants are tested."
+          if [ ! -s mutants.diff ]; then
+            echo "The diff against $BASE_REF is empty."
+            : > mutants.none
           fi
       - name: Run cargo-mutants on the diff
-        if: env.MODE == 'diff' && steps.diff.outputs.empty != 'true'
-        run: docker run --rm --network none -v "$PWD":/src -w /src kurla-dev dev/mutants.sh diff mutants.diff
-      - name: Run cargo-mutants on the shard
-        if: env.MODE == 'full'
-        run: docker run --rm --network none -v "$PWD":/src -w /src kurla-dev dev/mutants.sh full "$SHARD"
-      - name: Count the outcomes
-        if: env.MODE == 'full' || steps.diff.outputs.empty != 'true'
+        if: hashFiles('mutants.none') == ''
+        run: eval "$DEV_RUN dev/mutants.sh diff mutants.diff"
+      - name: Report that no mutants were generated
+        if: hashFiles('mutants.none') != ''
+        run: echo "no mutants were generated from this diff" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Count the outcomes and list the timeouts
+        if: hashFiles('mutants.none') == ''
         run: |
           jq -r '"caught: \(.caught)", "missed: \(.missed)", "timeout: \(.timeout)", "unviable: \(.unviable)"' mutants.out/outcomes.json
+          if [ -s mutants.out/timeout.txt ]; then
+            { echo "Timed-out mutants:"; cat mutants.out/timeout.txt; } | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Fail on a missed mutant that is not listed
-        if: env.MODE == 'full' || steps.diff.outputs.empty != 'true'
-        run: docker run --rm --network none -v "$PWD":/src -w /src kurla-dev cargo run --locked --offline -p xtask -- mutants-check mutants.out/missed.txt docs/equivalent-mutants.md
+        if: hashFiles('mutants.none') == ''
+        run: eval "$DEV_RUN cargo run --locked --offline -p xtask -- mutants-check mutants.out/missed.txt docs/equivalent-mutants.md"
+
+  plan:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'full'
+    runs-on: ubuntu-latest
+    env:
+      SHARDS: ${{ inputs.shards }}
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      indices: ${{ steps.plan.outputs.indices }}
+    steps:
+      - id: plan
+        run: |
+          case "$SHARDS" in
+            '' | *[!0-9]*) echo "shards must be a whole number, got: $SHARDS" >&2; exit 2 ;;
+          esac
+          if [ "$SHARDS" -lt 1 ] || [ "$SHARDS" -gt 64 ]; then
+            echo "shards must be from 1 to 64, got: $SHARDS" >&2
+            exit 2
+          fi
+          echo "count=$SHARDS" >> "$GITHUB_OUTPUT"
+          echo "indices=[$(seq -s, 0 $((SHARDS - 1)))]" >> "$GITHUB_OUTPUT"
+
+  full:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.indices) }}
+    env:
+      SHARD: ${{ matrix.shard }}/${{ needs.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: Run cargo-mutants on this shard
+        run: eval "$DEV_RUN dev/mutants.sh full $SHARD"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: mutants-out-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: error
+
+  merge:
+    needs: [plan, full]
+    runs-on: ubuntu-latest
+    env:
+      SHARDS: ${{ needs.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: mutants-out-*
+          path: shard-out
+      - name: Check that every shard is present and merge the missed lists
+        run: |
+          dirs=(shard-out/mutants-out-*)
+          if [ "${#dirs[@]}" -ne "$SHARDS" ]; then
+            echo "expected $SHARDS shard outputs, found ${#dirs[@]}" >&2
+            exit 1
+          fi
+          for d in "${dirs[@]}"; do
+            for f in outcomes.json missed.txt timeout.txt; do
+              [ -f "$d/$f" ] || { echo "missing $d/$f" >&2; exit 1; }
+            done
+          done
+          cat "${dirs[@]/%//missed.txt}" > missed-all.txt
+          jq -s -r '"caught: \(map(.caught) | add)", "missed: \(map(.missed) | add)", "timeout: \(map(.timeout) | add)", "unviable: \(map(.unviable) | add)"' "${dirs[@]/%//outcomes.json}"
+          if [ -n "$(cat "${dirs[@]/%//timeout.txt}")" ]; then
+            { echo "Timed-out mutants:"; cat "${dirs[@]/%//timeout.txt}"; } | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Fail on a missed mutant that is not listed
+        run: eval "$DEV_RUN cargo run --locked --offline -p xtask -- mutants-check --report-stale missed-all.txt docs/equivalent-mutants.md"
       - name: Report the tests that are the sole catcher of nothing
-        if: env.MODE == 'full'
-        run: docker run --rm --network none -v "$PWD":/src -w /src kurla-dev cargo run --locked --offline -p xtask -- mutants-unique mutants.out
+        run: eval "$DEV_RUN cargo run --locked --offline -p xtask -- mutants-unique shard-out/mutants-out-*"

@@ -1,5 +1,4 @@
 additional_cargo_args = ["--locked", "--offline"]
-additional_cargo_test_args = ["--no-fail-fast"]
 
 examine_globs = [
     "src/unicode/scan.rs",

@@ -4,6 +4,8 @@
 | --- | --- | --- | --- | --- |
 | Rust toolchain | 1.98.1 | rustup, pinned in `rust-toolchain.toml` | before 2026-11-05 | Compiler, rustfmt and clippy for every crate in the workspace. |
 | actions/checkout | v7.0.1 (`3d3c42e5aac5ba805825da76410c181273ba90b1`) | GitHub Actions | 2026-07-20 | Checks out the repository in CI, with `persist-credentials: false`. GitHub's own action, pinned by full commit SHA. |
+| actions/upload-artifact | v7.0.2 (`cf430e030ddbb5b0abf93d22962f4752f3646cd9`) | GitHub Actions | 2026-10-07 | Carries each mutation-test shard's `mutants.out` to the merge job in `.github/workflows/mutants.yml`. GitHub's own action, pinned by full commit SHA. |
+| actions/download-artifact | v8.0.2 (`9000827ccba6bdab643e8b6fd33ac0654aef8333`) | GitHub Actions | 2026-10-07 | Fetches every shard's `mutants.out` in the merge job of `.github/workflows/mutants.yml`. GitHub's own action, pinned by full commit SHA. |
 | adler2 | 2.0.1 | crates.io | 2025-06-09 | Pulled in by miniz_oxide (checksums). |
 | block-buffer | 0.12.1 | crates.io | 2026-06-11 | Pulled in by digest. |
 | cfg-if | 1.0.5 | crates.io | 2026-09-16 | Pulled in by sha2. |
