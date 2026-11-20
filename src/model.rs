@@ -54,7 +54,7 @@ pub enum LocationKind {
     Dependency,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CarrierKind {
     HiddenText,
     DecodedPayload,
@@ -175,12 +175,21 @@ pub struct Finding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedNotScanned {
+    pub span: Span,
+    pub declared_type: Option<String>,
+    pub kind: FileKind,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileCoverage {
     pub path: String,
     pub kind: FileKind,
     pub category: Category,
     pub skip: Option<SkipReason>,
     pub drawn_text_unscanned: bool,
+    pub embedded_not_scanned: Vec<EmbeddedNotScanned>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
