@@ -226,6 +226,12 @@ pub(crate) fn coverage_value(report: &Report) -> Value {
         .filter(|file| file.drawn_text_unscanned)
         .map(|file| json!(escape(&file.path)))
         .collect();
+    let metadata: Vec<Value> = report
+        .coverage
+        .iter()
+        .filter(|file| file.metadata_unscanned)
+        .map(|file| json!(escape(&file.path)))
+        .collect();
     let excluded: Vec<Value> = report
         .coverage
         .iter()
@@ -257,6 +263,7 @@ pub(crate) fn coverage_value(report: &Report) -> Value {
         "scanned_by_category": scanned,
         "skipped": skipped,
         "not_scanned_for_drawn_text": drawn,
+        "not_scanned_for_metadata": metadata,
         "excluded_by_user": excluded,
         "embedded_not_scanned": embedded,
         "encoded_runs_not_payloads": runs,
@@ -393,6 +400,7 @@ mod tests {
             category: kind.category(),
             skip,
             drawn_text_unscanned: kind.drawn_text_unscanned(),
+            metadata_unscanned: false,
             embedded_not_scanned: Vec::new(),
             encoded_runs_not_payloads: 0,
         }
@@ -658,6 +666,7 @@ mod tests {
                 "scanned_by_category",
                 "skipped",
                 "not_scanned_for_drawn_text",
+                "not_scanned_for_metadata",
                 "excluded_by_user",
                 "embedded_not_scanned",
                 "encoded_runs_not_payloads",
@@ -1180,5 +1189,32 @@ mod tests {
         let mut seen = reads.borrow().clone();
         seen.sort();
         assert_eq!(seen, vec!["f1.txt", "f2.txt", "f3.txt"]);
+    }
+
+    #[test]
+    fn files_whose_metadata_is_not_scanned_are_listed_in_every_text_format() {
+        let mut tiff = coverage_entry("pic.tiff", FileKind::OtherImage, None);
+        tiff.metadata_unscanned = true;
+        let fixture = Fixture {
+            findings: Vec::new(),
+            coverage: vec![tiff, coverage_entry("a.md", FileKind::Text, None)],
+            counts: BTreeMap::new(),
+            invalid: Vec::new(),
+            rejected: Vec::new(),
+            warnings: Vec::new(),
+            threshold: Severity::High,
+            require_complete: false,
+        };
+        let report = fixture.report();
+        let json: Value = serde_json::from_str(&json::render(&report)).unwrap();
+        assert_eq!(
+            json["coverage"]["not_scanned_for_metadata"],
+            serde_json::json!(["pic.tiff"])
+        );
+        assert!(human::render(&report).contains(
+            "
+metadata not scanned pic.tiff
+"
+        ));
     }
 }

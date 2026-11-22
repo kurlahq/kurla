@@ -95,6 +95,9 @@ pub fn render(report: &Report) -> String {
         if file.drawn_text_unscanned {
             let _ = writeln!(out, "not scanned for drawn text {}", escape(&file.path));
         }
+        if file.metadata_unscanned {
+            let _ = writeln!(out, "metadata not scanned {}", escape(&file.path));
+        }
     }
     let excluded = report
         .coverage

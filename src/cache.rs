@@ -368,6 +368,7 @@ fn coverage_value(coverage: &FileCoverage) -> Value {
         "category": category_name(coverage.category),
         "skip": coverage.skip.map(skip_name),
         "drawn_text_unscanned": coverage.drawn_text_unscanned,
+        "metadata_unscanned": coverage.metadata_unscanned,
         "embedded_not_scanned": embedded,
         "encoded_runs_not_payloads": coverage.encoded_runs_not_payloads,
     })
@@ -524,6 +525,7 @@ fn read_coverage(mut map: Map<String, Value>) -> Option<FileCoverage> {
         category: category_from(&take_string(&mut map, "category")?)?,
         skip,
         drawn_text_unscanned: take_bool(&mut map, "drawn_text_unscanned")?,
+        metadata_unscanned: take_bool(&mut map, "metadata_unscanned")?,
         embedded_not_scanned: take_array(&mut map, "embedded_not_scanned")?
             .into_iter()
             .map(read_embedded)
@@ -635,6 +637,7 @@ mod tests {
             category: Category::Text,
             skip: None,
             drawn_text_unscanned: false,
+            metadata_unscanned: false,
             embedded_not_scanned: Vec::new(),
             encoded_runs_not_payloads: 0,
         }
@@ -895,6 +898,7 @@ mod tests {
             category: Category::ImageMetadata,
             skip: Some(SkipReason::DecompressionLimit),
             drawn_text_unscanned: true,
+            metadata_unscanned: true,
             embedded_not_scanned: vec![
                 EmbeddedNotScanned {
                     span: span(5, 6),

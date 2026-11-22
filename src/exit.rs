@@ -107,6 +107,7 @@ mod tests {
             category: kind.category(),
             skip,
             drawn_text_unscanned: kind.drawn_text_unscanned(),
+            metadata_unscanned: false,
             embedded_not_scanned: Vec::new(),
             encoded_runs_not_payloads: 0,
         }

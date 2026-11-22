@@ -105,7 +105,7 @@ The run is incomplete when any of these holds:
 - a file in the text, SVG or image metadata category has the skip reason `size_limit`, `decompression_limit`, `timeout` or `malformed`;
 - `--require-complete` is given and any file is in the unknown binary category (other images and unread special files included, but not files excluded by `--exclude` and not links that were not followed), or any `embedded_not_scanned` entry has a kind other than `pdf`.
 
-PDF files, embedded PDFs, files with unscanned drawn text, excluded files and links that were not followed never make a run incomplete. They stay listed in the coverage.
+PDF files, embedded PDFs, files with unscanned drawn text, files whose metadata is not scanned, excluded files and links that were not followed never make a run incomplete. They stay listed in the coverage.
 
 A rejected decisions file never makes `complete` false, because `complete` describes coverage only.
 
@@ -153,6 +153,7 @@ Each finding has exactly these fields.
 | `scanned_by_category` | object | Files scanned with no skip, for each of `text`, `svg`, `image_metadata`, `pdf` and `unknown_binary`. All five keys are always present. |
 | `skipped` | array | Every file with a skip reason, each `{path, kind, category, reason}`. `kind` is one of `text`, `svg`, `png`, `jpeg`, `gif`, `webp`, `avif`, `pdf`, `other_image`, `unknown_binary`. `reason` is one of `size_limit`, `decompression_limit`, `timeout`, `unreadable`, `excluded_by_user`, `symlink_not_followed`, `pdf_not_scanned`, `malformed`. Malformed files are listed here and nowhere else. |
 | `not_scanned_for_drawn_text` | array of strings | Paths of files whose drawn text, such as text inside pixels, is not scanned. |
+| `not_scanned_for_metadata` | array of strings | Paths of TIFF, PSD, JPEG XL, JPEG 2000, BMP and ICO files. Kurla does not read their metadata yet, so text stored in it is not scanned. See [known-limits.md](known-limits.md). |
 | `excluded_by_user` | array of strings | Paths excluded by `--exclude`. These are also in `skipped`. |
 | `embedded_not_scanned` | array | Content found inside a scanned file that was not scanned, each `{path, byte_start, byte_end, declared_type, kind, reason}`. `declared_type` is a string or null. |
 | `encoded_runs_not_payloads` | number | The total, over all files, of encoded runs that did not decode to a payload. |
@@ -180,7 +181,7 @@ Plain text with no colour. There is one line for each finding:
 
 A finding in a binary file has `<path>@<byte_start>-<byte_end>` in place of the position. A reviewed finding ends with `reviewed (counted|not counted) by <reviewer>: <reason>`.
 
-A `coverage:` section follows. It lists the scanned counts, every skipped file, every embedded entry that was not scanned, every file not scanned for drawn text, the number of excluded files and the encoded-run total. After it come the invalid decisions, the rejected decisions files and the warnings, one line each. The last line is `complete, exit code N` or `incomplete, exit code N`.
+A `coverage:` section follows. It lists the scanned counts, every skipped file, every embedded entry that was not scanned, every file not scanned for drawn text, every file whose metadata is not scanned, the number of excluded files and the encoded-run total. After it come the invalid decisions, the rejected decisions files and the warnings, one line each. The last line is `complete, exit code N` or `incomplete, exit code N`.
 
 ### Command line
 

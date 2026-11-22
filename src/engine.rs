@@ -512,6 +512,7 @@ impl<'a> Engine<'a> {
             category: self.kind.category(),
             skip: self.skip,
             drawn_text_unscanned: self.kind.drawn_text_unscanned(),
+            metadata_unscanned: crate::binary::metadata_unscanned(self.rel_path, self.kind),
             embedded_not_scanned: self.embedded,
             encoded_runs_not_payloads: self.not_payload_runs,
         };
@@ -1776,5 +1777,24 @@ mod tests {
             "embedded file depth limit"
         );
         assert_eq!(of_rule(&findings, "B004").len(), 3);
+    }
+
+    #[test]
+    fn the_listed_other_image_formats_are_marked_metadata_not_scanned() {
+        for path in [
+            "a.tif", "a.tiff", "a.psd", "a.jxl", "a.jp2", "a.j2k", "a.bmp", "a.ico", "a.cur",
+        ] {
+            let (findings, coverage, _) = scan(path, &[0, 255, 1, 254]);
+            assert_eq!(coverage.kind, FileKind::OtherImage, "{path}");
+            assert!(coverage.metadata_unscanned, "{path}");
+            assert!(findings.is_empty());
+            assert_eq!(coverage.skip, None);
+        }
+        for path in ["a.tga", "a.emf", "a.wmf", "a.svgz", "a.dat"] {
+            let (_, coverage, _) = scan(path, &[0, 255, 1, 254]);
+            assert!(!coverage.metadata_unscanned, "{path}");
+        }
+        let (_, coverage, _) = scan("a.png", &png_ending_with(&[]));
+        assert!(!coverage.metadata_unscanned);
     }
 }

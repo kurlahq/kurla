@@ -860,6 +860,7 @@ fn planted() -> kurla::cache::Cached {
         category: Category::Text,
         skip: None,
         drawn_text_unscanned: false,
+        metadata_unscanned: false,
         embedded_not_scanned: Vec::new(),
         encoded_runs_not_payloads: 0,
     };

@@ -190,6 +190,7 @@ pub struct FileCoverage {
     pub category: Category,
     pub skip: Option<SkipReason>,
     pub drawn_text_unscanned: bool,
+    pub metadata_unscanned: bool,
     pub embedded_not_scanned: Vec<EmbeddedNotScanned>,
     pub encoded_runs_not_payloads: u64,
 }

@@ -33,6 +33,9 @@ const FTYP_BRANDS: [&[u8; 4]; 9] = [
 ];
 const FTYP_MAX_COMPATIBLE: usize = 64;
 const OUTPUT_CAP_SLACK: usize = 64 * 1024;
+const UNREAD_METADATA_EXTENSIONS: [&str; 9] = [
+    "tif", "tiff", "psd", "jxl", "jp2", "j2k", "bmp", "ico", "cur",
+];
 const OTHER_IMAGE_EXTENSIONS: [&str; 13] = [
     "svgz", "bmp", "tif", "tiff", "ico", "cur", "jxl", "psd", "tga", "jp2", "j2k", "emf", "wmf",
 ];
@@ -69,6 +72,14 @@ fn is_avif(bytes: &[u8]) -> bool {
     bytes
         .get(compatible_at..end)
         .is_some_and(|rest| rest.as_chunks::<4>().0.iter().any(|c| is_brand(c)))
+}
+
+pub fn metadata_unscanned(path: &str, kind: FileKind) -> bool {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    kind == FileKind::OtherImage
+        && extension.is_some_and(|ext| UNREAD_METADATA_EXTENSIONS.contains(&ext.as_str()))
 }
 
 pub fn sniff(bytes: &[u8], path: &str) -> FileKind {
