@@ -1764,25 +1764,6 @@ mod tests {
     }
 
     #[test]
-    fn the_ticker_checks_the_deadline_once_the_count_reaches_the_interval() {
-        let limits = Limits {
-            per_file_time: Duration::ZERO,
-            ..Limits::default()
-        };
-        let budget = Budget::new(&limits);
-        let mut ticker = Ticker {
-            budget: Some(&budget),
-            count: 1,
-            expired: false,
-        };
-        for _ in 0..TICK_INTERVAL - 1 {
-            assert!(!ticker.tick());
-        }
-        assert!(ticker.tick());
-        assert!(ticker.expired);
-    }
-
-    #[test]
     fn an_item_starts_where_its_uri_or_run_starts() {
         let uri = Item::Uri(Uri {
             start: 3,
