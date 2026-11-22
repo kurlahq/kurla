@@ -99,6 +99,10 @@ pub fn sniff(bytes: &[u8], path: &str) -> FileKind {
     }
 }
 
+pub(crate) fn is_padding(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&b| b == 0 || b.is_ascii_whitespace())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Visibility {
     Shown,
@@ -247,7 +251,7 @@ impl Sink {
         let Some(tail) = bytes.get(start..) else {
             return;
         };
-        if tail.iter().all(|&b| b == 0 || b.is_ascii_whitespace()) {
+        if is_padding(tail) {
             return;
         }
         let end = bytes.len();
