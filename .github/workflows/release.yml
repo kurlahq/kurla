@@ -25,6 +25,8 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.tag.outputs.commit }}
+      version: ${{ steps.tag.outputs.version }}
     env:
       EVENT_NAME: ${{ github.event_name }}
       INPUT_TAG: ${{ inputs.tag }}
@@ -52,7 +54,10 @@ jobs:
           fi
           core="${TAG#v}"
           core="${core%%-*}"
-          manifest="$(git show "refs/tags/$TAG:Cargo.toml")"
+          if ! manifest="$(git show "refs/tags/$TAG:Cargo.toml")"; then
+            echo "plan: version check failed: cannot read Cargo.toml at $TAG"
+            exit 1
+          fi
           version="$(printf '%s\n' "$manifest" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)"
           if [ -z "$version" ]; then
             echo "plan: version check failed: no version found in Cargo.toml at $TAG"
@@ -62,7 +67,10 @@ jobs:
             echo "plan: version check failed: the tag is $core but Cargo.toml at $TAG has $version"
             exit 1
           fi
+          commit="$(git rev-parse "refs/tags/$TAG^{commit}")"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build-linux-windows:
     needs: plan
@@ -70,11 +78,13 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          ref: ${{ needs.plan.outputs.commit }}
       - uses: ./.github/actions/dev-image
       - name: Build both targets with the network off
         run: |
@@ -84,6 +94,16 @@ jobs:
           mkdir dist
           cp target/x86_64-unknown-linux-musl/release/kurla dist/kurla-x86_64-unknown-linux-musl
           cp target/x86_64-pc-windows-gnu/release/kurla.exe dist/kurla-x86_64-pc-windows-gnu.exe
+      - name: Run the musl binary with the network off
+        run: |
+          if ! output="$(eval "$DEV_RUN ./dist/kurla-x86_64-unknown-linux-musl --version")"; then
+            echo "build-linux-windows: smoke check failed: the musl binary did not run"
+            exit 1
+          fi
+          if [ "$output" != "kurla $VERSION" ]; then
+            echo "build-linux-windows: smoke check failed: expected \"kurla $VERSION\" but got \"$output\""
+            exit 1
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: build-linux-windows
@@ -96,11 +116,13 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          ref: ${{ needs.plan.outputs.commit }}
       - name: Install the pinned toolchain
         run: |
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target aarch64-apple-darwin,x86_64-apple-darwin
@@ -117,6 +139,16 @@ jobs:
           mkdir dist
           cp target/aarch64-apple-darwin/release/kurla dist/kurla-aarch64-apple-darwin
           cp target/x86_64-apple-darwin/release/kurla dist/kurla-x86_64-apple-darwin
+      - name: Run the aarch64 binary
+        run: |
+          if ! output="$(./dist/kurla-aarch64-apple-darwin --version)"; then
+            echo "build-macos: smoke check failed: the aarch64 binary did not run"
+            exit 1
+          fi
+          if [ "$output" != "kurla $VERSION" ]; then
+            echo "build-macos: smoke check failed: expected \"kurla $VERSION\" but got \"$output\""
+            exit 1
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: build-macos
@@ -172,11 +204,25 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      COMMIT: ${{ needs.plan.outputs.commit }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: release-files
           path: dist
+      - name: Check the tag still points at the built commit
+        run: |
+          if ! sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/tags/$TAG" --jq .sha)"; then
+            echo "release: tag check failed: cannot resolve $TAG to a commit"
+            exit 1
+          fi
+          if [ "$sha" != "$COMMIT" ]; then
+            echo "release: tag check failed: $TAG now points at $sha, not the built $COMMIT"
+            exit 1
+          fi
       - name: Create the draft release
         run: |
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" --notes "Draft. Check the downloads with sha256sum -c SHA256SUMS, and check their build provenance with gh attestation verify FILE --repo OWNER/REPO. The macOS binaries were built with the offline flag only. None of the binaries are signed, so SmartScreen and Gatekeeper may warn." dist/kurla-aarch64-apple-darwin dist/kurla-x86_64-apple-darwin dist/kurla-x86_64-pc-windows-gnu.exe dist/kurla-x86_64-unknown-linux-musl dist/SHA256SUMS
