@@ -485,13 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn the_committed_equivalent_mutants_document_parses_and_lists_exactly_its_eleven_rows() {
+    fn the_committed_equivalent_mutants_document_parses_and_lists_exactly_its_ten_rows() {
         let document = include_str!("../../docs/equivalent-mutants.md");
         let missed = [
             "src/cache.rs:174:31: replace * with +",
             "src/cache.rs:184:27: replace match guard error.kind() == std::io::ErrorKind::Interrupted with false in hash_file",
             "src/decisions.rs:281:9: replace <impl Visitor<'de> for StrictVisitor>::expecting -> fmt::Result with Ok(Default::default())",
-            "src/aimed.rs:215:40: replace + with * in normalise",
             "src/aimed.rs:302:18: replace < with <= in phrase_hits",
             "src/aimed.rs:383:17: replace < with > in dialogue_hit",
             "src/aimed.rs:383:46: replace == with != in dialogue_hit",
@@ -502,12 +501,12 @@ mod tests {
         ]
         .join("\n");
         let report = check(&missed, document).unwrap();
-        assert_eq!(report.missed, 11);
+        assert_eq!(report.missed, 10);
         assert!(report.unlisted.is_empty(), "{report:?}");
         assert!(report.stale.is_empty(), "{report:?}");
         let without_rows = check("", document).unwrap();
-        assert_eq!(without_rows.stale.len(), 10, "{without_rows:?}");
+        assert_eq!(without_rows.stale.len(), 9, "{without_rows:?}");
         let listed: usize = without_rows.stale.iter().map(|entry| entry.listed).sum();
-        assert_eq!(listed, 11, "{without_rows:?}");
+        assert_eq!(listed, 10, "{without_rows:?}");
     }
 }

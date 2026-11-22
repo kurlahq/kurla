@@ -655,4 +655,13 @@ mod tests {
         assert_eq!(ids("x\n\rHuman: a\nAssistant: b"), vec![("A005", 3..22)]);
         assert_eq!(ids("\rHuman: hi\nAssistant: x"), vec![("A005", 1..21)]);
     }
+
+    #[test]
+    fn a_one_character_token_ends_one_past_its_start() {
+        let ranges: Vec<(usize, usize)> = normalise("x yz")
+            .iter()
+            .map(|token| (token.start, token.end))
+            .collect();
+        assert_eq!(ranges, vec![(0, 1), (2, 4)]);
+    }
 }
