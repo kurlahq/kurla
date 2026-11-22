@@ -8,3 +8,6 @@ The `mutation` column is the description cargo-mutants prints, with the `:line:c
 
 | file | mutation | reason |
 | --- | --- | --- |
+| src/cache.rs | replace * with + | The constant sets the size of the read buffer in `hash_file`, which only decides how many `read` calls feed the same byte sequence to SHA-256. The digest of a byte sequence does not depend on how it is chunked, so no test can observe the buffer size. |
+| src/cache.rs | replace match guard error.kind() == std::io::ErrorKind::Interrupted with false in hash_file | The guard differs from the original only when `read` returns `ErrorKind::Interrupted`. A regular file or a directory cannot be made to produce that error without injecting a signal, so no test can reach the difference. |
+| src/decisions.rs | replace <impl Visitor<'de> for StrictVisitor>::expecting -> fmt::Result with Ok(Default::default()) | serde calls `expecting` only from the default `visit_*` methods of a Visitor, to build an invalid-type error. StrictVisitor overrides every method that serde_json 1.0.154 `deserialize_any` calls (`vendor/serde_json/src/de.rs` lines 1393 to 1458), so `expecting` is unreachable. |

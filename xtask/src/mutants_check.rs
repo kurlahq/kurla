@@ -485,10 +485,19 @@ mod tests {
     }
 
     #[test]
-    fn the_committed_equivalent_mutants_document_parses_and_starts_without_entries() {
+    fn the_committed_equivalent_mutants_document_parses_and_lists_exactly_its_three_rows() {
         let document = include_str!("../../docs/equivalent-mutants.md");
-        let report = check("", document).unwrap();
-        assert_eq!(report.missed, 0);
+        let missed = [
+            "src/cache.rs:174:31: replace * with +",
+            "src/cache.rs:184:27: replace match guard error.kind() == std::io::ErrorKind::Interrupted with false in hash_file",
+            "src/decisions.rs:281:9: replace <impl Visitor<'de> for StrictVisitor>::expecting -> fmt::Result with Ok(Default::default())",
+        ]
+        .join("\n");
+        let report = check(&missed, document).unwrap();
+        assert_eq!(report.missed, 3);
+        assert!(report.unlisted.is_empty(), "{report:?}");
         assert!(report.stale.is_empty(), "{report:?}");
+        let without_rows = check("", document).unwrap();
+        assert_eq!(without_rows.stale.len(), 3, "{without_rows:?}");
     }
 }

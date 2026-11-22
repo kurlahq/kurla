@@ -1128,4 +1128,50 @@ mod tests {
         assert!(findings[0].review.is_some());
         assert!(invalid.is_empty());
     }
+
+    #[test]
+    fn decisions_error_displays_its_message() {
+        let failure = DecisionsError {
+            message: "entry 3: bad".to_string(),
+        };
+        assert_eq!(failure.to_string(), "entry 3: bad");
+    }
+
+    #[test]
+    fn thirty_day_months_accept_the_30th_and_reject_the_31st() {
+        for month in [4, 6, 9, 11] {
+            assert_eq!(
+                Date::parse(&format!("2025-{month:02}-30")),
+                Some(d(2025, month, 30)),
+                "month {month}"
+            );
+            assert_eq!(
+                Date::parse(&format!("2025-{month:02}-31")),
+                None,
+                "month {month}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_parse_rejects_a_wrong_second_separator() {
+        assert_eq!(Date::parse("2025-01x01"), None);
+        assert_eq!(Date::parse("2025x01-01"), None);
+        assert_eq!(Date::parse("2025-01-01"), Some(d(2025, 1, 1)));
+    }
+
+    #[test]
+    fn days_since_epoch_round_trips_month_and_century_edges() {
+        let cases = [
+            (0, d(1970, 1, 1)),
+            (11078, d(2000, 5, 1)),
+            (11323, d(2001, 1, 1)),
+            (47540, d(2100, 2, 28)),
+            (47541, d(2100, 3, 1)),
+        ];
+        for (days, date) in cases {
+            assert_eq!(Date::from_days_since_epoch(days), date, "{days}");
+            assert_eq!(date.days_since_epoch(), days, "{date}");
+        }
+    }
 }

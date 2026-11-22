@@ -1179,4 +1179,47 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn odd_length_hex_evidence_is_a_miss_not_a_panic() {
+        let dir = TestDir::new();
+        let cache = open(&dir);
+        let key = base_key(&cache);
+        assert!(cache.put(&key, &value()));
+        let file = entry_file(&cache, &key);
+        let good = fs::read_to_string(&file).unwrap();
+        let mutated = good.replace("\"evidence\":\"0001ff\"", "\"evidence\":\"abc\"");
+        assert_ne!(mutated, good);
+        fs::write(&file, &mutated).unwrap();
+        assert_eq!(cache.get(&key), None);
+        fs::write(&file, &good).unwrap();
+        assert_eq!(cache.get(&key), Some(value()));
+    }
+
+    #[test]
+    fn put_and_get_refuse_keys_that_are_not_64_lowercase_hex() {
+        let bad_keys = [
+            format!("../{}", "a".repeat(61)),
+            "A".repeat(64),
+            "abc".to_string(),
+        ];
+        for bad in bad_keys {
+            let dir = TestDir::new();
+            let cache = open(&dir);
+            assert!(!cache.put(&bad, &value()), "{bad}");
+            assert_eq!(cache.get(&bad), None, "{bad}");
+            assert_eq!(fs::read_dir(cache.dir()).unwrap().count(), 0, "{bad}");
+            let beside: Vec<_> = fs::read_dir(&dir.path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(beside, vec![std::ffi::OsString::from("c")], "{bad}");
+        }
+    }
+
+    #[test]
+    fn hash_file_of_a_directory_is_an_error() {
+        let dir = TestDir::new();
+        assert!(hash_file(&dir.path).is_err());
+    }
 }
