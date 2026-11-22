@@ -353,6 +353,17 @@ fn png_differential_accepts_the_signal_behind_an_earlier_size_skip() {
 }
 
 #[test]
+fn png_differential_accepts_the_signal_behind_an_earlier_malformed_skip() {
+    let mut out = limit_output(Some(SkipReason::Malformed), "B002");
+    let mut earlier = finding(0, 1);
+    earlier.rule_id = "L001";
+    out.findings.insert(0, earlier);
+    png::check_decompression(4000, 5000, &out);
+    let no_earlier = limit_output(Some(SkipReason::Malformed), "B002");
+    assert!(panic_text(|| png::check_decompression(4000, 5000, &no_earlier)).is_some());
+}
+
+#[test]
 fn png_differential_accepts_a_large_run_at_or_under_the_limit_without_a_signal() {
     png::check_decompression(100, 4000, &quiet_output());
     png::check_decompression(0, 0, &quiet_output());

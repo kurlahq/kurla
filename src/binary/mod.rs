@@ -110,6 +110,7 @@ pub(crate) struct Sink {
     input_len: usize,
     inflated: usize,
     used: usize,
+    malformed: bool,
 }
 
 impl Sink {
@@ -124,6 +125,7 @@ impl Sink {
             input_len,
             inflated: 0,
             used: 0,
+            malformed: false,
         }
     }
 
@@ -145,7 +147,18 @@ impl Sink {
     }
 
     fn l001(&mut self, message: &str, start: usize, end: usize) {
-        self.set_skip(SkipReason::SizeLimit);
+        self.low_finding(SkipReason::SizeLimit, message, start, end);
+    }
+
+    pub(crate) fn malformed(&mut self, message: &str, start: usize, end: usize) {
+        if !self.malformed {
+            self.malformed = true;
+            self.low_finding(SkipReason::Malformed, message, start, end);
+        }
+    }
+
+    fn low_finding(&mut self, reason: SkipReason, message: &str, start: usize, end: usize) {
+        self.set_skip(reason);
         self.out.findings.push(RawFinding {
             rule_id: "L001",
             family: Family::L,

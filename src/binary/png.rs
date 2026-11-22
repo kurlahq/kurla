@@ -1,4 +1,6 @@
-use miniz_oxide::inflate::decompress_to_vec_zlib_with_limit;
+use miniz_oxide::inflate::TINFLStatus;
+use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
+use std::ops::BitOr;
 
 use super::{Sink, latin1, lossy, sub};
 use crate::limits::Budget;
@@ -7,26 +9,43 @@ use crate::model::DetectorOutput;
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const CHUNK_HEADER_LEN: usize = 8;
 const CRC_LEN: usize = 4;
+const CORRUPT_STREAM: &str = "malformed PNG: compressed text is not a valid zlib stream";
+const UNKNOWN_METHOD: &str = "malformed PNG: unknown compression method";
+const TRUNCATED_CHUNK: &str = "malformed PNG: truncated chunk";
 
 pub(crate) enum Inflated {
     Text(Vec<u8>),
-    Unreadable,
+    Corrupt(Vec<u8>),
     LimitHit,
 }
 
 pub(crate) fn inflate(data: &[u8], budget: &mut Budget) -> Inflated {
     let allowed = usize::try_from(budget.remaining_decompressed()).unwrap_or(usize::MAX);
-    match decompress_to_vec_zlib_with_limit(data, allowed) {
-        Ok(out) => match budget.take_decompressed(out.len() as u64) {
-            Ok(()) => Inflated::Text(out),
-            Err(_) => Inflated::LimitHit,
-        },
-        Err(error) if error.status == miniz_oxide::inflate::TINFLStatus::HasMoreOutput => {
-            Inflated::LimitHit
-        }
-        Err(error) => {
-            let _ = budget.take_decompressed(error.output.len() as u64);
-            Inflated::Unreadable
+    let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+        .bitor(inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    let mut decompressor = Box::<DecompressorOxide>::default();
+    let mut out = vec![0; data.len().saturating_mul(2).min(allowed)];
+    let mut input = data;
+    let mut produced = 0;
+    loop {
+        let (status, consumed, written) =
+            decompress(&mut decompressor, input, &mut out, produced, flags);
+        produced += written;
+        input = input.get(consumed..).unwrap_or_default();
+        match status {
+            TINFLStatus::HasMoreOutput if out.len() < allowed => {
+                out.resize(out.len().saturating_mul(2).min(allowed), 0);
+            }
+            TINFLStatus::HasMoreOutput => return Inflated::LimitHit,
+            finished => {
+                out.truncate(produced);
+                let _ = budget.take_decompressed(produced as u64);
+                return if finished == TINFLStatus::Done {
+                    Inflated::Text(out)
+                } else {
+                    Inflated::Corrupt(out)
+                };
+            }
         }
     }
 }
@@ -84,7 +103,12 @@ impl Walker<'_> {
                 self.sink.add_inflated(out.len());
                 Some(out)
             }
-            Inflated::Unreadable => None,
+            Inflated::Corrupt(partial) => {
+                self.sink.add_inflated(partial.len());
+                self.sink
+                    .malformed(CORRUPT_STREAM, start, start + compressed.len());
+                Some(partial)
+            }
             Inflated::LimitHit => {
                 self.limit_hit = true;
                 self.sink.limit_hit(
@@ -102,10 +126,12 @@ impl Walker<'_> {
         let Some((&method, compressed)) = rest.and_then(|r| r.split_first()) else {
             return;
         };
+        let start = chunk.data_start + keyword.len() + 2;
         if method != 0 {
+            self.sink
+                .malformed(UNKNOWN_METHOD, start, start + compressed.len());
             return;
         }
-        let start = chunk.data_start + keyword.len() + 2;
         if let Some(text) = self.inflated(compressed, start) {
             let label = format!("PNG zTXt {}", latin1(keyword));
             self.sink.carrier(
@@ -139,9 +165,10 @@ impl Walker<'_> {
         if flag == 0 {
             self.sink
                 .carrier(&label, &lossy(body), start, start + body.len(), chunk.data);
-        } else if method == 0
-            && let Some(text) = self.inflated(body, start)
-        {
+        } else if method != 0 {
+            self.sink
+                .malformed(UNKNOWN_METHOD, start, start + body.len());
+        } else if let Some(text) = self.inflated(body, start) {
             self.sink
                 .carrier(&label, &lossy(&text), start, start + body.len(), chunk.data);
         }
@@ -155,6 +182,9 @@ impl Walker<'_> {
                 return;
             }
             let Some(chunk) = read_chunk(bytes, at) else {
+                if at < bytes.len() {
+                    self.sink.malformed(TRUNCATED_CHUNK, at, bytes.len());
+                }
                 return;
             };
             match &chunk.kind {
@@ -231,6 +261,28 @@ mod tests {
 
     fn texts(out: &DetectorOutput) -> Vec<&str> {
         out.carriers.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    fn findings(out: &DetectorOutput) -> Vec<(&str, &str, u64, u64)> {
+        out.findings
+            .iter()
+            .map(|f| {
+                (
+                    f.rule_id,
+                    f.message.as_str(),
+                    f.span.byte_start,
+                    f.span.byte_end,
+                )
+            })
+            .collect()
+    }
+
+    fn stored_zlib_cut_short(declared: u16, present: &[u8]) -> Vec<u8> {
+        let mut z = vec![0x78, 0x01, 0x01];
+        z.extend_from_slice(&declared.to_le_bytes());
+        z.extend_from_slice(&(!declared).to_le_bytes());
+        z.extend_from_slice(present);
+        z
     }
 
     #[test]
@@ -391,13 +443,30 @@ mod tests {
     }
 
     #[test]
-    fn truncated_png_keeps_earlier_carriers() {
-        let mut bytes = png(&[chunk(b"tEXt", b"A\0one")]);
-        bytes.extend_from_slice(&100u32.to_be_bytes());
-        bytes.extend_from_slice(b"tEXt");
-        bytes.extend_from_slice(b"B\0tw");
-        let out = scan_png(&bytes, &mut budget());
-        assert_eq!(texts(&out), vec!["PNG tEXt A: one"]);
+    fn a_truncated_chunk_keeps_earlier_carriers_and_marks_the_png_malformed() {
+        let complete = png(&[chunk(b"tEXt", b"A\0one")]);
+        let mut data_cut = complete.clone();
+        data_cut.extend_from_slice(&100u32.to_be_bytes());
+        data_cut.extend_from_slice(b"tEXt");
+        data_cut.extend_from_slice(b"B\0tw");
+        let mut header_cut = complete.clone();
+        header_cut.extend_from_slice(&[0, 0, 0]);
+        for bytes in [data_cut, header_cut] {
+            let out = scan_png(&bytes, &mut budget());
+            assert_eq!(texts(&out), vec!["PNG tEXt A: one"]);
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed PNG: truncated chunk",
+                    25,
+                    bytes.len() as u64
+                )]
+            );
+            assert_eq!(out.skip, Some(SkipReason::Malformed));
+        }
+        let out = scan_png(&complete, &mut budget());
+        assert!(out.findings.is_empty());
         assert_eq!(out.skip, None);
     }
 
@@ -428,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_or_unknown_method_ztxt_is_skipped_silently() {
+    fn corrupt_or_unknown_method_ztxt_is_marked_malformed_and_the_walk_continues() {
         let bytes = png(&[
             chunk(b"zTXt", b"K\0\0this is not zlib"),
             chunk(b"zTXt", b"K\0\x01\x78\x9c"),
@@ -436,8 +505,16 @@ mod tests {
         ]);
         let out = scan_png(&bytes, &mut budget());
         assert_eq!(texts(&out), vec!["PNG tEXt After: ok"]);
-        assert!(out.findings.is_empty());
-        assert_eq!(out.skip, None);
+        assert_eq!(
+            findings(&out),
+            vec![(
+                "L001",
+                "malformed PNG: compressed text is not a valid zlib stream",
+                19,
+                35
+            )]
+        );
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
     }
 
     #[test]
@@ -601,8 +678,11 @@ mod tests {
         };
         let mut b = Budget::new(&limits);
         let out = scan_png(&bytes, &mut b);
-        assert!(out.carriers.is_empty() && out.findings.is_empty());
-        assert!(b.remaining_decompressed() <= 400);
+        assert_eq!(
+            texts(&out),
+            vec![format!("PNG zTXt K: {}", "A".repeat(600))]
+        );
+        assert_eq!(b.remaining_decompressed(), 400);
     }
 
     #[test]
@@ -627,5 +707,94 @@ mod tests {
         assert_eq!(out.carriers.len(), 1);
         assert!(out.findings.is_empty());
         assert_eq!(out.skip, None);
+    }
+
+    #[test]
+    fn a_ztxt_stream_cut_short_is_charged_only_the_bytes_it_inflated() {
+        let mut data = b"K\0\0".to_vec();
+        data.extend_from_slice(&stored_zlib_cut_short(4000, &[b'a'; 3000]));
+        let bytes = png(&[chunk(b"zTXt", &data)]);
+        for limit in [4096, 65536] {
+            let limits = Limits {
+                max_decompressed_bytes: limit,
+                ..Limits::default()
+            };
+            let mut b = Budget::new(&limits);
+            let out = scan_png(&bytes, &mut b);
+            assert_eq!(b.remaining_decompressed(), limit - 3000, "limit {limit}");
+            assert!(out.findings.iter().all(|f| f.rule_id != "B002"));
+        }
+    }
+
+    #[test]
+    fn reaching_the_limit_is_b002_whatever_follows_the_stream() {
+        let mut first_block = vec![0x78, 0x01, 0x00];
+        first_block.extend_from_slice(&5000u16.to_le_bytes());
+        first_block.extend_from_slice(&(!5000u16).to_le_bytes());
+        first_block.extend_from_slice(&[b'a'; 5000]);
+        let tails: [&[u8]; 3] = [&[], &[0x07], &[0x01, 0x00, 0x00, 0xFF, 0xFF, 0, 0, 0, 0]];
+        for tail in tails {
+            let mut data = b"K\0\0".to_vec();
+            data.extend_from_slice(&first_block);
+            data.extend_from_slice(tail);
+            let bytes = png(&[chunk(b"zTXt", &data)]);
+            let limits = Limits {
+                max_decompressed_bytes: 4096,
+                ..Limits::default()
+            };
+            let out = scan_png(&bytes, &mut Budget::new(&limits));
+            let ids: Vec<&str> = out.findings.iter().map(|f| f.rule_id).collect();
+            assert_eq!(ids, vec!["B002"]);
+            assert_eq!(out.skip, Some(SkipReason::DecompressionLimit));
+        }
+    }
+
+    #[test]
+    fn corrupt_compressed_text_keeps_its_partial_text_and_marks_the_png_malformed() {
+        let cut = stored_zlib_cut_short(40, b"partial text");
+        let mut ztxt = b"K\0\0".to_vec();
+        ztxt.extend_from_slice(&cut);
+        let mut itxt = b"T\0\x01\0\0\0".to_vec();
+        itxt.extend_from_slice(&cut);
+        let bytes = png(&[chunk(b"zTXt", &ztxt), chunk(b"iTXt", &itxt)]);
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(
+            texts(&out),
+            vec!["PNG zTXt K: partial text", "PNG iTXt T: partial text"]
+        );
+        assert_eq!(
+            findings(&out),
+            vec![(
+                "L001",
+                "malformed PNG: compressed text is not a valid zlib stream",
+                19,
+                38
+            )]
+        );
+        assert_eq!(out.findings[0].base, Severity::Low);
+        assert_eq!(out.findings[0].carrier, CarrierKind::ResourceLimit);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn an_unknown_compression_method_marks_the_png_malformed() {
+        let cases = [
+            (png(&[chunk(b"zTXt", b"K\0\x01\x78\x01")]), 19, 21),
+            (png(&[chunk(b"iTXt", b"T\0\x01\x01\0\0\x78\x01")]), 22, 24),
+        ];
+        for (bytes, start, end) in cases {
+            let out = scan_png(&bytes, &mut budget());
+            assert!(out.carriers.is_empty());
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed PNG: unknown compression method",
+                    start,
+                    end
+                )]
+            );
+            assert_eq!(out.skip, Some(SkipReason::Malformed));
+        }
     }
 }

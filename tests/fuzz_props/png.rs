@@ -26,12 +26,14 @@ fn limit_signalled(out: &DetectorOutput) -> bool {
         .findings
         .iter()
         .any(|f| f.rule_id == "B002" && f.carrier == CarrierKind::ResourceLimit);
-    let earlier_size_skip = out.skip == Some(SkipReason::SizeLimit)
-        && out
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "L001" || f.rule_id == "B003");
-    finding && (out.skip == Some(SkipReason::DecompressionLimit) || earlier_size_skip)
+    let earlier_skip = matches!(
+        out.skip,
+        Some(SkipReason::SizeLimit | SkipReason::Malformed)
+    ) && out
+        .findings
+        .iter()
+        .any(|f| f.rule_id == "L001" || f.rule_id == "B003");
+    finding && (out.skip == Some(SkipReason::DecompressionLimit) || earlier_skip)
 }
 
 pub fn check_decompression(small_consumed: u64, large_consumed: u64, small: &DetectorOutput) {
