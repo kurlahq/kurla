@@ -175,10 +175,14 @@ const HASH_BUFFER: usize = 64 * 1024;
 
 pub fn hash_file(path: &Path) -> Result<[u8; 32], String> {
     let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    hash_reader(&mut file)
+}
+
+fn hash_reader(reader: &mut impl Read) -> Result<[u8; 32], String> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; HASH_BUFFER];
     loop {
-        let read = match file.read(&mut buffer) {
+        let read = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -944,6 +948,44 @@ mod tests {
             hex(&hash_file(&file).unwrap()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    struct FailsOnceThenReads {
+        failure: Option<std::io::ErrorKind>,
+        data: &'static [u8],
+    }
+
+    impl Read for FailsOnceThenReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(kind) = self.failure.take() {
+                return Err(std::io::Error::from(kind));
+            }
+            let n = self.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_and_the_hash_is_unchanged() {
+        let mut reader = FailsOnceThenReads {
+            failure: Some(std::io::ErrorKind::Interrupted),
+            data: b"abc",
+        };
+        assert_eq!(
+            hex(&hash_reader(&mut reader).unwrap()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn a_read_error_other_than_interrupted_is_an_error() {
+        let mut reader = FailsOnceThenReads {
+            failure: Some(std::io::ErrorKind::PermissionDenied),
+            data: b"abc",
+        };
+        assert!(hash_reader(&mut reader).is_err());
     }
 
     #[test]

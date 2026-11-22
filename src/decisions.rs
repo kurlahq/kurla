@@ -1138,6 +1138,16 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_type_value_is_rejected_with_a_message_naming_any_json_value() {
+        let wrong_type = serde::de::value::BytesDeserializer::<serde::de::value::Error>::new(b"x");
+        let message = match StrictValue::deserialize(wrong_type) {
+            Ok(_) => panic!("a byte array is not a JSON value"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(message, "invalid type: byte array, expected any JSON value");
+    }
+
+    #[test]
     fn thirty_day_months_accept_the_30th_and_reject_the_31st() {
         for month in [4, 6, 9, 11] {
             assert_eq!(
