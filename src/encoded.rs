@@ -1728,4 +1728,185 @@ mod tests {
         assert_eq!(out.not_payload_runs, 0);
         assert_eq!(run("abcdefghijklmnopqrstuvwxyz", 0).not_payload_runs, 0);
     }
+
+    fn plain_ticker() -> Ticker<'static> {
+        Ticker {
+            budget: None,
+            count: 0,
+            expired: false,
+        }
+    }
+
+    fn chars_of(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn only_the_five_scannable_image_kinds_are_scannable_images() {
+        for kind in [
+            FileKind::Png,
+            FileKind::Jpeg,
+            FileKind::Gif,
+            FileKind::Webp,
+            FileKind::Avif,
+        ] {
+            assert!(is_scannable_image(kind));
+        }
+        for kind in [
+            FileKind::Svg,
+            FileKind::Pdf,
+            FileKind::Text,
+            FileKind::UnknownBinary,
+            FileKind::OtherImage,
+        ] {
+            assert!(!is_scannable_image(kind));
+        }
+    }
+
+    #[test]
+    fn the_ticker_checks_the_deadline_once_the_count_reaches_the_interval() {
+        let limits = Limits {
+            per_file_time: Duration::ZERO,
+            ..Limits::default()
+        };
+        let budget = Budget::new(&limits);
+        let mut ticker = Ticker {
+            budget: Some(&budget),
+            count: 1,
+            expired: false,
+        };
+        for _ in 0..TICK_INTERVAL - 1 {
+            assert!(!ticker.tick());
+        }
+        assert!(ticker.tick());
+        assert!(ticker.expired);
+    }
+
+    #[test]
+    fn an_item_starts_where_its_uri_or_run_starts() {
+        let uri = Item::Uri(Uri {
+            start: 3,
+            payload_start: 9,
+            end: 12,
+            declared_type: String::new(),
+            base64: false,
+        });
+        assert_eq!(uri.start(), 3);
+        assert_eq!(Item::Run(7, 9).start(), 7);
+    }
+
+    #[test]
+    fn an_unterminated_quoted_data_uri_ends_at_the_end_of_the_text() {
+        let chars = chars_of("\"data:,abc");
+        let uris = find_uris(&chars, &mut plain_ticker());
+        assert_eq!(uris.len(), 1);
+        assert_eq!(
+            (uris[0].start, uris[0].payload_start, uris[0].end),
+            (1, 7, 10)
+        );
+    }
+
+    #[test]
+    fn an_unterminated_parenthesised_data_uri_ends_at_the_end_of_the_text() {
+        let chars = chars_of("(data:,abc");
+        let uris = find_uris(&chars, &mut plain_ticker());
+        assert_eq!(uris.len(), 1);
+        assert_eq!(
+            (uris[0].start, uris[0].payload_start, uris[0].end),
+            (1, 7, 10)
+        );
+    }
+
+    #[test]
+    fn a_data_prefix_with_no_comma_before_the_end_of_the_text_is_not_a_uri() {
+        let chars = chars_of("data:text");
+        assert!(find_uris(&chars, &mut plain_ticker()).is_empty());
+    }
+
+    #[test]
+    fn finding_a_plain_data_uri_ticks_once_per_character_scanned() {
+        let chars = chars_of("data:,ab");
+        let mut ticker = plain_ticker();
+        let uris = find_uris(&chars, &mut ticker);
+        assert_eq!(uris.len(), 1);
+        assert_eq!(uris[0].end, 8);
+        assert_eq!(ticker.count, 3);
+    }
+
+    #[test]
+    fn a_base64_data_uri_takes_at_most_two_padding_characters() {
+        let chars = chars_of("data:;base64,QUJD====");
+        let uris = find_uris(&chars, &mut plain_ticker());
+        assert_eq!(uris.len(), 1);
+        assert_eq!((uris[0].payload_start, uris[0].end), (13, 19));
+    }
+
+    #[test]
+    fn a_bare_run_takes_at_most_two_padding_characters() {
+        let chars = chars_of(&format!("{}====", "A".repeat(40)));
+        let items = find_items(&chars, &mut plain_ticker());
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Item::Run(0, 42)));
+    }
+
+    #[test]
+    fn whitespace_inside_a_base64_data_uri_is_allowed_only_after_a_quote() {
+        let double = find_uris(&chars_of("\"data:;base64,QUJD QUJD"), &mut plain_ticker());
+        assert_eq!(double[0].end, 23);
+        let single = find_uris(&chars_of("'data:;base64,QUJD QUJD"), &mut plain_ticker());
+        assert_eq!(single[0].end, 23);
+        let none = find_uris(&chars_of(" data:;base64,QUJD QUJD"), &mut plain_ticker());
+        assert_eq!(none[0].end, 18);
+    }
+
+    #[test]
+    fn words_are_the_alphanumeric_stretches_between_other_characters() {
+        assert_eq!(word_count("ab cd ef"), 3);
+        assert_eq!(word_count("  "), 0);
+        assert_eq!(word_count(""), 0);
+    }
+
+    #[test]
+    fn a_data_uri_payload_exactly_at_the_limit_is_not_limited() {
+        let limits = Limits {
+            max_base64_run_bytes: 68,
+            ..Limits::default()
+        };
+        let uri = format!("data:text/plain;base64,{}", b64(MSG.as_bytes()));
+        let out = run_with(&uri, 0, &limits);
+        assert_eq!(texts(&out), vec![MSG]);
+        assert!(out.out.findings.is_empty());
+        assert_eq!(out.out.skip, None);
+    }
+
+    #[test]
+    fn a_run_exactly_at_the_limit_after_a_prefix_is_not_limited() {
+        let limits = Limits {
+            max_base64_run_bytes: 68,
+            ..Limits::default()
+        };
+        let out = run_with(&format!("payload: {}", b64(MSG.as_bytes())), 0, &limits);
+        assert_eq!(texts(&out), vec![MSG]);
+        assert!(out.out.findings.is_empty());
+        assert_eq!(out.out.skip, None);
+    }
+
+    #[test]
+    fn a_short_hex_stretch_inside_a_run_is_not_a_hex_payload() {
+        let text = format!("{}6120622063{}", "Z".repeat(30), "Z".repeat(30));
+        let out = run(&text, 0);
+        assert!(out.out.carriers.is_empty());
+        assert!(out.blobs.is_empty());
+        assert_eq!(out.not_payload_runs, 1);
+    }
+
+    #[test]
+    fn a_run_after_a_listed_image_still_counts_as_not_a_payload() {
+        let hash = format!("sha512-{}", b64(&high_bytes(48)));
+        let uri = format!("data:image/png;base64,{}", b64(&png()));
+        let out = run(&format!("{uri} {hash}"), 0);
+        assert_eq!(out.blobs.len(), 1);
+        assert!(out.out.carriers.is_empty());
+        assert_eq!(out.not_payload_runs, 1);
+    }
 }

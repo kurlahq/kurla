@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn the_committed_equivalent_mutants_document_parses_and_lists_exactly_its_ten_rows() {
+    fn the_committed_equivalent_mutants_document_parses_and_lists_exactly_its_thirteen_rows() {
         let document = include_str!("../../docs/equivalent-mutants.md");
         let missed = [
             "src/cache.rs:174:31: replace * with +",
@@ -498,15 +498,18 @@ mod tests {
             "src/aimed.rs:384:18: replace += with *= in dialogue_hit",
             "src/glob.rs:96:34: replace + with * in segment_matches",
             "src/glob.rs:97:31: replace + with * in segment_matches",
+            "src/encoded.rs:291:25: replace + with * in find_uris",
+            "src/encoded.rs:311:23: replace + with * in find_uris",
+            "src/encoded.rs:393:25: replace | with ^ in decode_base64",
         ]
         .join("\n");
         let report = check(&missed, document).unwrap();
-        assert_eq!(report.missed, 10);
+        assert_eq!(report.missed, 13);
         assert!(report.unlisted.is_empty(), "{report:?}");
         assert!(report.stale.is_empty(), "{report:?}");
         let without_rows = check("", document).unwrap();
-        assert_eq!(without_rows.stale.len(), 9, "{without_rows:?}");
+        assert_eq!(without_rows.stale.len(), 11, "{without_rows:?}");
         let listed: usize = without_rows.stale.iter().map(|entry| entry.listed).sum();
-        assert_eq!(listed, 10, "{without_rows:?}");
+        assert_eq!(listed, 13, "{without_rows:?}");
     }
 }
