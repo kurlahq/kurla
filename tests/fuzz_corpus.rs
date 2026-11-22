@@ -276,7 +276,7 @@ fn hand_built_seeds_reach_the_metadata_they_were_built_to_carry() {
     );
     assert_eq!(
         carriers_in("bmff", "minimal_exif_xmp.avif", kurla::binary::scan_avif),
-        3
+        5
     );
     let tiff = fs::read(root().join("fuzz/corpus/exif/minimal_two_entries.tiff")).expect("seed");
     assert_eq!(
