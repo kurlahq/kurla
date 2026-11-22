@@ -1,0 +1,36 @@
+additional_cargo_args = ["--locked", "--offline"]
+
+examine_globs = [
+    "src/unicode/scan.rs",
+    "src/unicode/context.rs",
+    "src/text.rs",
+    "src/markup.rs",
+    "src/svg.rs",
+    "src/binary/*.rs",
+    "src/encoded.rs",
+    "src/aimed.rs",
+    "src/agent_files.rs",
+    "src/location.rs",
+    "src/severity.rs",
+    "src/engine.rs",
+    "src/walk.rs",
+    "src/glob.rs",
+    "src/decisions.rs",
+    "src/cache.rs",
+    "src/exit.rs",
+    "src/limits.rs",
+]
+
+exclude_globs = [
+    "src/report/human.rs",
+    "src/cli.rs",
+    "src/main.rs",
+    "src/lib.rs",
+    "src/model.rs",
+    "src/report/mod.rs",
+    "src/report/json.rs",
+    "src/report/sarif.rs",
+    "src/unicode/mod.rs",
+    "src/unicode/tables.rs",
+    "xtask/**/*.rs",
+]

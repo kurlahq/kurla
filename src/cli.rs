@@ -1,4 +1,4 @@
-use crate::cache::Cache;
+use crate::cache::{Cache, executable_hash};
 use crate::decisions::{self, Applied};
 use crate::glob::Glob;
 use crate::limits::Limits;
@@ -229,6 +229,26 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const CURRENT_DECISIONS: &str = ".kurla/decisions.json";
 
+fn open_cache(
+    dir: Result<PathBuf, String>,
+    binary: Result<[u8; 32], String>,
+    warnings: &mut Vec<String>,
+) -> Option<Cache> {
+    match (dir, binary) {
+        (Err(reason), _) => {
+            warnings.push(format!("cache disabled: {reason}"));
+            None
+        }
+        (Ok(_), Err(reason)) => {
+            warnings.push(format!(
+                "cache disabled: cannot hash the running executable: {reason}"
+            ));
+            None
+        }
+        (Ok(dir), Ok(binary)) => Some(Cache::open(dir, binary)),
+    }
+}
+
 pub fn run(args: &[OsString], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match parse(args) {
         Err(message) => {
@@ -355,13 +375,11 @@ fn scan(options: &Options, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let cache = if options.no_cache {
         None
     } else {
-        match Cache::resolve_dir(options.cache_dir.clone()) {
-            Ok(dir) => Some(Cache::open(Some(dir))),
-            Err(reason) => {
-                warnings.push(format!("cache disabled: {reason}"));
-                None
-            }
-        }
+        open_cache(
+            Cache::resolve_dir(options.cache_dir.clone()),
+            executable_hash(),
+            &mut warnings,
+        )
     };
     let mut limits = Limits::default();
     if let Some(max) = options.max_file_size {
@@ -674,5 +692,38 @@ mod tests {
         assert!(write_atomic_with(&target, b"report", &mut names).is_err());
         assert!(!temp.exists());
         assert!(target.is_dir());
+    }
+
+    #[test]
+    fn unhashable_executable_disables_cache_with_warning() {
+        let mut warnings = Vec::new();
+        let cache = open_cache(
+            Ok(PathBuf::from("somewhere")),
+            Err("access denied".to_string()),
+            &mut warnings,
+        );
+        assert!(cache.is_none());
+        assert_eq!(
+            warnings,
+            vec!["cache disabled: cannot hash the running executable: access denied".to_string()]
+        );
+    }
+
+    #[test]
+    fn hashable_executable_and_directory_enable_cache_without_warning() {
+        let mut warnings = Vec::new();
+        let dir = std::env::temp_dir().join(format!("kurla-cli-open-{}", std::process::id()));
+        let cache = open_cache(Ok(dir.clone()), Ok([3; 32]), &mut warnings);
+        assert_eq!(cache.as_ref().map(Cache::dir), Some(dir.as_path()));
+        assert!(warnings.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unresolvable_directory_disables_cache_with_its_reason() {
+        let mut warnings = Vec::new();
+        let cache = open_cache(Err("no home".to_string()), Ok([3; 32]), &mut warnings);
+        assert!(cache.is_none());
+        assert_eq!(warnings, vec!["cache disabled: no home".to_string()]);
     }
 }

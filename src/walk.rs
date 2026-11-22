@@ -355,7 +355,7 @@ fn cached_scan(class: &str, bytes: &[u8], limits: &Limits, cache: &CacheUse) -> 
     let Some(store) = cache.cache else {
         return scan_file(class, bytes, limits);
     };
-    let key = Cache::key(class, bytes, limits);
+    let key = store.key(class, bytes, limits);
     if let Some(hit) = store.get(&key) {
         return hit;
     }

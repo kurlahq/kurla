@@ -1335,4 +1335,147 @@ mod tests {
             "\u{fffd}\u{fffd}\u{fffd}"
         );
     }
+
+    fn cs(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn an_eight_digit_hex_colour_combines_the_alpha_pair() {
+        assert_eq!(parse_hex("11223312"), Some([17, 34, 51, 18]));
+        assert_eq!(parse_hex("112233"), Some([17, 34, 51, 255]));
+    }
+
+    #[test]
+    fn a_leading_number_may_start_with_a_sign_or_a_dot() {
+        for text in ["0px", "+0px", "-0px", ".0em", "0.0pt"] {
+            assert!(leading_number_is_zero(text), "{text}");
+        }
+        for text in ["1px", "0.5px", "px", ""] {
+            assert!(!leading_number_is_zero(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_slash_not_followed_by_a_star_is_not_a_css_comment() {
+        assert_eq!(normalise_css("a/b"), "a/b");
+        assert_eq!(normalise_css("a/"), "a/");
+    }
+
+    #[test]
+    fn css_comments_end_at_the_first_star_slash() {
+        assert_eq!(normalise_css("a/* c */b"), "ab");
+        assert_eq!(normalise_css("/*/b*/c"), "c");
+        assert_eq!(normalise_css("/* a*b */c"), "c");
+    }
+
+    #[test]
+    fn a_backslash_before_a_non_hex_character_keeps_that_character() {
+        let bs = char::from(92u8);
+        assert_eq!(normalise_css(&format!("a{bs}{bs}b")), format!("a{bs}b"));
+        assert_eq!(normalise_css(&format!("{bs}-x")), "-x");
+    }
+
+    #[test]
+    fn a_tag_name_stops_at_whitespace_slash_or_the_end() {
+        assert_eq!(read_name(&cs("abc"), 0), ("abc".to_string(), 3));
+        assert_eq!(read_name(&cs("Ab/c"), 0), ("ab".to_string(), 2));
+    }
+
+    #[test]
+    fn quoted_attribute_values_end_after_the_closing_quote() {
+        assert_eq!(
+            read_attribute_value(&cs("\"ab\" x"), 0),
+            ("ab".to_string(), 4)
+        );
+        assert_eq!(read_attribute_value(&cs("'ab'"), 0), ("ab".to_string(), 4));
+        assert_eq!(
+            read_attribute_value(&cs("\"abc"), 0),
+            ("abc".to_string(), 4)
+        );
+    }
+
+    #[test]
+    fn unquoted_attribute_values_end_at_whitespace_a_bracket_or_the_end() {
+        assert_eq!(
+            read_attribute_value(&cs("abc def"), 0),
+            ("abc".to_string(), 3)
+        );
+        assert_eq!(
+            read_attribute_value(&cs("abc>d"), 0),
+            ("abc".to_string(), 3)
+        );
+        assert_eq!(read_attribute_value(&cs("abc"), 0), ("abc".to_string(), 3));
+        assert_eq!(
+            read_attribute_value(&cs("=abc d"), 1),
+            ("abc".to_string(), 4)
+        );
+    }
+
+    #[test]
+    fn an_attribute_value_at_the_end_of_the_text_is_empty() {
+        assert_eq!(read_attribute_value(&cs(""), 0), (String::new(), 0));
+        assert_eq!(read_attribute_value(&cs("xy"), 2), (String::new(), 2));
+    }
+
+    #[test]
+    fn a_slash_closes_an_open_tag_only_when_a_bracket_follows_it() {
+        let closed = parse_open_tag(&cs("<x/>"), 0);
+        assert_eq!(closed.name, "x");
+        assert!(closed.self_closing);
+        assert!(!closed.hidden);
+        assert_eq!(closed.end, 4);
+        let open = parse_open_tag(&cs("<x/ >"), 0);
+        assert!(!open.self_closing);
+        assert_eq!(open.end, 5);
+    }
+
+    #[test]
+    fn comment_bounds_of_the_short_forms_and_the_end_markers() {
+        assert_eq!(comment_bounds(&cs("<!-->"), 0), (4, 5));
+        assert_eq!(comment_bounds(&cs("<!--->"), 0), (4, 6));
+        assert_eq!(comment_bounds(&cs("<!--a> b -->"), 0), (9, 12));
+        assert_eq!(comment_bounds(&cs("<!---a -->"), 0), (7, 10));
+        assert_eq!(comment_bounds(&cs("<!-- a-b> c -->"), 0), (12, 15));
+        assert_eq!(comment_bounds(&cs("<!-- a ->d -->"), 0), (11, 14));
+        assert_eq!(comment_bounds(&cs("<!-- a --x> b -->"), 0), (14, 17));
+        assert_eq!(comment_bounds(&cs("<!-- a --!> b"), 0), (7, 11));
+    }
+
+    #[test]
+    fn declarations_and_processing_instructions_are_skipped_tokens() {
+        assert!(matches!(
+            next_token(&cs("<?x?>"), 0),
+            Some(Token::Skip { end: 5 })
+        ));
+        assert!(matches!(
+            next_token(&cs("<!DOCTYPE html>"), 0),
+            Some(Token::Skip { end: 15 })
+        ));
+    }
+
+    #[test]
+    fn the_next_line_starts_after_one_terminator_or_a_crlf_pair() {
+        assert_eq!(next_line(&cs("a\r\nb"), 1), 3);
+        assert_eq!(next_line(&cs("a\rb"), 1), 2);
+        assert_eq!(next_line(&cs("a\nb"), 1), 2);
+        assert_eq!(next_line(&cs("ab"), 2), 2);
+    }
+
+    #[test]
+    fn a_closing_fence_allows_only_spaces_and_tabs_after_the_run() {
+        assert!(closes_fence(&cs("```"), '`', 3));
+        assert!(closes_fence(&cs("```  "), '`', 3));
+        assert!(closes_fence(&cs("```\t"), '`', 3));
+        assert!(closes_fence(&cs("   ````"), '`', 3));
+        assert!(!closes_fence(&cs("```x"), '`', 3));
+        assert!(!closes_fence(&cs("``` x"), '`', 3));
+        assert!(!closes_fence(&cs("``"), '`', 3));
+    }
+
+    #[test]
+    fn an_indented_fence_after_other_text_is_found_and_ends_after_its_closing_line() {
+        let text = cs("a\n  ```\nb\n```\nc");
+        assert_eq!(fence_region(&text, 2), Some(14));
+    }
 }

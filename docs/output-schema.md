@@ -67,8 +67,9 @@ An entry is looked up by a SHA-256 key over these length-prefixed fields:
 - the Kurla version;
 - the rules version, which changes whenever any rule changes;
 - every resource limit, including the per-file time limit.
+- the SHA-256 of the running Kurla executable, which changes with every change to the rules, the bundled libraries or the compiler, so a stale rules version label cannot serve old results.
 
-A change to any of them is a miss, and the file is scanned again. Each entry also records its own key, and an entry that is corrupt, has an unknown name or field, or does not match its key is treated as a miss.
+A change to any of them is a miss, and the file is scanned again. The executable is hashed once per run, and only when the cache is on. Cached entries hold findings from before review decisions are applied, so a changed decisions file always takes effect; an entry that carries a review is a miss. Each entry also records its own key, and an entry that is corrupt, has an unknown name or field, or does not match its key is treated as a miss.
 
 ### What is never cached
 
@@ -80,6 +81,7 @@ A change to any of them is a miss, and the file is scanned again. Each entry als
 - A cache directory inside a scanned path is not used, and the run reports `cache disabled: cache directory is inside a scanned path`, so a scanned tree cannot supply its own results.
 - When entries cannot be written the scan result is unaffected and the run reports `cache writes failed: N`.
 - When no cache directory can be determined, the cache is disabled and the reason is reported.
+- When the running executable cannot be hashed, the cache is disabled and the run reports `cache disabled: cannot hash the running executable: <reason>`.
 
 ## Reports
 

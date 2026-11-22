@@ -1,0 +1,15 @@
+[advisories]
+version = 2
+yanked = "allow"
+
+[licenses]
+version = 2
+allow = ["Apache-2.0", "MIT", "Zlib"]
+exceptions = [{ crate = "libfuzzer-sys", allow = ["NCSA"] }]
+
+[bans]
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<!DOCTYPE svg [
+  <!ENTITY lol0 "lol">
+  <!ENTITY lol1 "&lol0;&lol0;&lol0;&lol0;&lol0;&lol0;&lol0;&lol0;&lol0;&lol0;">
+  <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
+  <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+  <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">
+]>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">
+  <text x="1" y="5">&lol4;</text>
+</svg>

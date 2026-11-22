@@ -110,6 +110,7 @@ pub(crate) struct Sink {
     input_len: usize,
     inflated: usize,
     used: usize,
+    malformed: bool,
 }
 
 impl Sink {
@@ -124,6 +125,7 @@ impl Sink {
             input_len,
             inflated: 0,
             used: 0,
+            malformed: false,
         }
     }
 
@@ -145,7 +147,18 @@ impl Sink {
     }
 
     fn l001(&mut self, message: &str, start: usize, end: usize) {
-        self.set_skip(SkipReason::SizeLimit);
+        self.low_finding(SkipReason::SizeLimit, message, start, end);
+    }
+
+    pub(crate) fn malformed(&mut self, message: &str, start: usize, end: usize) {
+        if !self.malformed {
+            self.malformed = true;
+            self.low_finding(SkipReason::Malformed, message, start, end);
+        }
+    }
+
+    fn low_finding(&mut self, reason: SkipReason, message: &str, start: usize, end: usize) {
+        self.set_skip(reason);
         self.out.findings.push(RawFinding {
             rule_id: "L001",
             family: Family::L,
@@ -465,5 +478,82 @@ mod tests {
         };
         assert_eq!(sniff(&build(63), "a"), FileKind::Avif);
         assert_ne!(sniff(&build(64), "a"), FileKind::Avif);
+    }
+
+    fn plain_budget() -> Budget {
+        Budget::new(&crate::limits::Limits::default())
+    }
+
+    fn many_inline_entries(count: usize) -> Vec<u8> {
+        let mut v = vec![b'I', b'I', 0x2A, 0x00, 0x08, 0, 0, 0];
+        v.extend_from_slice(&(count as u16).to_le_bytes());
+        for _ in 0..count {
+            v.extend_from_slice(&0x010Fu16.to_le_bytes());
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&2u32.to_le_bytes());
+            v.extend_from_slice(&[b'a', 0, 0, 0]);
+        }
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v
+    }
+
+    #[test]
+    fn the_output_cap_for_an_empty_input_is_exactly_sixty_four_kib() {
+        let mut exact = Sink::new(0);
+        assert!(exact.carrier("L", &"a".repeat(65536), 0, 1, &[]));
+        assert!(!exact.stop);
+        assert_eq!(exact.out.carriers.len(), 1);
+        assert!(exact.out.findings.is_empty());
+        let mut over = Sink::new(0);
+        assert!(!over.carrier("L", &"a".repeat(65537), 0, 1, &[]));
+        assert!(over.stop);
+        assert!(over.out.carriers.is_empty());
+        assert_eq!(over.out.findings.len(), 1);
+        assert_eq!(over.out.findings[0].rule_id, "B003");
+        assert_eq!(over.out.skip, Some(SkipReason::SizeLimit));
+    }
+
+    #[test]
+    fn carrier_costs_add_up_to_the_cap_and_the_next_byte_is_refused() {
+        let mut sink = Sink::new(0);
+        assert!(sink.carrier("L", &"a".repeat(65535), 0, 1, &[]));
+        assert!(sink.carrier("L", "a", 0, 1, &[]));
+        assert!(!sink.carrier("L", "a", 0, 1, &[]));
+        assert!(sink.stop);
+        assert_eq!(sink.out.carriers.len(), 2);
+    }
+
+    #[test]
+    fn exif_entry_limit_finding_spans_the_whole_block_at_its_base_offset() {
+        let tiff = many_inline_entries(1001);
+        assert_eq!(tiff.len(), 8 + 2 + 1001 * 12 + 4);
+        let mut sink = Sink::new(100 + tiff.len());
+        sink.exif(&tiff, 100, &plain_budget());
+        assert_eq!(sink.out.carriers.len(), 1000);
+        assert_eq!(sink.out.findings.len(), 1);
+        let finding = &sink.out.findings[0];
+        assert_eq!(finding.rule_id, "L001");
+        assert_eq!(finding.span.byte_start, 100);
+        assert_eq!(finding.span.byte_end, 100 + 12026);
+    }
+
+    #[test]
+    fn unmapped_xmp_text_is_reported_over_the_whole_packet_span() {
+        let packet = b"<a>hello</a>";
+        let mut unmapped = Sink::new(packet.len());
+        unmapped.xmp("XMP", packet, 100, 112, false, &plain_budget());
+        assert_eq!(unmapped.out.carriers.len(), 1);
+        let carrier = &unmapped.out.carriers[0];
+        assert_eq!(carrier.text, "XMP: hello");
+        assert_eq!(carrier.span.byte_start, 100);
+        assert_eq!(carrier.span.byte_end, 112);
+        assert_eq!(carrier.evidence, b"hello".to_vec());
+        let mut mapped = Sink::new(packet.len());
+        mapped.xmp("XMP", packet, 100, 112, true, &plain_budget());
+        assert_eq!(mapped.out.carriers.len(), 1);
+        let carrier = &mapped.out.carriers[0];
+        assert_eq!(carrier.span.byte_start, 103);
+        assert_eq!(carrier.span.byte_end, 108);
+        assert_eq!(carrier.evidence, b"hello".to_vec());
     }
 }

@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const COOLDOWN_DAYS: i64 = 14;
 
-const LOCK_PATH: &str = "Cargo.lock";
+const LOCK_PATHS: [&str; 2] = ["Cargo.lock", "fuzz/Cargo.lock"];
 const EXCEPTIONS_PATH: &str = "supply-chain/cooldown-exceptions.toml";
 const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
@@ -136,7 +136,7 @@ fn split_key_value(line: &str) -> Option<(&str, &str)> {
     Some((key, value))
 }
 
-fn parse_lock(text: &str) -> Result<Vec<Package>, String> {
+fn parse_lock(path: &str, text: &str) -> Result<Vec<Package>, String> {
     let mut packages: Vec<Package> = Vec::new();
     let mut current: Option<(Option<String>, Option<String>, Option<String>)> = None;
     let mut in_array = false;
@@ -164,7 +164,7 @@ fn parse_lock(text: &str) -> Result<Vec<Package>, String> {
 
     for (number, line) in text.lines().enumerate() {
         let line = line.trim();
-        let location = |message: String| format!("{LOCK_PATH} line {}: {message}", number + 1);
+        let location = |message: String| format!("{path} line {}: {message}", number + 1);
         if in_array {
             if line == "]" {
                 in_array = false;
@@ -213,9 +213,9 @@ fn parse_lock(text: &str) -> Result<Vec<Package>, String> {
             _ => return Err(location(format!("unexpected key `{key}`"))),
         }
     }
-    finish(&mut current, &mut packages).map_err(|m| format!("{LOCK_PATH}: {m}"))?;
+    finish(&mut current, &mut packages).map_err(|m| format!("{path}: {m}"))?;
     if !saw_version {
-        return Err(format!("{LOCK_PATH}: missing `version = 4`"));
+        return Err(format!("{path}: missing `version = 4`"));
     }
     Ok(packages)
 }
@@ -299,25 +299,50 @@ fn exception_problem(entry: &Exception, packages: &[Package]) -> Option<String> 
         .iter()
         .any(|p| p.registry && p.name == field(0) && p.version == field(1));
     if !known {
-        return Some("no such crates.io package in Cargo.lock".to_string());
+        return Some("no such crates.io package in Cargo.lock or fuzz/Cargo.lock".to_string());
     }
     None
 }
 
-pub fn evaluate(
-    lock: &str,
+pub fn load_locks(
+    read: &dyn Fn(&str) -> std::io::Result<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut locks = Vec::new();
+    for path in LOCK_PATHS {
+        let text = read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        locks.push((path.to_string(), text));
+    }
+    Ok(locks)
+}
+
+pub fn evaluate_locks(
+    locks: &[(&str, &str)],
     exceptions: &str,
     today: i64,
     lookup: &dyn Fn(&str, &str) -> Result<String, String>,
 ) -> Report {
     let mut report = Report::default();
-    let packages = match parse_lock(lock) {
-        Ok(packages) => packages,
-        Err(message) => {
-            report.errors.push(message);
-            return report;
+    let mut packages: Vec<Package> = Vec::new();
+    for (path, text) in locks {
+        match parse_lock(path, text) {
+            Ok(parsed) => {
+                for package in parsed {
+                    let seen = packages.iter().any(|p| {
+                        p.name == package.name
+                            && p.version == package.version
+                            && p.registry == package.registry
+                    });
+                    if !seen {
+                        packages.push(package);
+                    }
+                }
+            }
+            Err(message) => report.errors.push(message),
         }
-    };
+    }
+    if !report.errors.is_empty() {
+        return report;
+    }
     let entries = match parse_exceptions(exceptions) {
         Ok(entries) => entries,
         Err(message) => {
@@ -414,10 +439,10 @@ fn today_utc() -> Result<i64, String> {
 }
 
 pub fn run() -> ExitCode {
-    let lock = match std::fs::read_to_string(LOCK_PATH) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("cannot read {LOCK_PATH}: {e}");
+    let locks = match load_locks(&|path| std::fs::read_to_string(path)) {
+        Ok(locks) => locks,
+        Err(message) => {
+            eprintln!("{message}");
             return ExitCode::from(1);
         }
     };
@@ -436,7 +461,11 @@ pub fn run() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let report = evaluate(&lock, &exceptions, today, &curl_lookup);
+    let pairs: Vec<(&str, &str)> = locks
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let report = evaluate_locks(&pairs, &exceptions, today, &curl_lookup);
     print!("{}", report.render());
     if report.passed() {
         println!("cooldown-check: ok");
@@ -502,11 +531,168 @@ mod tests {
             .iter()
             .map(|(n, v, d)| ((n.to_string(), v.to_string()), d.to_string()))
             .collect();
-        evaluate(lock_text, exceptions, today(), &|name, version| {
+        evaluate_locks(
+            &[("Cargo.lock", lock_text)],
+            exceptions,
+            today(),
+            &|name, version| {
+                map.get(&(name.to_string(), version.to_string()))
+                    .cloned()
+                    .ok_or_else(|| format!("no fixture for {name} {version}"))
+            },
+        )
+    }
+
+    fn evaluate_locks_with(
+        locks: &[(&str, String)],
+        exceptions: &str,
+        dates: &[(&str, &str, &str)],
+        calls: &std::cell::RefCell<Vec<String>>,
+    ) -> Report {
+        let map: HashMap<(String, String), String> = dates
+            .iter()
+            .map(|(n, v, d)| ((n.to_string(), v.to_string()), d.to_string()))
+            .collect();
+        let pairs: Vec<(&str, &str)> = locks.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        evaluate_locks(&pairs, exceptions, today(), &|name, version| {
+            calls.borrow_mut().push(format!("{name} {version}"));
             map.get(&(name.to_string(), version.to_string()))
                 .cloned()
                 .ok_or_else(|| format!("no fixture for {name} {version}"))
         })
+    }
+
+    #[test]
+    fn young_package_only_in_the_fuzz_lock_fails() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let report = evaluate_locks_with(
+            &[
+                ("Cargo.lock", lock(&[("old", "1.0.0", true)])),
+                ("fuzz/Cargo.lock", lock(&[("fresh", "1.0.0", true)])),
+            ],
+            "",
+            &[
+                ("old", "1.0.0", "2026-01-01T00:00:00Z"),
+                ("fresh", "1.0.0", "2026-11-18T10:00:00Z"),
+            ],
+            &calls,
+        );
+        assert!(!report.passed());
+        assert_eq!(report.offenders.len(), 1);
+        assert!(report.offenders[0].contains("fresh 1.0.0"));
+    }
+
+    #[test]
+    fn exception_for_a_package_in_the_fuzz_lock_is_valid() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let report = evaluate_locks_with(
+            &[
+                ("Cargo.lock", lock(&[("old", "1.0.0", true)])),
+                ("fuzz/Cargo.lock", lock(&[("fresh", "1.0.0", true)])),
+            ],
+            &good_exception(),
+            &[
+                ("old", "1.0.0", "2026-01-01T00:00:00Z"),
+                ("fresh", "1.0.0", "2026-11-18T10:00:00Z"),
+            ],
+            &calls,
+        );
+        assert!(report.passed(), "{}", report.render());
+        assert!(report.invalid.is_empty());
+    }
+
+    #[test]
+    fn package_shared_by_both_locks_is_looked_up_and_reported_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let report = evaluate_locks_with(
+            &[
+                ("Cargo.lock", lock(&[("fresh", "1.0.0", true)])),
+                ("fuzz/Cargo.lock", lock(&[("fresh", "1.0.0", true)])),
+            ],
+            "",
+            &[("fresh", "1.0.0", "2026-11-18T10:00:00Z")],
+            &calls,
+        );
+        assert_eq!(report.offenders.len(), 1);
+        assert_eq!(calls.borrow().as_slice(), ["fresh 1.0.0"]);
+    }
+
+    #[test]
+    fn same_crate_at_two_versions_in_two_locks_is_checked_per_version() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let report = evaluate_locks_with(
+            &[
+                ("Cargo.lock", lock(&[("dup", "1.0.0", true)])),
+                ("fuzz/Cargo.lock", lock(&[("dup", "1.1.0", true)])),
+            ],
+            "",
+            &[
+                ("dup", "1.0.0", "2026-01-01T00:00:00Z"),
+                ("dup", "1.1.0", "2026-11-18T10:00:00Z"),
+            ],
+            &calls,
+        );
+        assert_eq!(report.offenders.len(), 1);
+        assert!(report.offenders[0].contains("dup 1.1.0"));
+        assert_eq!(calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn parse_error_in_the_fuzz_lock_names_that_file() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let report = evaluate_locks_with(
+            &[
+                ("Cargo.lock", lock(&[("old", "1.0.0", true)])),
+                ("fuzz/Cargo.lock", "garbage\n".to_string()),
+            ],
+            "",
+            &[("old", "1.0.0", "2026-01-01T00:00:00Z")],
+            &calls,
+        );
+        assert!(!report.passed());
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("fuzz/Cargo.lock"));
+    }
+
+    #[test]
+    fn missing_fuzz_lock_is_an_error_not_a_skip() {
+        let result = load_locks(&|path| {
+            if path == "fuzz/Cargo.lock" {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } else {
+                Ok(lock(&[("old", "1.0.0", true)]))
+            }
+        });
+        let message = result.expect_err("a missing fuzz lock must fail");
+        assert!(message.contains("fuzz/Cargo.lock"), "{message}");
+    }
+
+    #[test]
+    fn missing_root_lock_is_an_error() {
+        let result = load_locks(&|path| {
+            if path == "Cargo.lock" {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } else {
+                Ok(lock(&[("old", "1.0.0", true)]))
+            }
+        });
+        let message = result.expect_err("a missing root lock must fail");
+        assert!(message.contains("Cargo.lock"), "{message}");
+    }
+
+    #[test]
+    fn both_locks_present_are_loaded_in_order() {
+        let loaded = load_locks(&|path| Ok(format!("text of {path}"))).expect("both present");
+        assert_eq!(
+            loaded,
+            [
+                ("Cargo.lock".to_string(), "text of Cargo.lock".to_string()),
+                (
+                    "fuzz/Cargo.lock".to_string(),
+                    "text of fuzz/Cargo.lock".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -633,6 +819,30 @@ mod tests {
             assert!(report.invalid[0].contains(name));
             assert!(report.invalid[0].contains(version));
         }
+    }
+
+    #[test]
+    fn unknown_exception_message_names_both_lock_files() {
+        let lock_text = lock(&[("old", "2.0.0", true)]);
+        let report = evaluate_with(
+            &lock_text,
+            &exception(
+                "ghost",
+                "1.0.0",
+                "RUSTSEC-2026-0001",
+                "0.9.0",
+                "kiri1101",
+                "2026-11-18",
+            ),
+            &[("old", "2.0.0", "2026-01-01T00:00:00Z")],
+        );
+        assert_eq!(report.invalid.len(), 1);
+        assert!(
+            report.invalid[0]
+                .contains("no such crates.io package in Cargo.lock or fuzz/Cargo.lock"),
+            "{}",
+            report.invalid[0]
+        );
     }
 
     #[test]

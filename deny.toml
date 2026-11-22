@@ -1,10 +1,10 @@
 [advisories]
 version = 2
-yanked = "deny"
+yanked = "allow"
 
 [licenses]
 version = 2
-allow = ["Apache-2.0", "MIT", "Unicode-3.0", "BSD-3-Clause", "Zlib"]
+allow = ["Apache-2.0", "MIT", "Zlib"]
 
 [bans]
 wildcards = "deny"

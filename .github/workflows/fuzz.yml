@@ -1,0 +1,67 @@
+name: fuzz
+
+on:
+  pull_request:
+    paths:
+      - src/binary/**
+      - src/svg.rs
+      - src/markup.rs
+      - src/encoded.rs
+      - src/unicode/**
+      - src/engine.rs
+      - fuzz/**
+      - tests/fuzz_props/**
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PULL_REQUEST_SECONDS: "60"
+  SCHEDULE_SECONDS: "300"
+  DEV_RUN: docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/tmp/cargo-home -v "$PWD":/src -w /src kurla-dev
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'schedule' && 90 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - png
+          - jpeg
+          - exif
+          - gif
+          - bmff
+          - svg
+          - markup
+          - encoded
+          - text_unicode
+          - scan_file
+    env:
+      TARGET: ${{ matrix.target }}
+      EVENT: ${{ github.event_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: Fuzz the target
+        run: |
+          seconds="$PULL_REQUEST_SECONDS"
+          if [ "$EVENT" = schedule ]; then
+            seconds="$SCHEDULE_SECONDS"
+          fi
+          eval "$DEV_RUN cargo +nightly-2026-11-04 fuzz run $TARGET fuzz/corpus/$TARGET -- -max_total_time=$seconds"
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: warn
