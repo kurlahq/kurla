@@ -98,6 +98,6 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/dev-image
       - name: Audit
-        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo audit
+        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo audit --deny yanked
       - name: Audit the fuzz workspace
-        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo audit --file fuzz/Cargo.lock
+        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo audit --deny yanked --file fuzz/Cargo.lock
