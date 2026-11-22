@@ -285,4 +285,18 @@ mod tests {
         assert!(Glob::new("**").is_ok());
         assert!(Glob::new("a/**/b").is_ok());
     }
+
+    #[test]
+    fn glob_errors_display_a_message_naming_the_problem() {
+        let message = |e: GlobError| e.to_string();
+        assert!(message(GlobError::Empty).contains("empty glob"));
+        assert!(message(GlobError::TripleStar).contains("***"));
+        assert!(message(GlobError::PartialDoubleStar).contains("**"));
+        assert!(message(GlobError::PartialDoubleStar).contains("whole path segment"));
+        assert!(message(GlobError::EmptySegment).contains("empty path segment"));
+        assert_eq!(
+            Glob::new("a/***").unwrap_err().to_string(),
+            GlobError::TripleStar.to_string()
+        );
+    }
 }

@@ -157,4 +157,12 @@ mod tests {
     fn leading_dot_slash_is_ignored() {
         assert_eq!(classify("./src/x.rs", 0), Code);
     }
+
+    #[test]
+    fn a_file_named_like_a_directory_is_not_inside_that_directory() {
+        assert_eq!(classify("src/vendor", 0), DataAsset);
+        assert_eq!(classify("node_modules", 0), DataAsset);
+        assert_eq!(classify("docs", 0), DataAsset);
+        assert_eq!(classify("vendor/x", 0), Dependency);
+    }
 }

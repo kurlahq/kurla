@@ -709,4 +709,41 @@ mod tests {
         let json = r#"{"apiKeyHelper":"k"}"#;
         assert_eq!(active_commands(".claude\\Settings.json", json), v(&["k"]));
     }
+
+    #[test]
+    fn github_directory_names_below_a_subdirectory_are_not_agent_files() {
+        assert!(!is_agent_file("other/prompts/x.md"));
+        assert!(!is_agent_file("other/instructions/x.md"));
+        assert!(!is_agent_file("other/chatmodes/x.md"));
+        assert!(!is_agent_file("other/copilot-instructions.md"));
+        assert!(!is_agent_file(".github"));
+        assert!(is_agent_file(".github/prompts/x.md"));
+        assert!(is_agent_file(".github/copilot-instructions.md"));
+    }
+
+    #[test]
+    fn a_block_comment_ends_only_at_star_slash() {
+        assert_eq!(strip_comments("a/* x/y */b"), "a b");
+        assert_eq!(strip_comments("x/* a * b */y"), "x y");
+    }
+
+    #[test]
+    fn a_trailing_backslash_inside_a_string_does_not_panic_the_comma_stripper() {
+        assert_eq!(strip_trailing_commas("\"a\\"), "\"a\\");
+    }
+
+    #[test]
+    fn values_outside_hooks_and_commands_are_not_listed() {
+        assert_eq!(
+            active_commands(".claude/settings.json", r#"{"env":{"FOO":"bar"}}"#),
+            v(&[])
+        );
+        assert_eq!(
+            active_commands(
+                ".claude/settings.json",
+                r#"{"env":{"FOO":"bar"},"hooks":{"Stop":[{"hooks":[{"command":"c"}]}]}}"#
+            ),
+            v(&["c"])
+        );
+    }
 }
