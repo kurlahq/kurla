@@ -299,7 +299,7 @@ fn exception_problem(entry: &Exception, packages: &[Package]) -> Option<String> 
         .iter()
         .any(|p| p.registry && p.name == field(0) && p.version == field(1));
     if !known {
-        return Some("no such crates.io package in Cargo.lock".to_string());
+        return Some("no such crates.io package in Cargo.lock or fuzz/Cargo.lock".to_string());
     }
     None
 }
@@ -819,6 +819,30 @@ mod tests {
             assert!(report.invalid[0].contains(name));
             assert!(report.invalid[0].contains(version));
         }
+    }
+
+    #[test]
+    fn unknown_exception_message_names_both_lock_files() {
+        let lock_text = lock(&[("old", "2.0.0", true)]);
+        let report = evaluate_with(
+            &lock_text,
+            &exception(
+                "ghost",
+                "1.0.0",
+                "RUSTSEC-2026-0001",
+                "0.9.0",
+                "kiri1101",
+                "2026-11-18",
+            ),
+            &[("old", "2.0.0", "2026-01-01T00:00:00Z")],
+        );
+        assert_eq!(report.invalid.len(), 1);
+        assert!(
+            report.invalid[0]
+                .contains("no such crates.io package in Cargo.lock or fuzz/Cargo.lock"),
+            "{}",
+            report.invalid[0]
+        );
     }
 
     #[test]

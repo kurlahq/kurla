@@ -67,7 +67,8 @@
 
 - Imports: every audit set in cargo-vet's built-in registry, namely `actix`, `ariel-os`, `bytecode-alliance`, `embark-studios`, `fermyon`, `google`, `isrg`, `mozilla` and `zcash`.
 - Verification 1 (2026-11-19, cargo-vet 0.10.3): 4 of the 29 crates.io packages in `Cargo.lock` are fully audited through imports: `adler2`, `cpufeatures`, `quote` and `windows-link`. The other 25 are listed as exemptions in `supply-chain/config.toml`.
-- The 8 crates that only the fuzz workspace uses (`arbitrary`, `cc`, `find-msvc-tools`, `getrandom`, `jobserver`, `libfuzzer-sys`, `r-efi`, `shlex`) are exemptions at `safe-to-deploy`, the same criteria as every other exemption. CI proves whether any of them is already covered by an imported audit.
+- The 8 crates that only the fuzz workspace uses (`arbitrary`, `cc`, `find-msvc-tools`, `getrandom`, `jobserver`, `libfuzzer-sys`, `r-efi`, `shlex`) are exemptions at `safe-to-deploy`, the same criteria as every other exemption.
+- Verification 2 (2026-11-22, cargo-vet 0.10.3, CI): the fuzz workspace's 37 crates.io packages are 4 fully audited and 33 exempted; the main workspace's 29 are 4 and 25. Every exemption is used by at least one workspace.
 
 ## Crate-policy reviews pending
 

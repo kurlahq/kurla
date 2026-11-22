@@ -25,7 +25,10 @@ mod svg;
 #[path = "fuzz_props/text_unicode.rs"]
 mod text_unicode;
 
-use kurla::model::{Carrier, CarrierKind, Family, RawFinding, RuleStatus, Severity, Span};
+use kurla::model::{
+    Carrier, CarrierKind, DetectorOutput, Family, RawFinding, RuleStatus, Severity, SkipReason,
+    Span,
+};
 
 const TARGETS: [&str; 10] = [
     "png",
@@ -46,15 +49,21 @@ fn root() -> PathBuf {
 
 fn seeds(target: &str) -> Vec<(String, Vec<u8>)> {
     let dir = root().join("fuzz").join("corpus").join(target);
+    assert!(!seeds_in(&dir).is_empty(), "no seeds for {target}");
+    seeds_in(&dir)
+}
+
+fn seeds_in(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
         let path = entry.expect("directory entry").path();
-        if path.is_file() {
-            let bytes = fs::read(&path).expect("seed is readable");
-            out.push((path.display().to_string(), bytes));
-        }
+        let kind = fs::symlink_metadata(&path)
+            .expect("entry metadata")
+            .file_type();
+        assert!(kind.is_file(), "{} is not a regular file", path.display());
+        let bytes = fs::read(&path).expect("seed is readable");
+        out.push((path.display().to_string(), bytes));
     }
-    assert!(!out.is_empty(), "no seeds for {target}");
     out
 }
 
@@ -215,7 +224,7 @@ fn span_checker_rejects_a_bad_extra_span() {
 }
 
 #[test]
-fn span_checker_rejects_a_span_beyond_usize_range_values() {
+fn span_checker_rejects_a_u64_max_end() {
     let message = panic_text(|| {
         spans::check_spans(10, "x", &[finding(u64::MAX, u64::MAX)], &[], &[]);
     });
@@ -274,4 +283,179 @@ fn hand_built_seeds_reach_the_metadata_they_were_built_to_carry() {
         kurla::binary::exif_text_fields(&tiff).expect("valid").len(),
         2
     );
+}
+
+fn limit_output(skip: Option<SkipReason>, rule: &'static str) -> DetectorOutput {
+    let mut raw = finding(0, 1);
+    raw.rule_id = rule;
+    raw.carrier = CarrierKind::ResourceLimit;
+    DetectorOutput {
+        findings: vec![raw],
+        carriers: Vec::new(),
+        skip,
+    }
+}
+
+fn quiet_output() -> DetectorOutput {
+    DetectorOutput {
+        findings: Vec::new(),
+        carriers: Vec::new(),
+        skip: None,
+    }
+}
+
+#[test]
+fn png_differential_rejects_a_small_run_over_its_limit() {
+    let message = panic_text(|| png::check_decompression(4097, 4097, &quiet_output()));
+    assert!(
+        message
+            .expect("must panic")
+            .contains("png: the small run consumed 4097 bytes")
+    );
+}
+
+#[test]
+fn png_differential_rejects_a_large_run_over_the_limit_without_a_signal() {
+    let message = panic_text(|| png::check_decompression(4096, 5000, &quiet_output()));
+    assert!(
+        message
+            .expect("must panic")
+            .contains("png: the large run consumed 5000 bytes")
+    );
+}
+
+#[test]
+fn png_differential_rejects_a_signal_with_the_wrong_rule_or_skip() {
+    let wrong_rule = limit_output(Some(SkipReason::DecompressionLimit), "B003");
+    assert!(panic_text(|| png::check_decompression(4096, 5000, &wrong_rule)).is_some());
+    let wrong_skip = limit_output(Some(SkipReason::Malformed), "B002");
+    assert!(panic_text(|| png::check_decompression(4096, 5000, &wrong_skip)).is_some());
+    let no_skip = limit_output(None, "B002");
+    assert!(panic_text(|| png::check_decompression(4096, 5000, &no_skip)).is_some());
+}
+
+#[test]
+fn png_differential_accepts_a_large_run_over_the_limit_with_the_signal() {
+    let signal = limit_output(Some(SkipReason::DecompressionLimit), "B002");
+    png::check_decompression(4000, 5000, &signal);
+}
+
+#[test]
+fn png_differential_accepts_the_signal_behind_an_earlier_size_skip() {
+    let mut out = limit_output(Some(SkipReason::SizeLimit), "B002");
+    let mut earlier = finding(0, 1);
+    earlier.rule_id = "L001";
+    out.findings.insert(0, earlier);
+    png::check_decompression(4000, 5000, &out);
+    let mut no_earlier = limit_output(Some(SkipReason::SizeLimit), "B002");
+    no_earlier.findings[0].carrier = CarrierKind::ResourceLimit;
+    assert!(panic_text(|| png::check_decompression(4000, 5000, &no_earlier)).is_some());
+}
+
+#[test]
+fn png_differential_accepts_a_large_run_at_or_under_the_limit_without_a_signal() {
+    png::check_decompression(100, 4000, &quiet_output());
+    png::check_decompression(0, 0, &quiet_output());
+}
+
+#[test]
+fn png_differential_accepts_a_large_run_of_exactly_the_limit_without_a_signal() {
+    png::check_decompression(4096, 4096, &quiet_output());
+}
+
+#[test]
+fn png_differential_leaves_a_timeout_undecided() {
+    let timed_out = DetectorOutput {
+        skip: Some(SkipReason::Timeout),
+        ..quiet_output()
+    };
+    png::check_decompression(0, 5000, &timed_out);
+}
+
+#[test]
+fn png_differential_seed_exceeds_the_small_limit() {
+    let bytes = fs::read(root().join("fuzz/corpus/png/ztxt_over_4k.png")).expect("seed exists");
+    assert!(bytes.len() <= 4096);
+    let mut small = kurla::limits::Budget::new(&png::limits());
+    let small_out = kurla::binary::scan_png(&bytes, &mut small);
+    let mut large = kurla::limits::Budget::new(&png::large_limits());
+    kurla::binary::scan_png(&bytes, &mut large);
+    assert_eq!(
+        png::large_limits().max_decompressed_bytes - large.remaining_decompressed(),
+        5000
+    );
+    assert_eq!(small.remaining_decompressed(), 4096);
+    assert_eq!(small_out.skip, Some(SkipReason::DecompressionLimit));
+    assert!(
+        small_out
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "B002" && f.carrier == CarrierKind::ResourceLimit)
+    );
+}
+
+#[test]
+fn scan_file_carries_the_png_limit_skip() {
+    let bytes = fs::read(root().join("fuzz/corpus/png/ztxt_over_4k.png")).expect("seed exists");
+    let (findings, coverage, _) = kurla::engine::scan_file("x.png", &bytes, &scan_file::limits());
+    assert_eq!(coverage.skip, Some(SkipReason::DecompressionLimit));
+    assert!(findings.iter().any(|f| f.raw.rule_id == "B002"));
+    let small = limit_output(Some(SkipReason::DecompressionLimit), "B002");
+    scan_file::check_png_propagation(&small, coverage.skip);
+    scan_file::check_png_propagation(&quiet_output(), None);
+    scan_file::check_png_propagation(&small, Some(SkipReason::Timeout));
+    let message = panic_text(|| scan_file::check_png_propagation(&small, None));
+    assert!(
+        message
+            .expect("must panic")
+            .contains("scan_file: x.png lost the skip reason")
+    );
+}
+
+#[test]
+fn text_seeds_of_the_text_targets_decode_except_the_listed_ones() {
+    let expected_undecodable: [&str; 0] = [];
+    for target in ["markup", "encoded", "text_unicode"] {
+        for (name, bytes) in seeds(target) {
+            let listed = expected_undecodable.iter().any(|f| name.ends_with(f));
+            assert_eq!(
+                kurla::text::TextDoc::decode(&bytes).is_some(),
+                !listed,
+                "{target}: {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn seeds_panics_on_a_directory_entry_instead_of_skipping_it() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("seeds_dir_entry");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("nested")).expect("create");
+    fs::write(dir.join("a.bin"), b"x").expect("write");
+    let message = panic_text(|| {
+        seeds_in(&dir);
+    });
+    let message = message.expect("must panic");
+    assert!(message.contains("not a regular file"), "{message}");
+    assert!(message.contains("nested"), "{message}");
+}
+
+#[test]
+fn seeds_accepts_a_directory_of_regular_files() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("seeds_regular_only");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create");
+    fs::write(dir.join("a.bin"), b"x").expect("write");
+    assert_eq!(seeds_in(&dir).len(), 1);
+}
+
+#[test]
+fn fuzz_manifest_pins_the_root_crate_version() {
+    let manifest = fs::read_to_string(root().join("fuzz/Cargo.toml")).expect("readable");
+    let line = format!(
+        "kurla = {{ path = \"..\", version = \"={}\" }}",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(manifest.lines().any(|l| l == line), "{line}");
 }
