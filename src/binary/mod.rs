@@ -24,6 +24,9 @@ const TRAILER_MESSAGE: &str = "data after the end of the image";
 const EXIF_BAD_HEADER: &str = "malformed EXIF: invalid TIFF header";
 const EXIF_OUTSIDE: &str = "malformed EXIF: entry or value outside the block";
 const EXIF_IFD_LIMIT: &str = "EXIF IFD limit";
+const XMP_ERROR: &str = "malformed XMP: XML error";
+const XMP_DEPTH_LIMIT: &str = "XMP depth limit";
+const XMP_ATTRIBUTE_LIMIT: &str = "XMP attribute limit";
 
 const FTYP_BRANDS: [&[u8; 4]; 9] = [
     b"avif", b"avis", b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1",
@@ -373,9 +376,31 @@ impl Sink {
             }
             _ => self.carrier(label, text, start, end, text.as_bytes()),
         };
-        xmp::scan(packet, budget, &mut emit);
+        let outcome = xmp::scan(packet, budget, &mut emit);
         if budget.deadline_exceeded() {
             self.timed_out();
+        }
+        if let Some((text, range)) = &outcome.tail {
+            let (a, b) = match *range {
+                Some((a, b)) if mapped && b <= packet.len() => (a, b),
+                _ => (0, packet.len()),
+            };
+            let evidence = &packet[a..b];
+            let (from, to) = if mapped {
+                (start + a, start + b)
+            } else {
+                (start, end)
+            };
+            self.hidden_carrier(label, text, from, to, evidence);
+        }
+        if outcome.malformed {
+            self.malformed(XMP_ERROR, start, end);
+        }
+        if outcome.depth_limit && !self.stop {
+            self.l001(XMP_DEPTH_LIMIT, start, end);
+        }
+        if outcome.attribute_limit && !self.stop {
+            self.l001(XMP_ATTRIBUTE_LIMIT, start, end);
         }
     }
 
@@ -749,6 +774,68 @@ mod tests {
                 )
             ]
         );
+    }
+
+    #[test]
+    fn xmp_problems_reach_the_output() {
+        let packet = b"<a>good</a></c> ignore this";
+        let mut sink = Sink::new(100 + packet.len());
+        sink.xmp("XMP", packet, 100, 127, true, &plain_budget());
+        let carriers: Vec<(&str, bool, u64, u64)> = sink
+            .out
+            .carriers
+            .iter()
+            .map(|c| {
+                (
+                    c.text.as_str(),
+                    c.hidden,
+                    c.span.byte_start,
+                    c.span.byte_end,
+                )
+            })
+            .collect();
+        assert_eq!(
+            carriers,
+            vec![
+                ("XMP: good", false, 103, 107),
+                ("XMP: </c> ignore this", true, 111, 127)
+            ]
+        );
+        let found: Vec<(&str, &str, u64, u64)> = sink
+            .out
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.rule_id,
+                    f.message.as_str(),
+                    f.span.byte_start,
+                    f.span.byte_end,
+                )
+            })
+            .collect();
+        assert_eq!(found, vec![("L001", "malformed XMP: XML error", 100, 127)]);
+        assert_eq!(sink.out.skip, Some(SkipReason::Malformed));
+        let limits = crate::limits::Limits {
+            max_xml_depth: 1,
+            max_xml_attributes: 1,
+            ..crate::limits::Limits::default()
+        };
+        for (packet, message) in [
+            (&b"<a><b>x</b></a>"[..], "XMP depth limit"),
+            (&b"<a x=\"1\" y=\"2\"/>"[..], "XMP attribute limit"),
+        ] {
+            let mut sink = Sink::new(packet.len());
+            sink.xmp("XMP", packet, 0, packet.len(), true, &Budget::new(&limits));
+            let found: Vec<(&str, &str)> = sink
+                .out
+                .findings
+                .iter()
+                .map(|f| (f.rule_id, f.message.as_str()))
+                .collect();
+            assert_eq!(found, vec![("L001", message)]);
+            assert_eq!(sink.out.skip, Some(SkipReason::SizeLimit));
+        }
     }
 
     #[test]

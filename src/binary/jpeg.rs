@@ -329,15 +329,23 @@ mod tests {
         payload.extend_from_slice(xml.as_bytes());
         let bytes = jpeg(&[seg(0xE1, &payload)]);
         let out = scan_jpeg(&bytes, &mut budget());
-        assert_eq!(texts(&out), vec!["JPEG XMP: hidden words"]);
+        assert_eq!(
+            texts(&out),
+            vec![
+                "JPEG XMP: adobe:ns:meta/",
+                "JPEG XMP: r",
+                "JPEG XMP: d",
+                "JPEG XMP: hidden words"
+            ]
+        );
         assert_eq!(
             (
-                out.carriers[0].span.byte_start,
-                out.carriers[0].span.byte_end
+                out.carriers[3].span.byte_start,
+                out.carriers[3].span.byte_end
             ),
             (153, 165)
         );
-        assert_eq!(out.carriers[0].evidence, b"hidden words".to_vec());
+        assert_eq!(out.carriers[3].evidence, b"hidden words".to_vec());
     }
 
     #[test]
@@ -347,7 +355,15 @@ mod tests {
         let full = xml.len() as u32;
         let bytes = jpeg(&[ext_seg(full, 0, a), ext_seg(full, 40, b)]);
         let out = scan_jpeg(&bytes, &mut budget());
-        assert_eq!(texts(&out), vec!["JPEG XMP: ext words"]);
+        assert_eq!(
+            texts(&out),
+            vec![
+                "JPEG XMP: adobe:ns:meta/",
+                "JPEG XMP: r",
+                "JPEG XMP: d",
+                "JPEG XMP: ext words"
+            ]
+        );
     }
 
     #[test]

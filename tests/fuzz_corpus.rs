@@ -267,16 +267,16 @@ fn hand_built_seeds_reach_the_metadata_they_were_built_to_carry() {
     );
     assert_eq!(
         carriers_in("jpeg", "minimal_exif_xmp_com.jpg", kurla::binary::scan_jpeg),
-        4
+        7
     );
     assert!(carriers_in("gif", "minimal_comment_xmp.gif", kurla::binary::scan_gif) >= 2);
     assert_eq!(
         carriers_in("bmff", "minimal_exif_xmp.webp", kurla::binary::scan_webp),
-        3
+        6
     );
     assert_eq!(
         carriers_in("bmff", "minimal_exif_xmp.avif", kurla::binary::scan_avif),
-        5
+        8
     );
     let tiff = fs::read(root().join("fuzz/corpus/exif/minimal_two_entries.tiff")).expect("seed");
     assert_eq!(
