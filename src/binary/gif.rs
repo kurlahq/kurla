@@ -1,4 +1,4 @@
-use super::{Sink, lossy, sub};
+use super::{Sink, latin1, lossy, sub};
 use crate::limits::Budget;
 use crate::model::DetectorOutput;
 
@@ -6,11 +6,16 @@ const HEADER_LEN: usize = 13;
 const APPLICATION_ID_LEN: usize = 11;
 const XMP_ID: &[u8] = b"XMP DataXMP";
 const TRAILER_LEN: usize = 258;
+const TRUNCATED: &str = "malformed GIF: truncated block";
+const UNKNOWN_BLOCK: &str = "malformed GIF: unknown block";
+const TRAILER_LABEL: &str = "GIF data after trailer";
 
 enum Stop {
     Truncated,
     Timeout,
 }
+
+type Parts<'a> = Vec<(usize, &'a [u8])>;
 
 fn trailer() -> Vec<u8> {
     let mut t = Vec::with_capacity(TRAILER_LEN);
@@ -20,11 +25,11 @@ fn trailer() -> Vec<u8> {
     t
 }
 
-fn sub_blocks(
-    bytes: &[u8],
+fn sub_blocks<'b>(
+    bytes: &'b [u8],
     mut at: usize,
     budget: &Budget,
-    mut visit: impl FnMut(usize, &[u8]),
+    mut visit: impl FnMut(usize, &'b [u8]),
 ) -> Result<usize, Stop> {
     loop {
         if budget.deadline_exceeded() {
@@ -38,6 +43,7 @@ fn sub_blocks(
             return Ok(at);
         }
         let Some(data) = sub(bytes, at, usize::from(len)) else {
+            visit(at, &bytes[at..]);
             return Err(Stop::Truncated);
         };
         visit(at, data);
@@ -53,61 +59,101 @@ fn color_table_len(packed: u8) -> usize {
     }
 }
 
+fn joined(parts: &[(usize, &[u8])]) -> Vec<u8> {
+    parts
+        .iter()
+        .flat_map(|(_, data)| data.iter().copied())
+        .collect()
+}
+
+fn extent(parts: &[(usize, &[u8])]) -> Option<(usize, usize)> {
+    let &(first, _) = parts.first()?;
+    let &(last, data) = parts.last()?;
+    Some((first, last + data.len()))
+}
+
 struct Gif<'a> {
     bytes: &'a [u8],
     sink: Sink,
     budget: &'a mut Budget,
 }
 
-impl Gif<'_> {
-    fn finish(&mut self, stop: &Stop) {
-        if matches!(stop, Stop::Timeout) {
-            self.sink.timed_out();
+impl<'a> Gif<'a> {
+    fn finish(&mut self, stop: &Stop, from: usize) {
+        match stop {
+            Stop::Timeout => self.sink.timed_out(),
+            Stop::Truncated => self.sink.malformed(TRUNCATED, from, self.bytes.len()),
         }
     }
 
-    fn comment(&mut self, at: usize) -> Option<usize> {
-        let mut text = Vec::new();
-        let mut first = None;
-        let mut last = 0usize;
+    fn parts(&mut self, at: usize, from: usize) -> (Parts<'a>, Option<usize>) {
+        let mut parts = Vec::new();
         let result = sub_blocks(self.bytes, at, self.budget, |start, data| {
-            first.get_or_insert(start);
-            last = start + data.len();
-            text.extend_from_slice(data);
+            parts.push((start, data));
         });
         match result {
-            Ok(next) => {
-                if let Some(start) = first {
-                    self.sink
-                        .carrier("GIF Comment", &lossy(&text), start, last, &text);
-                }
-                Some(next)
-            }
+            Ok(next) => (parts, Some(next)),
             Err(stop) => {
-                self.finish(&stop);
-                None
+                self.finish(&stop, from);
+                (parts, None)
             }
         }
     }
 
-    fn application(&mut self, at: usize) -> Option<usize> {
+    fn comment(&mut self, from: usize) -> Option<usize> {
+        let (parts, next) = self.parts(from + 2, from);
+        if let Some((start, end)) = extent(&parts) {
+            let text = joined(&parts);
+            self.sink
+                .carrier("GIF Comment", &lossy(&text), start, end, &text);
+        }
+        next
+    }
+
+    fn plain_text(&mut self, from: usize) -> Option<usize> {
+        let (parts, next) = self.parts(from + 2, from);
+        let shown = parts.get(1..).unwrap_or_default();
+        if let Some((start, end)) = extent(shown) {
+            let text = joined(shown);
+            self.sink
+                .hidden_carrier("GIF plain text", &lossy(&text), start, end, &text);
+        }
+        next
+    }
+
+    fn application(&mut self, from: usize) -> Option<usize> {
+        let at = from + 2;
         let is_xmp = self.bytes.get(at) == Some(&(APPLICATION_ID_LEN as u8))
             && sub(self.bytes, at + 1, APPLICATION_ID_LEN) == Some(XMP_ID);
-        if !is_xmp {
-            return self.skip(at);
+        if is_xmp {
+            return self.xmp(at + 1 + APPLICATION_ID_LEN, from);
         }
-        let from = at + 1 + APPLICATION_ID_LEN;
-        match sub_blocks(self.bytes, from, self.budget, |_, _| {}) {
+        let (parts, next) = self.parts(at, from);
+        if let (Some(&(_, id)), Some((start, end))) = (parts.first(), extent(&parts)) {
+            let data = joined(parts.get(1..).unwrap_or_default());
+            let text = if data.is_empty() {
+                latin1(id)
+            } else {
+                format!("{} {}", latin1(id), lossy(&data))
+            };
+            self.sink
+                .carrier("GIF application", &text, start, end, &joined(&parts));
+        }
+        next
+    }
+
+    fn xmp(&mut self, data_at: usize, from: usize) -> Option<usize> {
+        match sub_blocks(self.bytes, data_at, self.budget, |_, _| {}) {
             Ok(next) => {
-                let trailer_at = next.checked_sub(TRAILER_LEN).filter(|&t| t >= from);
+                let trailer_at = next.checked_sub(TRAILER_LEN).filter(|&t| t >= data_at);
                 let end = match trailer_at {
                     Some(t) if self.bytes[t..next] == trailer()[..] => t,
                     _ => next - 1,
                 };
                 self.sink.xmp(
                     "GIF XMP",
-                    &self.bytes[from..end],
-                    from,
+                    &self.bytes[data_at..end],
+                    data_at,
                     end,
                     true,
                     self.budget,
@@ -118,41 +164,43 @@ impl Gif<'_> {
                 let end = self.bytes.len();
                 self.sink.xmp(
                     "GIF XMP",
-                    &self.bytes[from..end],
-                    from,
+                    &self.bytes[data_at..end],
+                    data_at,
                     end,
                     true,
                     self.budget,
                 );
+                self.finish(&Stop::Truncated, from);
                 None
             }
             Err(stop) => {
-                self.finish(&stop);
+                self.finish(&stop, from);
                 None
             }
         }
     }
 
-    fn skip(&mut self, at: usize) -> Option<usize> {
+    fn skip(&mut self, at: usize, from: usize) -> Option<usize> {
         match sub_blocks(self.bytes, at, self.budget, |_, _| {}) {
             Ok(next) => Some(next),
             Err(stop) => {
-                self.finish(&stop);
+                self.finish(&stop, from);
                 None
             }
         }
     }
 
     fn image(&mut self, at: usize) -> Option<usize> {
-        let packed = *self.bytes.get(at.checked_add(9)?)?;
-        let data = at
-            .checked_add(10)?
-            .checked_add(color_table_len(packed))?
-            .checked_add(1)?;
-        if data > self.bytes.len() {
+        let data = self.bytes.get(at + 9).and_then(|&packed| {
+            at.checked_add(10)?
+                .checked_add(color_table_len(packed))?
+                .checked_add(1)
+        });
+        let Some(data) = data else {
+            self.finish(&Stop::Truncated, at);
             return None;
-        }
-        self.skip(data)
+        };
+        self.skip(data, at)
     }
 
     fn walk(&mut self, mut at: usize) {
@@ -168,18 +216,25 @@ impl Gif<'_> {
                 return;
             };
             let next = match introducer {
-                0x21 => {
-                    let Some(&label) = self.bytes.get(at + 1) else {
-                        return;
-                    };
-                    match label {
-                        0xFE => self.comment(at + 2),
-                        0xFF => self.application(at + 2),
-                        _ => self.skip(at + 2),
+                0x21 => match self.bytes.get(at + 1) {
+                    Some(0xFE) => self.comment(at),
+                    Some(0x01) => self.plain_text(at),
+                    Some(0xFF) => self.application(at),
+                    Some(_) => self.skip(at + 2, at),
+                    None => {
+                        self.finish(&Stop::Truncated, at);
+                        None
                     }
-                }
+                },
                 0x2C => self.image(at),
-                _ => None,
+                0x3B => {
+                    self.sink.trailer(TRAILER_LABEL, self.bytes, at + 1, true);
+                    None
+                }
+                _ => {
+                    self.sink.malformed(UNKNOWN_BLOCK, at, self.bytes.len());
+                    None
+                }
             };
             match next {
                 Some(next) => at = next,
@@ -198,12 +253,13 @@ pub fn scan_gif(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
     if !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
         return gif.sink.out;
     }
-    let Some(&packed) = bytes.get(10) else {
-        return gif.sink.out;
-    };
-    let body = HEADER_LEN + color_table_len(packed);
-    if body <= bytes.len() {
-        gif.walk(body);
+    let body = bytes
+        .get(10)
+        .map(|&packed| HEADER_LEN + color_table_len(packed))
+        .filter(|&body| body <= bytes.len());
+    match body {
+        Some(body) => gif.walk(body),
+        None => gif.finish(&Stop::Truncated, 0),
     }
     gif.sink.out
 }
@@ -310,18 +366,54 @@ mod tests {
     }
 
     #[test]
-    fn graphic_control_and_other_application_extensions_are_skipped() {
+    fn graphic_control_is_skipped_and_other_application_extensions_are_carriers() {
         let mut bytes = head();
         bytes.extend_from_slice(&[0x21, 0xF9, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]);
         bytes.extend_from_slice(&[0x21, 0xFF, 0x0B]);
         bytes.extend_from_slice(b"NETSCAPE2.0");
         bytes.extend_from_slice(&[0x03, 0x01, 0x00, 0x00, 0x00]);
+        bytes.extend_from_slice(&[0x21, 0xFF, 0x0B]);
+        bytes.extend_from_slice(b"NOTEPAD 1.0");
+        bytes.extend_from_slice(&[0x04, b'n', b'o', b't', b'e', 0x00]);
+        bytes.extend_from_slice(&[0x21, 0xFF, 0x0B]);
+        bytes.extend_from_slice(b"EMPTYDATA10");
+        bytes.push(0x00);
         bytes.extend_from_slice(&comment(&[b"found"]));
         bytes.push(0x3B);
+        let out = scan_gif(&bytes, &mut budget());
         assert_eq!(
-            texts(&scan_gif(&bytes, &mut budget())),
-            vec!["GIF Comment: found"]
+            texts(&out),
+            vec![
+                "GIF application: NETSCAPE2.0 \u{1}\0\0",
+                "GIF application: NOTEPAD 1.0 note",
+                "GIF application: EMPTYDATA10",
+                "GIF Comment: found"
+            ]
         );
+        assert_eq!(
+            (
+                out.carriers[1].span.byte_start,
+                out.carriers[1].span.byte_end
+            ),
+            (49, 65)
+        );
+        assert!(out.findings.is_empty());
+    }
+
+    #[test]
+    fn plain_text_extension_text_is_a_hidden_carrier() {
+        let mut bytes = head();
+        bytes.extend_from_slice(&[0x21, 0x01, 0x0C]);
+        bytes.extend_from_slice(&[0; 12]);
+        bytes.extend_from_slice(&[0x03, b'h', b'e', b'l', 0x02, b'l', b'o', 0x00]);
+        bytes.push(0x3B);
+        let out = scan_gif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["GIF plain text: hello"]);
+        let c = &out.carriers[0];
+        assert!(c.hidden);
+        assert_eq!(c.kind, CarrierKind::HiddenText);
+        assert_eq!((c.span.byte_start, c.span.byte_end), (35, 41));
+        assert!(out.findings.is_empty());
     }
 
     #[test]
@@ -377,46 +469,161 @@ mod tests {
         assert_eq!(texts(&out).last(), Some(&"GIF Comment: tail"));
     }
 
+    fn findings(out: &DetectorOutput) -> Vec<(&str, &str, u64, u64)> {
+        out.findings
+            .iter()
+            .map(|f| {
+                (
+                    f.rule_id,
+                    f.message.as_str(),
+                    f.span.byte_start,
+                    f.span.byte_end,
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn parse_stops_at_the_trailer_byte() {
+    fn the_trailer_byte_ends_the_parse_and_what_follows_is_b004() {
         let mut bytes = head();
         bytes.extend_from_slice(&comment(&[b"one"]));
         bytes.push(0x3B);
         bytes.extend_from_slice(&comment(&[b"two"]));
+        let out = scan_gif(&bytes, &mut budget());
+        let visible: Vec<&str> = out
+            .carriers
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(visible, vec!["GIF Comment: one"]);
         assert_eq!(
-            texts(&scan_gif(&bytes, &mut budget())),
-            vec!["GIF Comment: one"]
+            findings(&out),
+            vec![("B004", "data after the end of the image", 27, 34)]
         );
     }
 
     #[test]
-    fn unknown_block_introducer_stops_the_parse() {
+    fn data_after_the_trailer_byte_follows_the_trailer_rule() {
+        let with = |tail: &[u8]| {
+            let mut bytes = head();
+            bytes.push(0x3B);
+            bytes.extend_from_slice(tail);
+            scan_gif(&bytes, &mut budget())
+        };
+        let out = with(b"note for the reader");
+        assert_eq!(
+            texts(&out),
+            vec!["GIF data after trailer: note for the reader"]
+        );
+        assert!(out.carriers[0].hidden);
+        assert_eq!(
+            findings(&out),
+            vec![("B004", "data after the end of the image", 20, 39)]
+        );
+        let out = with(b"PK\x03\x04rest of a zip");
+        assert_eq!(findings(&out)[0].0, "B004");
+        assert_eq!(out.embedded[0].format, Some("zip"));
+        let out = with(b"\0\0 \n");
+        assert!(out.carriers.is_empty() && out.findings.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_block_introducer_stops_the_parse_and_marks_the_gif_malformed() {
         let mut bytes = head();
         bytes.extend_from_slice(&comment(&[b"one"]));
         bytes.push(0x99);
         bytes.extend_from_slice(&comment(&[b"two"]));
+        let out = scan_gif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["GIF Comment: one"]);
         assert_eq!(
-            texts(&scan_gif(&bytes, &mut budget())),
-            vec!["GIF Comment: one"]
+            findings(&out),
+            vec![("L001", "malformed GIF: unknown block", 26, 34)]
+        );
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn a_truncated_comment_keeps_its_partial_text_and_marks_the_gif_malformed() {
+        let mut bytes = head();
+        bytes.extend_from_slice(&comment(&[b"one"]));
+        bytes.extend_from_slice(&[0x21, 0xFE, 0x02, b'a', b'b', 0x09, b't', b'w']);
+        let out = scan_gif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["GIF Comment: one", "GIF Comment: abtw"]);
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed GIF: truncated block", 26, 34)]
+        );
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn truncated_blocks_mark_the_gif_malformed() {
+        let mut image = head();
+        image.extend_from_slice(&[0x2C, 0, 0, 0, 0]);
+        let mut table = head();
+        table.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0x80, 0, 0]);
+        let mut data = head();
+        data.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0x00, 0x02, 0x04, 0x01]);
+        let mut label = head();
+        label.push(0x21);
+        let mut other = head();
+        other.extend_from_slice(&[0x21, 0xF9, 0x04, 0x00]);
+        for bytes in [image, table, data, label, other] {
+            let out = scan_gif(&bytes, &mut budget());
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed GIF: truncated block",
+                    19,
+                    bytes.len() as u64
+                )],
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_xmp_extension_is_kept_and_marks_the_gif_malformed() {
+        let mut bytes = head();
+        bytes.extend_from_slice(&[0x21, 0xFF, 0x0B]);
+        bytes.extend_from_slice(b"XMP DataXMP");
+        bytes.extend_from_slice(b"<a>cut");
+        let out = scan_gif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["GIF XMP: cut"]);
+        assert_eq!(
+            findings(&out),
+            vec![(
+                "L001",
+                "malformed GIF: truncated block",
+                19,
+                bytes.len() as u64
+            )]
         );
     }
 
     #[test]
-    fn truncated_gif_keeps_earlier_carriers() {
-        let mut bytes = head();
-        bytes.extend_from_slice(&comment(&[b"one"]));
-        bytes.extend_from_slice(&[0x21, 0xFE, 0x09, b't', b'w']);
-        let out = scan_gif(&bytes, &mut budget());
-        assert_eq!(texts(&out), vec!["GIF Comment: one"]);
-        assert_eq!(out.skip, None);
-    }
-
-    #[test]
-    fn truncated_header_or_wrong_magic_gives_nothing() {
+    fn a_truncated_header_marks_the_gif_malformed_and_wrong_magic_gives_nothing() {
         for bytes in [
-            &b""[..],
             &b"GIF89a"[..],
             &b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00"[..],
+        ] {
+            let out = scan_gif(bytes, &mut budget());
+            assert!(out.carriers.is_empty());
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed GIF: truncated block",
+                    0,
+                    bytes.len() as u64
+                )]
+            );
+        }
+        assert!(scan_gif(&head(), &mut budget()).findings.is_empty());
+        for bytes in [
+            &b""[..],
             &b"GIF88a\x01\x00\x01\x00\x00\x00\x00"[..],
             &b"PNG89a\x01\x00\x01\x00\x00\x00\x00"[..],
         ] {
