@@ -11,26 +11,42 @@ const MAX_RECORDED_RANGES: usize = 1 << 20;
 const EXIF_PREFIX: &[u8] = b"Exif\0\0";
 const XMP_MIME: &[u8] = b"application/rdf+xml";
 const RIFF_HEADER_LEN: usize = 12;
+const RIFF_SIZE: &str = "malformed WebP: RIFF size does not fit the file";
+const TRUNCATED_CHUNK: &str = "malformed WebP: truncated chunk";
+const WEBP_TRAILER: &str = "WebP data after RIFF";
 
 pub fn scan_webp(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
     let mut sink = Sink::new(bytes.len());
     if !(bytes.starts_with(b"RIFF") && bytes.get(8..RIFF_HEADER_LEN) == Some(b"WEBP".as_slice())) {
         return sink.out;
     }
+    let declared = le_u32(bytes, 4)
+        .and_then(|n| usize::try_from(n).ok())
+        .and_then(|n| n.checked_add(8));
+    let riff_end = match declared {
+        Some(end) if (RIFF_HEADER_LEN..=bytes.len()).contains(&end) => end,
+        _ => {
+            sink.malformed(RIFF_SIZE, 4, 8);
+            bytes.len()
+        }
+    };
+    let body = &bytes[..riff_end];
     let mut at = RIFF_HEADER_LEN;
-    loop {
+    while at < body.len() {
         if budget.deadline_exceeded() {
             sink.timed_out();
             break;
         }
-        let Some(kind) = sub(bytes, at, 4) else {
-            break;
-        };
-        let Some(size) = le_u32(bytes, at + 4).and_then(|n| usize::try_from(n).ok()) else {
+        let (Some(kind), Some(size)) = (
+            sub(body, at, 4),
+            le_u32(body, at + 4).and_then(|n| usize::try_from(n).ok()),
+        ) else {
+            sink.malformed(TRUNCATED_CHUNK, at, body.len());
             break;
         };
         let start = at + 8;
-        let Some(payload) = sub(bytes, start, size) else {
+        let Some(payload) = sub(body, start, size) else {
+            sink.malformed(TRUNCATED_CHUNK, at, body.len());
             break;
         };
         let end = start + size;
@@ -55,6 +71,9 @@ pub fn scan_webp(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
             break;
         }
         at = end.saturating_add(size & 1);
+    }
+    if !sink.stop {
+        sink.trailer(WEBP_TRAILER, bytes, riff_end, true);
     }
     sink.out
 }
@@ -580,6 +599,20 @@ mod tests {
         out.carriers.iter().map(|c| c.text.as_str()).collect()
     }
 
+    fn findings(out: &DetectorOutput) -> Vec<(&str, &str, u64, u64)> {
+        out.findings
+            .iter()
+            .map(|f| {
+                (
+                    f.rule_id,
+                    f.message.as_str(),
+                    f.span.byte_start,
+                    f.span.byte_end,
+                )
+            })
+            .collect()
+    }
+
     fn spans(out: &DetectorOutput) -> Vec<(u64, u64)> {
         out.carriers
             .iter()
@@ -722,12 +755,77 @@ mod tests {
     }
 
     #[test]
-    fn webp_truncated_chunk_stops_walk_and_keeps_earlier_carriers() {
+    fn webp_truncated_chunk_keeps_earlier_carriers_and_marks_the_webp_malformed() {
         let bytes = riff(&[(b"EXIF", 32, &TIFF), (b"XMP ", 100, b"<a>x</a>")]);
         let out = scan_webp(&bytes, &mut budget());
         assert_eq!(texts(&out), vec!["WebP Exif ImageDescription: hello"]);
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed WebP: truncated chunk", 52, 68)]
+        );
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
         let huge = riff(&[(b"XMP ", u32::MAX, b"<a>x</a>")]);
-        assert!(scan_webp(&huge, &mut budget()).carriers.is_empty());
+        let out = scan_webp(&huge, &mut budget());
+        assert!(out.carriers.is_empty());
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed WebP: truncated chunk", 12, 28)]
+        );
+        let mut header = riff(&[(b"EXIF", 32, &TIFF)]);
+        header.extend_from_slice(b"XMP");
+        let size = (header.len() - 8) as u32;
+        header[4..8].copy_from_slice(&size.to_le_bytes());
+        let out = scan_webp(&header, &mut budget());
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed WebP: truncated chunk", 52, 55)]
+        );
+    }
+
+    #[test]
+    fn data_after_the_riff_size_follows_the_trailer_rule() {
+        let with = |tail: &[u8]| {
+            let mut bytes = riff(&[(b"EXIF", 32, &TIFF)]);
+            bytes.extend_from_slice(tail);
+            scan_webp(&bytes, &mut budget())
+        };
+        let out = with(b"note for the reader");
+        assert_eq!(
+            texts(&out),
+            vec![
+                "WebP Exif ImageDescription: hello",
+                "WebP data after RIFF: note for the reader"
+            ]
+        );
+        assert!(out.carriers[1].hidden);
+        assert_eq!(
+            findings(&out),
+            vec![("B004", "data after the end of the image", 52, 71)]
+        );
+        let out = with(b"PK\x03\x04rest of a zip");
+        assert_eq!(findings(&out)[0].0, "B004");
+        assert_eq!(out.embedded[0].format, Some("zip"));
+        let out = with(b"\0\0\0\0");
+        assert!(out.findings.is_empty() && out.embedded.is_empty());
+    }
+
+    #[test]
+    fn a_riff_size_that_does_not_fit_the_file_marks_the_webp_malformed() {
+        for declared in [1000u32, 0] {
+            let mut bytes = riff(&[(b"EXIF", 32, &TIFF)]);
+            bytes[4..8].copy_from_slice(&declared.to_le_bytes());
+            let out = scan_webp(&bytes, &mut budget());
+            assert_eq!(texts(&out), vec!["WebP Exif ImageDescription: hello"]);
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed WebP: RIFF size does not fit the file",
+                    4,
+                    8
+                )]
+            );
+        }
     }
 
     #[test]
