@@ -13,6 +13,8 @@ const ENTRY_LEN: usize = 12;
 const TAG_EXIF_IFD: u16 = 0x8769;
 const TAG_GPS_IFD: u16 = 0x8825;
 const TAG_INTEROP_IFD: u16 = 0xA005;
+const TAG_SUB_IFDS: u16 = 0x014A;
+const TAG_COPYRIGHT: u16 = 0x8298;
 const TAG_USER_COMMENT: u16 = 0x9286;
 const TAG_XP_FIRST: u16 = 0x9C9B;
 const TAG_XP_LAST: u16 = 0x9C9F;
@@ -21,6 +23,7 @@ const TAG_GPS_AREA_INFORMATION: u16 = 0x001C;
 const TYPE_BYTE: u16 = 1;
 const TYPE_ASCII: u16 = 2;
 const TYPE_UNDEFINED: u16 = 7;
+const TYPE_UTF8: u16 = 129;
 const PUBLIC_OUTPUT_SLACK: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,6 +31,8 @@ pub(crate) struct Outcome {
     pub timed_out: bool,
     pub entry_limit: bool,
     pub stopped: bool,
+    pub malformed: bool,
+    pub ifd_limit: bool,
 }
 
 pub(crate) struct Value {
@@ -35,6 +40,7 @@ pub(crate) struct Value {
     pub text: String,
     pub start: usize,
     pub end: usize,
+    pub hidden: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +123,7 @@ fn tag_name(kind: Kind, tag: u16) -> String {
         (_, 0xA433) => Some("LensMake"),
         (_, 0xA434) => Some("LensModel"),
         (_, 0xA435) => Some("LensSerialNumber"),
+        (_, 0x927C) => Some("MakerNote"),
         _ => None,
     };
     match known {
@@ -154,24 +161,104 @@ fn is_prefixed(kind: Kind, tag: u16) -> bool {
     }
 }
 
-fn decode_value(kind: Kind, tag: u16, typ: u16, value: &[u8], big: bool) -> Option<String> {
-    let text = if (TAG_XP_FIRST..=TAG_XP_LAST).contains(&tag) && kind != Kind::Gps {
-        if !matches!(typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED) {
-            return None;
+fn type_size(typ: u16) -> Option<usize> {
+    Some(match typ {
+        1 | 2 | 6 | 7 | TYPE_UTF8 => 1,
+        3 | 8 => 2,
+        4 | 9 | 11 | 13 => 4,
+        5 | 10 | 12 => 8,
+        _ => return None,
+    })
+}
+
+fn is_xp(kind: Kind, tag: u16) -> bool {
+    (TAG_XP_FIRST..=TAG_XP_LAST).contains(&tag) && kind != Kind::Gps
+}
+
+fn trim_nul(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |at| at + 1);
+    &bytes[..end]
+}
+
+fn clean_text(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let clean = !text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'));
+    clean.then(|| text.to_string())
+}
+
+struct Raw<'v> {
+    kind: Kind,
+    tag: u16,
+    typ: u16,
+    value: &'v [u8],
+    start: usize,
+    big: bool,
+}
+
+fn decode(raw: &Raw<'_>) -> Vec<Value> {
+    let name = tag_name(raw.kind, raw.tag);
+    let end = raw.start + raw.value.len();
+    let one = |text: String| {
+        let text = text.trim_end_matches('\0').to_string();
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![Value {
+                name: name.clone(),
+                text,
+                start: raw.start,
+                end,
+                hidden: false,
+            }]
         }
-        utf16(value, false)
-    } else if is_prefixed(kind, tag) {
-        if !matches!(typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED) {
-            return None;
-        }
-        decode_prefixed(value, big)?
-    } else if typ == TYPE_ASCII {
-        lossy(value)
-    } else {
-        return None;
     };
-    let trimmed = text.trim_end_matches('\0');
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    if is_xp(raw.kind, raw.tag) {
+        return one(utf16(raw.value, false));
+    }
+    if is_prefixed(raw.kind, raw.tag) {
+        if !matches!(raw.typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED) {
+            return Vec::new();
+        }
+        return one(decode_prefixed(raw.value, raw.big).unwrap_or_else(|| lossy(raw.value)));
+    }
+    match raw.typ {
+        TYPE_ASCII => {
+            let trimmed = trim_nul(raw.value);
+            let split = trimmed.iter().position(|&b| b == 0);
+            match split.filter(|_| raw.tag != TAG_COPYRIGHT) {
+                Some(nul) => {
+                    let mut values = Vec::new();
+                    let shown = lossy(&trimmed[..nul]);
+                    if !shown.is_empty() {
+                        values.push(Value {
+                            name: name.clone(),
+                            text: shown,
+                            start: raw.start,
+                            end: raw.start + nul,
+                            hidden: false,
+                        });
+                    }
+                    let after = lossy(&trimmed[nul + 1..]);
+                    let after = after.trim_matches('\0');
+                    if !after.is_empty() {
+                        values.push(Value {
+                            name: name.clone(),
+                            text: after.to_string(),
+                            start: raw.start + nul + 1,
+                            end,
+                            hidden: true,
+                        });
+                    }
+                    values
+                }
+                None => one(lossy(trimmed)),
+            }
+        }
+        TYPE_UTF8 => one(lossy(raw.value)),
+        _ => clean_text(trim_nul(raw.value)).map_or_else(Vec::new, one),
+    }
 }
 
 #[derive(Default)]
@@ -179,6 +266,7 @@ struct Pointers {
     exif: Option<usize>,
     gps: Option<usize>,
     interop: Option<usize>,
+    subs: Vec<usize>,
     next: Option<usize>,
 }
 
@@ -192,10 +280,35 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
+    fn sub_ifds(&mut self, entry_at: usize, count: u32, pointer: Option<usize>) -> Vec<usize> {
+        let len = usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(4));
+        let at = len.and_then(|len| {
+            if len <= 4 {
+                Some(entry_at + 8)
+            } else {
+                pointer
+            }
+        });
+        let Some(array) = at.zip(len).and_then(|(at, len)| sub(self.tiff, at, len)) else {
+            self.outcome.malformed = true;
+            return Vec::new();
+        };
+        array
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter_map(|raw| self.order.u32(raw, 0))
+            .filter_map(|offset| usize::try_from(offset).ok())
+            .collect()
+    }
+
     fn ifd(&mut self, offset: usize, kind: Kind) -> Pointers {
         let mut pointers = Pointers::default();
         let order = self.order;
         let Some(declared) = order.u16(self.tiff, offset) else {
+            self.outcome.malformed = true;
             return pointers;
         };
         let declared = usize::from(declared);
@@ -208,13 +321,12 @@ impl Walk<'_> {
                 self.outcome.timed_out = true;
                 return pointers;
             }
-            let Some(entry_at) = index
+            let entry = index
                 .checked_mul(ENTRY_LEN)
                 .and_then(|n| n.checked_add(entries_at))
-            else {
-                break;
-            };
-            let Some(entry) = sub(self.tiff, entry_at, ENTRY_LEN) else {
+                .and_then(|at| Some((at, sub(self.tiff, at, ENTRY_LEN)?)));
+            let Some((entry_at, entry)) = entry else {
+                self.outcome.malformed = true;
                 break;
             };
             let (Some(tag), Some(typ), Some(n)) = (
@@ -222,59 +334,23 @@ impl Walk<'_> {
                 order.u16(entry, 2),
                 order.u32(entry, 4),
             ) else {
+                self.outcome.malformed = true;
                 break;
             };
             let pointer = order.u32(entry, 8).and_then(|o| usize::try_from(o).ok());
-            match (kind, tag) {
-                (Kind::Ifd0, TAG_EXIF_IFD) => {
-                    pointers.exif = pointer;
-                    continue;
+            match tag {
+                TAG_EXIF_IFD => pointers.exif = pointer,
+                TAG_GPS_IFD => pointers.gps = pointer,
+                TAG_INTEROP_IFD => pointers.interop = pointer,
+                TAG_SUB_IFDS => pointers.subs = self.sub_ifds(entry_at, n, pointer),
+                _ => {
+                    if !self.value(kind, (tag, typ, n), entry_at, pointer) {
+                        return pointers;
+                    }
                 }
-                (Kind::Ifd0, TAG_GPS_IFD) => {
-                    pointers.gps = pointer;
-                    continue;
-                }
-                (Kind::Exif, TAG_INTEROP_IFD) => {
-                    pointers.interop = pointer;
-                    continue;
-                }
-                _ => {}
-            }
-            if !matches!(typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED) {
-                continue;
-            }
-            let Ok(len) = usize::try_from(n) else {
-                continue;
-            };
-            let start = if len <= 4 {
-                Some(entry_at + 8)
-            } else {
-                pointer
-            };
-            let Some(start) = start else {
-                continue;
-            };
-            let Some(value) = sub(self.tiff, start, len) else {
-                continue;
-            };
-            if !self.seen.insert((start, len)) {
-                continue;
-            }
-            let Some(text) = decode_value(kind, tag, typ, value, order.big) else {
-                continue;
-            };
-            let value = Value {
-                name: tag_name(kind, tag),
-                text,
-                start,
-                end: start + len,
-            };
-            if !(self.emit)(value) {
-                self.outcome.stopped = true;
-                return pointers;
             }
         }
-        if kind == Kind::Ifd0 {
+        if matches!(kind, Kind::Ifd0 | Kind::Ifd1) {
             pointers.next = declared
                 .checked_mul(ENTRY_LEN)
                 .and_then(|n| n.checked_add(entries_at))
@@ -283,6 +359,48 @@ impl Walk<'_> {
                 .filter(|&o| o != 0);
         }
         pointers
+    }
+
+    fn value(
+        &mut self,
+        kind: Kind,
+        (tag, typ, count): (u16, u16, u32),
+        entry_at: usize,
+        pointer: Option<usize>,
+    ) -> bool {
+        let text_type =
+            is_xp(kind, tag) || matches!(typ, TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED | TYPE_UTF8);
+        let len = type_size(typ).and_then(|size| usize::try_from(count).ok()?.checked_mul(size));
+        let (true, Some(len)) = (text_type, len) else {
+            return true;
+        };
+        let start = if len <= 4 {
+            Some(entry_at + 8)
+        } else {
+            pointer
+        };
+        let Some((start, value)) = start.and_then(|s| Some((s, sub(self.tiff, s, len)?))) else {
+            self.outcome.malformed = true;
+            return true;
+        };
+        if !self.seen.insert((start, len)) {
+            return true;
+        }
+        let raw = Raw {
+            kind,
+            tag,
+            typ,
+            value,
+            start,
+            big: self.order.big,
+        };
+        for value in decode(&raw) {
+            if !(self.emit)(value) {
+                self.outcome.stopped = true;
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -320,18 +438,22 @@ pub(crate) fn parse_values(
         let (offset, kind) = queue[index];
         index += 1;
         let pointers = walk.ifd(offset, kind);
-        let found = [
+        let mut found = vec![
             (pointers.exif, Kind::Exif),
             (pointers.gps, Kind::Gps),
             (pointers.interop, Kind::Interop),
-            (pointers.next, Kind::Ifd1),
         ];
+        found.extend(pointers.subs.iter().map(|&at| (Some(at), Kind::Ifd1)));
+        found.push((pointers.next, Kind::Ifd1));
         for (pointer, kind) in found {
-            if let Some(at) = pointer
-                && queue.len() < MAX_IFDS
-                && visited.insert(at)
-            {
+            let Some(at) = pointer.filter(|at| !visited.contains(at)) else {
+                continue;
+            };
+            if queue.len() < MAX_IFDS {
+                visited.insert(at);
                 queue.push((at, kind));
+            } else {
+                walk.outcome.ifd_limit = true;
             }
         }
     }
@@ -533,8 +655,11 @@ mod tests {
     }
 
     #[test]
-    fn user_comment_shorter_than_prefix_or_empty_body_gives_nothing() {
-        assert_eq!(exif_text_fields(&user_comment(LE, b"ASCII")), Ok(vec![]));
+    fn user_comment_shorter_than_its_prefix_is_read_and_an_empty_body_gives_nothing() {
+        assert_eq!(
+            exif_text_fields(&user_comment(LE, b"ASCII")),
+            Ok(vec![pair("UserComment", "ASCII")])
+        );
         assert_eq!(
             exif_text_fields(&user_comment(LE, b"ASCII\0\0\0")),
             Ok(vec![])
@@ -569,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn exif_ifd_pointer_is_followed_from_ifd0_only() {
+    fn exif_ifd_pointers_are_followed_from_any_ifd() {
         let mut tiff = header(LE);
         tiff.extend_from_slice(&u16b(LE, 1));
         tiff.extend_from_slice(&entry(LE, 0x8769, 4, 1, u32b(LE, 26)));
@@ -580,7 +705,196 @@ mod tests {
         tiff.extend_from_slice(&u16b(LE, 1));
         tiff.extend_from_slice(&entry(LE, 0x010F, 2, 3, *b"zz\0\0"));
         tiff.extend_from_slice(&[0, 0, 0, 0]);
-        assert_eq!(exif_text_fields(&tiff), Ok(vec![]));
+        assert_eq!(exif_text_fields(&tiff), Ok(vec![pair("Make", "zz")]));
+    }
+
+    fn malformed(tiff: &[u8]) -> bool {
+        parse_values(tiff, &|| false, &mut |_| true)
+            .unwrap()
+            .malformed
+    }
+
+    #[test]
+    fn blocks_with_out_of_range_parts_are_reported_as_malformed() {
+        let mut far = header(LE);
+        far[4..8].copy_from_slice(&u32b(LE, 0xFFFF_FFF0));
+        let mut outside = header(LE);
+        outside.extend_from_slice(&u16b(LE, 1));
+        outside.extend_from_slice(&entry(LE, 0x010E, 2, 6, u32b(LE, 0xFFFF_FFF0)));
+        outside.extend_from_slice(&[0, 0, 0, 0]);
+        let mut cut = header(LE);
+        cut.extend_from_slice(&u16b(LE, 2));
+        cut.extend_from_slice(&entry(LE, 0x010F, 2, 3, *b"ab\0\0"));
+        cut.extend_from_slice(&[0x0E, 0x01, 0x02]);
+        for tiff in [far, header(LE), outside, cut] {
+            assert!(malformed(&tiff), "{tiff:?}");
+        }
+        assert!(!malformed(&single_ifd(LE, 0x010E, 2, b"hello\0")));
+    }
+
+    fn chain(n: usize) -> Vec<u8> {
+        let mut tiff = header(LE);
+        for i in 0..n {
+            let next = if i + 1 < n { 8 + 18 * (i + 1) } else { 0 };
+            tiff.extend_from_slice(&u16b(LE, 1));
+            tiff.extend_from_slice(&entry(LE, 0x010F, 2, 2, *b"a\0\0\0"));
+            tiff.extend_from_slice(&u32b(LE, next as u32));
+        }
+        tiff
+    }
+
+    #[test]
+    fn more_than_sixteen_ifds_are_reported_as_an_ifd_limit() {
+        let (seen, outcome) = values(&chain(17));
+        assert_eq!(seen.len(), 16);
+        assert!(outcome.ifd_limit);
+        let (seen, outcome) = values(&chain(16));
+        assert_eq!(seen.len(), 16);
+        assert!(!outcome.ifd_limit);
+    }
+
+    #[test]
+    fn later_ifds_sub_ifds_and_pointers_outside_ifd0_are_followed() {
+        let mut tiff = header(LE);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x010F, 2, 2, *b"a\0\0\0"));
+        tiff.extend_from_slice(&u32b(LE, 26));
+        tiff.extend_from_slice(&u16b(LE, 3));
+        tiff.extend_from_slice(&entry(LE, 0x0110, 2, 2, *b"b\0\0\0"));
+        tiff.extend_from_slice(&entry(LE, 0x014A, 4, 1, u32b(LE, 68)));
+        tiff.extend_from_slice(&entry(LE, 0x8825, 4, 1, u32b(LE, 86)));
+        tiff.extend_from_slice(&u32b(LE, 104));
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x0131, 2, 2, *b"s\0\0\0"));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x0001, 2, 2, *b"N\0\0\0"));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x013B, 2, 2, *b"c\0\0\0"));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(tiff.len(), 122);
+        assert_eq!(
+            exif_text_fields(&tiff),
+            Ok(vec![
+                pair("Make", "a"),
+                pair("Model", "b"),
+                pair("GPSLatitudeRef", "N"),
+                pair("Software", "s"),
+                pair("Artist", "c")
+            ])
+        );
+        let mut array = header(LE);
+        array.extend_from_slice(&u16b(LE, 1));
+        array.extend_from_slice(&entry(LE, 0x014A, 4, 2, u32b(LE, 26)));
+        array.extend_from_slice(&[0, 0, 0, 0]);
+        array.extend_from_slice(&u32b(LE, 34));
+        array.extend_from_slice(&u32b(LE, 52));
+        array.extend_from_slice(&u16b(LE, 1));
+        array.extend_from_slice(&entry(LE, 0x010F, 2, 2, *b"x\0\0\0"));
+        array.extend_from_slice(&[0, 0, 0, 0]);
+        array.extend_from_slice(&u16b(LE, 1));
+        array.extend_from_slice(&entry(LE, 0x0110, 2, 2, *b"y\0\0\0"));
+        array.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            exif_text_fields(&array),
+            Ok(vec![pair("Make", "x"), pair("Model", "y")])
+        );
+    }
+
+    #[test]
+    fn utf8_typed_values_are_read() {
+        let tiff = single_ifd(LE, 0x010E, 129, "h\u{e9}llo\0".as_bytes());
+        assert_eq!(
+            exif_text_fields(&tiff),
+            Ok(vec![pair("ImageDescription", "h\u{e9}llo")])
+        );
+    }
+
+    #[test]
+    fn clean_utf8_byte_and_undefined_values_are_read() {
+        assert_eq!(
+            exif_text_fields(&single_ifd(LE, 0x927C, 7, b"Maker text\0\0")),
+            Ok(vec![pair("MakerNote", "Maker text")])
+        );
+        assert_eq!(
+            exif_text_fields(&single_ifd(LE, 0x1234, 1, b"plain words")),
+            Ok(vec![pair("Tag0x1234", "plain words")])
+        );
+        for binary in [&[1u8, 2, 0xFF, 0, 9, 9][..], b"a\x01bcde"] {
+            assert_eq!(
+                exif_text_fields(&single_ifd(LE, 0x927C, 7, binary)),
+                Ok(vec![])
+            );
+        }
+    }
+
+    #[test]
+    fn xp_tags_of_any_type_are_utf16le() {
+        let mut tiff = header(LE);
+        tiff.extend_from_slice(&u16b(LE, 1));
+        tiff.extend_from_slice(&entry(LE, 0x9C9B, 3, 2, [0x41, 0x00, 0x42, 0x00]));
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(exif_text_fields(&tiff), Ok(vec![pair("XPTitle", "AB")]));
+        let mut long = header(LE);
+        long.extend_from_slice(&u16b(LE, 1));
+        long.extend_from_slice(&entry(LE, 0x9C9C, 4, 1, [0x43, 0x00, 0x44, 0x00]));
+        long.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(exif_text_fields(&long), Ok(vec![pair("XPComment", "CD")]));
+        let mut rational = header(LE);
+        rational.extend_from_slice(&u16b(LE, 1));
+        rational.extend_from_slice(&entry(LE, 0x9C9D, 5, 1, u32b(LE, 26)));
+        rational.extend_from_slice(&[0, 0, 0, 0]);
+        rational.extend_from_slice(b"E F G H ");
+        assert_eq!(
+            exif_text_fields(&rational),
+            Ok(vec![pair("XPAuthor", "EFGH")])
+        );
+    }
+
+    fn shown(tiff: &[u8]) -> Vec<(String, String, usize, usize, bool)> {
+        let mut seen = Vec::new();
+        parse_values(tiff, &|| false, &mut |v: Value| {
+            seen.push((v.name, v.text, v.start, v.end, v.hidden));
+            true
+        })
+        .unwrap();
+        seen
+    }
+
+    #[test]
+    fn text_after_an_internal_nul_is_a_hidden_value() {
+        let tiff = single_ifd(LE, 0x010E, 2, b"shown\0hidden words\0");
+        assert_eq!(
+            shown(&tiff),
+            vec![
+                (
+                    "ImageDescription".to_string(),
+                    "shown".to_string(),
+                    26,
+                    31,
+                    false
+                ),
+                (
+                    "ImageDescription".to_string(),
+                    "hidden words".to_string(),
+                    32,
+                    45,
+                    true
+                )
+            ]
+        );
+        let copyright = single_ifd(LE, 0x8298, 2, b"photographer\0editor\0");
+        assert_eq!(
+            shown(&copyright),
+            vec![(
+                "Copyright".to_string(),
+                "photographer\0editor".to_string(),
+                26,
+                46,
+                false
+            )]
+        );
     }
 
     #[test]

@@ -21,6 +21,9 @@ use crate::text::TextDoc;
 
 pub(crate) const EVIDENCE_CAP: usize = 4096;
 const TRAILER_MESSAGE: &str = "data after the end of the image";
+const EXIF_BAD_HEADER: &str = "malformed EXIF: invalid TIFF header";
+const EXIF_OUTSIDE: &str = "malformed EXIF: entry or value outside the block";
+const EXIF_IFD_LIMIT: &str = "EXIF IFD limit";
 
 const FTYP_BRANDS: [&[u8; 4]; 9] = [
     b"avif", b"avis", b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1",
@@ -330,15 +333,15 @@ impl Sink {
                 Placement::Mapped(base) => (base + value.start, base + value.end),
                 Placement::Whole(start, end) => (start, end),
             };
-            self.carrier(
-                &format!("{label} {}", value.name),
-                &value.text,
-                start,
-                end,
-                evidence,
-            )
+            let label = format!("{label} {}", value.name);
+            if value.hidden {
+                self.hidden_carrier(&label, &value.text, start, end, evidence)
+            } else {
+                self.carrier(&label, &value.text, start, end, evidence)
+            }
         };
         let Ok(outcome) = exif::parse_values(tiff, &expired, &mut emit) else {
+            self.malformed(EXIF_BAD_HEADER, block_start, block_end);
             return;
         };
         if outcome.timed_out {
@@ -346,6 +349,12 @@ impl Sink {
         }
         if outcome.entry_limit && !self.stop {
             self.l001("EXIF entry limit", block_start, block_end);
+        }
+        if outcome.ifd_limit && !self.stop {
+            self.l001(EXIF_IFD_LIMIT, block_start, block_end);
+        }
+        if outcome.malformed {
+            self.malformed(EXIF_OUTSIDE, block_start, block_end);
         }
     }
 
@@ -629,6 +638,117 @@ mod tests {
         assert_eq!(finding.rule_id, "L001");
         assert_eq!(finding.span.byte_start, 100);
         assert_eq!(finding.span.byte_end, 100 + 12026);
+    }
+
+    fn tiff_with(entries: &[(u16, u16, u32, [u8; 4])], tail: &[u8]) -> Vec<u8> {
+        let mut v = vec![b'I', b'I', 0x2A, 0x00, 0x08, 0, 0, 0];
+        v.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, typ, count, value) in entries {
+            v.extend_from_slice(&tag.to_le_bytes());
+            v.extend_from_slice(&typ.to_le_bytes());
+            v.extend_from_slice(&count.to_le_bytes());
+            v.extend_from_slice(value);
+        }
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v.extend_from_slice(tail);
+        v
+    }
+
+    type Found = Vec<(&'static str, String, u64, u64)>;
+
+    fn exif_findings(tiff: &[u8]) -> (Found, Option<SkipReason>) {
+        let mut sink = Sink::new(100 + tiff.len());
+        sink.exif(tiff, 100, &plain_budget());
+        let found = sink
+            .out
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.rule_id,
+                    f.message.clone(),
+                    f.span.byte_start,
+                    f.span.byte_end,
+                )
+            })
+            .collect();
+        (found, sink.out.skip)
+    }
+
+    #[test]
+    fn exif_problems_reach_the_output_over_the_whole_block() {
+        let (found, skip) = exif_findings(b"XX*\0");
+        assert_eq!(
+            found,
+            vec![(
+                "L001",
+                "malformed EXIF: invalid TIFF header".to_string(),
+                100,
+                104
+            )]
+        );
+        assert_eq!(skip, Some(SkipReason::Malformed));
+        let outside = tiff_with(&[(0x010E, 2, 6, 0xFFFF_FFF0u32.to_le_bytes())], &[]);
+        let (found, skip) = exif_findings(&outside);
+        assert_eq!(
+            found,
+            vec![(
+                "L001",
+                "malformed EXIF: entry or value outside the block".to_string(),
+                100,
+                100 + outside.len() as u64
+            )]
+        );
+        assert_eq!(skip, Some(SkipReason::Malformed));
+        let mut chain = vec![b'I', b'I', 0x2A, 0x00, 0x08, 0, 0, 0];
+        for i in 0..17u32 {
+            let next = if i < 16 { 8 + 18 * (i + 1) } else { 0 };
+            chain.extend_from_slice(&1u16.to_le_bytes());
+            chain.extend_from_slice(&0x010Fu16.to_le_bytes());
+            chain.extend_from_slice(&2u16.to_le_bytes());
+            chain.extend_from_slice(&2u32.to_le_bytes());
+            chain.extend_from_slice(&[b'a', 0, 0, 0]);
+            chain.extend_from_slice(&next.to_le_bytes());
+        }
+        let (found, skip) = exif_findings(&chain);
+        assert_eq!(
+            found,
+            vec![(
+                "L001",
+                "EXIF IFD limit".to_string(),
+                100,
+                100 + chain.len() as u64
+            )]
+        );
+        assert_eq!(skip, Some(SkipReason::SizeLimit));
+    }
+
+    #[test]
+    fn text_after_an_internal_exif_nul_is_a_hidden_carrier() {
+        let tiff = tiff_with(&[(0x010E, 2, 13, 26u32.to_le_bytes())], b"shown\0hidden\0");
+        let mut sink = Sink::new(tiff.len());
+        sink.exif(&tiff, 0, &plain_budget());
+        let carriers: Vec<(&str, bool, CarrierKind)> = sink
+            .out
+            .carriers
+            .iter()
+            .map(|c| (c.text.as_str(), c.hidden, c.kind))
+            .collect();
+        assert_eq!(
+            carriers,
+            vec![
+                (
+                    "EXIF ImageDescription: shown",
+                    false,
+                    CarrierKind::MetadataField
+                ),
+                (
+                    "EXIF ImageDescription: hidden",
+                    true,
+                    CarrierKind::HiddenText
+                )
+            ]
+        );
     }
 
     #[test]

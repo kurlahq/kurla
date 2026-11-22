@@ -642,11 +642,13 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_exif_in_app1_is_ignored_and_walk_continues() {
+    fn corrupt_exif_in_app1_is_malformed_and_the_walk_continues() {
         let bytes = jpeg(&[seg(0xE1, b"Exif\0\0garbage"), seg(0xFE, b"after")]);
+        let out = scan_jpeg(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["JPEG COM: after"]);
         assert_eq!(
-            texts(&scan_jpeg(&bytes, &mut budget())),
-            vec!["JPEG COM: after"]
+            findings(&out),
+            vec![("L001", "malformed EXIF: invalid TIFF header", 12, 19)]
         );
     }
 
