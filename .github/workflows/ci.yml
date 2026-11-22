@@ -84,7 +84,7 @@ jobs:
       - name: Vet
         run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo vet --locked
       - name: Vet the fuzz workspace
-        run: docker run --rm -v "$PWD":/src -w /src kurla-dev cargo vet --locked --manifest-path fuzz/Cargo.toml
+        run: docker run --rm -v "$PWD":/src -w /src/fuzz kurla-dev cargo vet --locked
       - name: Cooldown
         run: cargo xtask cooldown-check
 

@@ -13,9 +13,6 @@ store = { path = "../supply-chain" }
 
 [workspace]
 
-[workspace.metadata.vet]
-store = { path = "../supply-chain" }
-
 [dependencies]
 libfuzzer-sys = "=0.4.13"
 kurla = { path = "..", version = "=0.1.0" }

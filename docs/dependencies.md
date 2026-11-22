@@ -61,7 +61,7 @@
 - Exceptions to the cooldown go in `supply-chain/cooldown-exceptions.toml`. The file is absent while there are none.
 - The fuzz workspace (`fuzz/`) has its own `fuzz/Cargo.lock`, vendored into the same `vendor/` directory with `cargo vendor --sync fuzz/Cargo.toml vendor`. `cargo xtask cooldown-check` checks both lock files, and a missing `fuzz/Cargo.lock` is an error. The fuzz crate is never part of the shipped binary.
 - `cc` was pinned at 1.11.1 with `cargo update --precise`, because 1.11.2 and 1.11.3 were younger than the cutoff.
-- cargo-deny, cargo-vet and cargo-audit run against the fuzz workspace as well. The cargo-vet store is shared: `fuzz/Cargo.toml` points `store` at `../supply-chain`.
+- cargo-deny, cargo-vet and cargo-audit run against the fuzz workspace as well. The cargo-vet store is shared: `[package.metadata.vet]` in `fuzz/Cargo.toml` points `store` at `../supply-chain`. cargo-vet 0.10.3 uses that path as written, relative to the working directory, so CI runs `cargo vet` from `fuzz/`. It refuses a manifest that sets both `[package.metadata.vet]` and `[workspace.metadata.vet]`.
 
 ## cargo-vet
 
