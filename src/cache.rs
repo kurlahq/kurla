@@ -19,10 +19,10 @@ const KEY_LEN: usize = 64;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const RULE_IDS: [&str; 27] = [
+const RULE_IDS: [&str; 28] = [
     "A001", "A002", "A003", "A004", "A005", "A006", "A007", "A008", "A009", "A010", "B002", "B003",
-    "E001", "I002", "L001", "L002", "M002", "S002", "S003", "S004", "U001", "U002", "U003", "U004",
-    "U005", "U006", "U007",
+    "B004", "E001", "I002", "L001", "L002", "M002", "S002", "S003", "S004", "U001", "U002", "U003",
+    "U004", "U005", "U006", "U007",
 ];
 
 fn rule_id(name: &str) -> Option<&'static str> {
@@ -917,6 +917,21 @@ mod tests {
             (CarrierKind::ResourceLimit, u64::MAX),
         ]);
         let stored: Cached = (findings, cov, counts);
+        let key = base_key(&cache);
+        assert!(cache.put(&key, &stored));
+        assert_eq!(cache.get(&key), Some(stored));
+    }
+
+    #[test]
+    fn a_b004_finding_is_cached_and_read_back() {
+        let dir = TestDir::new();
+        let cache = open(&dir);
+        let mut b004 = finding(Severity::High, None);
+        b004.raw.rule_id = "B004";
+        b004.raw.family = Family::B;
+        b004.raw.carrier = CarrierKind::HiddenText;
+        let mut stored = value();
+        stored.0 = vec![b004];
         let key = base_key(&cache);
         assert!(cache.put(&key, &stored));
         assert_eq!(cache.get(&key), Some(stored));

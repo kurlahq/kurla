@@ -1,13 +1,13 @@
 use crate::agent_files::{active_commands, is_agent_file};
 use crate::aimed::{self, PatternHit};
 use crate::binary::{self, scan_avif, scan_gif, scan_jpeg, scan_png, scan_webp};
-use crate::encoded::{EmbeddedBlob, EncodedOutput, scan_encoded};
+use crate::encoded::{EncodedOutput, scan_encoded};
 use crate::limits::{Budget, Limits};
 use crate::location;
 use crate::markup::{Markup, scan_markup};
 use crate::model::{
-    Carrier, CarrierKind, DetectorOutput, EmbeddedNotScanned, Family, FileCoverage, FileKind,
-    Finding, LocationKind, RawFinding, RuleStatus, Severity, SkipReason, Span,
+    Carrier, CarrierKind, DetectorOutput, EmbeddedBlob, EmbeddedNotScanned, Family, FileCoverage,
+    FileKind, Finding, LocationKind, RawFinding, RuleStatus, Severity, SkipReason, Span,
 };
 use crate::severity::finalize;
 use crate::svg::{MALFORMED_XML, scan_svg};
@@ -23,6 +23,7 @@ pub const RULES_VERSION: &str = "1";
 const SNIFF_PREFIX: usize = 8192;
 const PAYLOAD_CAP: usize = 256;
 const EVIDENCE_CAP: usize = 4096;
+const EMBEDDED_DEPTH_LIMIT: &str = "embedded file depth limit";
 
 struct Entry {
     raw: RawFinding,
@@ -289,6 +290,29 @@ impl<'a> Engine<'a> {
                 aimed_only: false,
             });
         }
+        for blob in out.embedded {
+            self.route_embedded(blob, depth.saturating_add(1), remap);
+        }
+    }
+
+    fn route_embedded(&mut self, blob: EmbeddedBlob, depth: u8, remap: Option<Span>) {
+        let scannable = matches!(
+            blob.kind,
+            FileKind::Png | FileKind::Jpeg | FileKind::Gif | FileKind::Webp | FileKind::Avif
+        );
+        if scannable && depth > self.limits.max_decode_depth {
+            let span = remap.unwrap_or(blob.span);
+            self.push(limit_finding("L001", EMBEDDED_DEPTH_LIMIT, span));
+            self.note_skip(Some(SkipReason::SizeLimit));
+            self.embedded.push(EmbeddedNotScanned {
+                span,
+                declared_type: blob.declared_type,
+                kind: blob.kind,
+                reason: EMBEDDED_DEPTH_LIMIT.to_string(),
+            });
+            return;
+        }
+        self.route_blob(blob, depth, remap);
     }
 
     fn absorb_encoded(&mut self, encoded: EncodedOutput, depth: u8, remap: Option<Span>) {
@@ -1572,6 +1596,7 @@ mod tests {
             findings: vec![limit_finding(rule, message, tail_span(10, 20))],
             carriers,
             skip: None,
+            embedded: Vec::new(),
         }
     }
 
@@ -1673,5 +1698,83 @@ mod tests {
         let hidden_only = "<svg xmlns=\"http://www.w3.org/2000/svg\"><text display=\"none\">hello there</text></svg>";
         let (_, _, counts) = scan("a.svg", hidden_only.as_bytes());
         assert!(counts.is_empty());
+    }
+
+    fn png_ending_with(trailer: &[u8]) -> Vec<u8> {
+        let mut v = PNG_SIGNATURE.to_vec();
+        v.extend_from_slice(&png_chunk(b"IEND", &[]));
+        v.extend_from_slice(trailer);
+        v
+    }
+
+    #[test]
+    fn a_png_trailer_is_b004_high_and_critical_when_instruction_like() {
+        let (findings, _, _) = scan("a.png", &png_ending_with(b"note for the reader"));
+        assert_eq!(rule_ids(&findings), vec!["B004"]);
+        assert_eq!(findings[0].severity, Severity::High);
+        let (findings, _, _) = scan("a.png", &png_ending_with(PHRASE.as_bytes()));
+        assert_eq!(rule_ids(&findings), vec!["B004"]);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].raw.span.byte_start, 20);
+    }
+
+    #[test]
+    fn a_zip_after_iend_is_listed_as_embedded_and_not_scanned() {
+        let bytes = png_ending_with(b"PK\x03\x04rest of a zip");
+        let (findings, coverage, _) = scan("a.png", &bytes);
+        assert_eq!(rule_ids(&findings), vec!["B004"]);
+        assert_eq!(
+            coverage.embedded_not_scanned,
+            vec![EmbeddedNotScanned {
+                span: Span {
+                    byte_start: 20,
+                    byte_end: bytes.len() as u64,
+                    line: None,
+                    column: None,
+                },
+                declared_type: None,
+                kind: FileKind::UnknownBinary,
+                reason: "zip content not scanned".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_image_after_iend_is_scanned_as_an_embedded_image() {
+        let bytes = png_ending_with(&jpeg_with_comment(PHRASE));
+        let (findings, coverage, _) = scan("a.png", &bytes);
+        let aimed: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.raw.family == Family::A)
+            .collect();
+        assert!(!aimed.is_empty());
+        assert!(
+            aimed
+                .iter()
+                .all(|f| f.raw.carrier == CarrierKind::MetadataField
+                    && f.raw.span.byte_start == 20
+                    && f.raw.span.byte_end == bytes.len() as u64)
+        );
+        assert!(coverage.embedded_not_scanned.is_empty());
+    }
+
+    #[test]
+    fn embedded_images_past_the_decode_depth_are_listed_with_l001() {
+        let mut chain = png_ending_with(&[]);
+        for _ in 0..3 {
+            chain = png_ending_with(&chain);
+        }
+        let (findings, coverage, _) = scan("a.png", &chain);
+        let l001 = of_rule(&findings, "L001");
+        assert_eq!(l001.len(), 1);
+        assert_eq!(l001[0].raw.message, "embedded file depth limit");
+        assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(coverage.embedded_not_scanned.len(), 1);
+        assert_eq!(coverage.embedded_not_scanned[0].kind, FileKind::Png);
+        assert_eq!(
+            coverage.embedded_not_scanned[0].reason,
+            "embedded file depth limit"
+        );
+        assert_eq!(of_rule(&findings, "B004").len(), 3);
     }
 }

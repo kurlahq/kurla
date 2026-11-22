@@ -293,6 +293,7 @@ fn limit_output(skip: Option<SkipReason>, rule: &'static str) -> DetectorOutput 
         findings: vec![raw],
         carriers: Vec::new(),
         skip,
+        embedded: Vec::new(),
     }
 }
 
@@ -301,6 +302,7 @@ fn quiet_output() -> DetectorOutput {
         findings: Vec::new(),
         carriers: Vec::new(),
         skip: None,
+        embedded: Vec::new(),
     }
 }
 

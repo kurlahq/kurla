@@ -12,7 +12,8 @@ const CRC_LEN: usize = 4;
 const CORRUPT_STREAM: &str = "malformed PNG: compressed text is not a valid zlib stream";
 const UNKNOWN_METHOD: &str = "malformed PNG: unknown compression method";
 const TRUNCATED_CHUNK: &str = "malformed PNG: truncated chunk";
-const INCOMPLETE_HEADER: &str = "malformed PNG: text chunk header is incomplete";
+const INCOMPLETE_HEADER: &str = "malformed PNG: chunk header is incomplete";
+const TRAILER_LABEL: &str = "PNG data after IEND";
 
 pub(crate) enum Inflated {
     Text(Vec<u8>),
@@ -70,6 +71,11 @@ fn read_chunk(bytes: &[u8], at: usize) -> Option<Chunk<'_>> {
     })
 }
 
+fn part_span(chunk: &Chunk<'_>, part: &[u8]) -> (usize, usize) {
+    let start = chunk.data_start + (part.as_ptr().addr() - chunk.data.as_ptr().addr());
+    (start, start + part.len())
+}
+
 fn split_nul(data: &[u8]) -> (&[u8], Option<&[u8]>) {
     match data.iter().position(|&b| b == 0) {
         Some(at) => (&data[..at], Some(&data[at + 1..])),
@@ -111,6 +117,44 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
+    fn part_carrier(&mut self, chunk: &Chunk<'_>, label: &str, part: &[u8]) {
+        let (start, end) = part_span(chunk, part);
+        self.sink
+            .carrier(label, &latin1(part), start, end, chunk.data);
+    }
+
+    fn name_chunk(&mut self, chunk: &Chunk<'_>, label: &str) {
+        match split_nul(chunk.data) {
+            (name, Some(_)) => self.part_carrier(chunk, label, name),
+            (_, None) => self.incomplete_header(chunk),
+        }
+    }
+
+    fn pcal_chunk(&mut self, chunk: &Chunk<'_>) {
+        let (name, rest) = split_nul(chunk.data);
+        let Some(rest) = rest else {
+            self.incomplete_header(chunk);
+            return;
+        };
+        self.part_carrier(chunk, "PNG pCAL name", name);
+        let (Some(&count), Some(strings)) = (rest.get(9), rest.get(10..)) else {
+            self.incomplete_header(chunk);
+            return;
+        };
+        let mut pieces = strings.split(|&b| b == 0);
+        if let Some(unit) = pieces.next() {
+            self.part_carrier(chunk, "PNG pCAL unit", unit);
+        }
+        let mut parameters = 0usize;
+        for parameter in pieces {
+            parameters += 1;
+            self.part_carrier(chunk, "PNG pCAL parameter", parameter);
+        }
+        if parameters != usize::from(count) {
+            self.incomplete_header(chunk);
+        }
+    }
+
     fn incomplete_header(&mut self, chunk: &Chunk<'_>) {
         self.sink.malformed(
             INCOMPLETE_HEADER,
@@ -198,6 +242,7 @@ impl Walker<'_> {
         let start = chunk.data_start + keyword.len() + 2;
         let span = (start, start + compressed.len());
         if method != 0 {
+            self.text_carrier("zTXt", chunk, keyword, "", span);
             self.sink.malformed(UNKNOWN_METHOD, span.0, span.1);
             return;
         }
@@ -234,6 +279,7 @@ impl Walker<'_> {
         if header.flag == 0 {
             self.text_carrier("iTXt", chunk, header.keyword, &lossy(body), span);
         } else if header.method != 0 {
+            self.text_carrier("iTXt", chunk, header.keyword, "", span);
             self.sink.malformed(UNKNOWN_METHOD, span.0, span.1);
         } else if let Some(text) = self.inflated(body, start) {
             self.text_carrier("iTXt", chunk, header.keyword, &lossy(&text), span);
@@ -257,8 +303,15 @@ impl Walker<'_> {
                 b"tEXt" => self.text_chunk(&chunk),
                 b"zTXt" => self.ztxt_chunk(&chunk),
                 b"iTXt" => self.itxt_chunk(&chunk),
+                b"iCCP" => self.name_chunk(&chunk, "PNG iCCP profile name"),
+                b"sPLT" => self.name_chunk(&chunk, "PNG sPLT palette name"),
+                b"pCAL" => self.pcal_chunk(&chunk),
                 b"eXIf" => self.sink.exif(chunk.data, chunk.data_start, &*self.budget),
-                b"IEND" => return,
+                b"IEND" => {
+                    let after = chunk.data_start + chunk.data.len() + CRC_LEN;
+                    self.sink.trailer(TRAILER_LABEL, bytes, after, true);
+                    return;
+                }
                 _ => {}
             }
             if self.sink.stop {
@@ -292,7 +345,7 @@ pub fn scan_png(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
 mod tests {
     use super::*;
     use crate::limits::Limits;
-    use crate::model::{CarrierKind, Family, RuleStatus, Severity, SkipReason};
+    use crate::model::{CarrierKind, Family, FileKind, RuleStatus, Severity, SkipReason};
     use miniz_oxide::deflate::compress_to_vec_zlib;
     use std::time::Duration;
 
@@ -576,7 +629,11 @@ mod tests {
         let out = scan_png(&bytes, &mut budget());
         assert_eq!(
             texts(&out),
-            vec!["PNG zTXt keyword: K", "PNG tEXt After: ok"]
+            vec![
+                "PNG zTXt keyword: K",
+                "PNG zTXt keyword: K",
+                "PNG tEXt After: ok"
+            ]
         );
         assert_eq!(
             findings(&out),
@@ -635,12 +692,7 @@ mod tests {
         );
         assert_eq!(
             findings(&out),
-            vec![(
-                "L001",
-                "malformed PNG: text chunk header is incomplete",
-                16,
-                33
-            )]
+            vec![("L001", "malformed PNG: chunk header is incomplete", 16, 33)]
         );
         assert_eq!(out.skip, Some(SkipReason::Malformed));
     }
@@ -663,7 +715,7 @@ mod tests {
                 findings(&out),
                 vec![(
                     "L001",
-                    "malformed PNG: text chunk header is incomplete",
+                    "malformed PNG: chunk header is incomplete",
                     16,
                     16 + data.len() as u64
                 )],
@@ -695,14 +747,102 @@ mod tests {
     }
 
     #[test]
-    fn parse_stops_at_iend() {
+    fn chunks_after_iend_are_not_parsed_and_are_a_trailer() {
         let bytes = png(&[
             chunk(b"tEXt", b"A\0one"),
             chunk(b"IEND", &[]),
             chunk(b"tEXt", b"B\0two"),
         ]);
         let out = scan_png(&bytes, &mut budget());
-        assert_eq!(texts(&out), vec!["PNG tEXt A: one"]);
+        let visible: Vec<&str> = out
+            .carriers
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(visible, vec!["PNG tEXt A: one"]);
+        assert_eq!(
+            findings(&out),
+            vec![(
+                "B004",
+                "data after the end of the image",
+                37,
+                bytes.len() as u64
+            )]
+        );
+    }
+
+    #[test]
+    fn data_after_iend_is_a_hidden_carrier_with_b004() {
+        let mut bytes = png(&[chunk(b"tEXt", b"A\0one"), chunk(b"IEND", &[])]);
+        bytes.extend_from_slice(b"note for the reader");
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(
+            texts(&out),
+            vec![
+                "PNG tEXt A: one",
+                "PNG data after IEND: note for the reader"
+            ]
+        );
+        let trailer = &out.carriers[1];
+        assert!(trailer.hidden);
+        assert_eq!(trailer.kind, CarrierKind::HiddenText);
+        assert_eq!((trailer.span.byte_start, trailer.span.byte_end), (37, 56));
+        assert_eq!(trailer.evidence, b"note for the reader".to_vec());
+        assert_eq!(
+            findings(&out),
+            vec![("B004", "data after the end of the image", 37, 56)]
+        );
+        let b004 = &out.findings[0];
+        assert_eq!(
+            (b004.family, b004.base, b004.status, b004.carrier),
+            (
+                Family::B,
+                Severity::High,
+                RuleStatus::Stable,
+                CarrierKind::HiddenText
+            )
+        );
+        assert_eq!(out.skip, None);
+        assert!(out.embedded.is_empty());
+    }
+
+    #[test]
+    fn a_trailer_of_only_nul_bytes_or_ascii_whitespace_gives_nothing() {
+        let tails: [&[u8]; 3] = [b"\0\0\0\0", b" \t\r\n\x0C", b"\0 \n\0"];
+        for tail in tails {
+            let mut bytes = png(&[chunk(b"IEND", &[])]);
+            bytes.extend_from_slice(tail);
+            let out = scan_png(&bytes, &mut budget());
+            assert!(out.carriers.is_empty(), "{tail:?}");
+            assert!(out.findings.is_empty(), "{tail:?}");
+            assert!(out.embedded.is_empty(), "{tail:?}");
+        }
+    }
+
+    #[test]
+    fn a_recognised_file_after_iend_is_embedded_as_well_as_b004() {
+        let zip: &[u8] = b"PK\x03\x04rest of a zip";
+        let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xFE, 0x00, 0x04, b'h', b'i', 0xFF, 0xD9];
+        let cases = [
+            (zip, FileKind::UnknownBinary, Some("zip"), Vec::new()),
+            (jpeg, FileKind::Jpeg, None, jpeg.to_vec()),
+        ];
+        for (tail, kind, format, kept) in cases {
+            let mut bytes = png(&[chunk(b"IEND", &[])]);
+            bytes.extend_from_slice(tail);
+            let out = scan_png(&bytes, &mut budget());
+            let ids: Vec<&str> = out.findings.iter().map(|f| f.rule_id).collect();
+            assert_eq!(ids, vec!["B004"]);
+            assert_eq!(out.embedded.len(), 1);
+            let blob = &out.embedded[0];
+            assert_eq!((blob.kind, blob.format), (kind, format));
+            assert_eq!(
+                (blob.span.byte_start, blob.span.byte_end),
+                (20, bytes.len() as u64)
+            );
+            assert_eq!(blob.bytes, kept);
+        }
     }
 
     #[test]
@@ -947,14 +1087,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_compression_method_marks_the_png_malformed() {
+    fn an_unknown_compression_method_keeps_the_keyword_and_marks_the_png_malformed() {
         let cases = [
-            (png(&[chunk(b"zTXt", b"K\0\x01\x78\x01")]), 19, 21),
-            (png(&[chunk(b"iTXt", b"T\0\x01\x01\0\0\x78\x01")]), 22, 24),
+            (
+                png(&[chunk(b"zTXt", b"K\0\x01\x78\x01")]),
+                19,
+                21,
+                "PNG zTXt keyword: K",
+            ),
+            (
+                png(&[chunk(b"iTXt", b"T\0\x01\x01\0\0\x78\x01")]),
+                22,
+                24,
+                "PNG iTXt keyword: T",
+            ),
         ];
-        for (bytes, start, end) in cases {
+        for (bytes, start, end, keyword) in cases {
             let out = scan_png(&bytes, &mut budget());
-            assert!(out.carriers.is_empty());
+            assert_eq!(texts(&out), vec![keyword]);
             assert_eq!(
                 findings(&out),
                 vec![(
@@ -965,6 +1115,71 @@ mod tests {
                 )]
             );
             assert_eq!(out.skip, Some(SkipReason::Malformed));
+        }
+    }
+
+    fn pcal(name: &[u8], count: u8, rest: &[u8]) -> Vec<u8> {
+        let mut data = name.to_vec();
+        data.push(0);
+        data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1, 0, count]);
+        data.extend_from_slice(rest);
+        data
+    }
+
+    #[test]
+    fn iccp_splt_and_pcal_names_are_carriers() {
+        let bytes = png(&[
+            chunk(b"iCCP", b"sRGB profile\0\0\x78\x01"),
+            chunk(b"sPLT", b"Palette one\0\x08\x01\x02\x03\x04\x00\x01"),
+            chunk(b"pCAL", &pcal(b"Cal name", 2, b"metres\x001.0\x002.5")),
+            chunk(b"pCAL", &pcal(b"Bare", 0, b"")),
+        ]);
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(
+            texts(&out),
+            vec![
+                "PNG iCCP profile name: sRGB profile",
+                "PNG sPLT palette name: Palette one",
+                "PNG pCAL name: Cal name",
+                "PNG pCAL unit: metres",
+                "PNG pCAL parameter: 1.0",
+                "PNG pCAL parameter: 2.5",
+                "PNG pCAL name: Bare"
+            ]
+        );
+        let spans: Vec<(u64, u64)> = out
+            .carriers
+            .iter()
+            .map(|c| (c.span.byte_start, c.span.byte_end))
+            .collect();
+        assert_eq!(spans[0], (16, 28));
+        assert_eq!(spans[3], (94, 100));
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
+    }
+
+    #[test]
+    fn iccp_splt_and_pcal_with_broken_headers_mark_the_png_malformed() {
+        let cases: [(&[u8; 4], Vec<u8>); 5] = [
+            (b"iCCP", b"no separator".to_vec()),
+            (b"sPLT", b"no separator".to_vec()),
+            (b"pCAL", b"no separator".to_vec()),
+            (b"pCAL", b"Name\0\0\0\0\0\0\0\0\0\0".to_vec()),
+            (b"pCAL", pcal(b"Name", 2, b"metres\x001.0")),
+        ];
+        for (kind, data) in cases {
+            let out = scan_png(&png(&[chunk(kind, &data)]), &mut budget());
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed PNG: chunk header is incomplete",
+                    16,
+                    16 + data.len() as u64
+                )],
+                "{data:?}"
+            );
+            assert_eq!(out.skip, Some(SkipReason::Malformed), "{data:?}");
         }
     }
 }

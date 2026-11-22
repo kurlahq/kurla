@@ -2,8 +2,8 @@ use crate::binary;
 use crate::limits::Budget;
 use crate::markup::decode_references;
 use crate::model::{
-    Carrier, CarrierKind, DetectorOutput, Family, FileKind, RawFinding, RuleStatus, Severity,
-    SkipReason, Span,
+    Carrier, CarrierKind, DetectorOutput, EmbeddedBlob, Family, FileKind, RawFinding, RuleStatus,
+    Severity, SkipReason, Span,
 };
 use crate::text::TextDoc;
 use crate::unicode::is_default_ignorable;
@@ -15,15 +15,6 @@ const EVIDENCE_CAP: usize = 4096;
 const TICK_INTERVAL: usize = 4096;
 const MIN_PRINTABLE_PERCENT: usize = 90;
 const MIN_WORDS: usize = 3;
-
-pub struct EmbeddedBlob {
-    pub kind: FileKind,
-    pub declared_type: Option<String>,
-    pub format: Option<&'static str>,
-    pub span: Span,
-    pub bytes: Vec<u8>,
-    pub evidence: Vec<u8>,
-}
 
 pub struct EncodedOutput {
     pub out: DetectorOutput,
@@ -797,6 +788,7 @@ pub fn scan_encoded(doc: &TextDoc, depth: u8, budget: &mut Budget) -> EncodedOut
             findings: scanner.findings,
             carriers: scanner.carriers,
             skip,
+            embedded: Vec::new(),
         },
         blobs: scanner.blobs,
         not_payload_runs: if at_limit {

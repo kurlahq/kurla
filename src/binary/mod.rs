@@ -14,12 +14,13 @@ pub use xmp::xmp_text;
 
 use crate::limits::Budget;
 use crate::model::{
-    Carrier, CarrierKind, DetectorOutput, Family, FileKind, RawFinding, RuleStatus, Severity,
-    SkipReason, Span,
+    Carrier, CarrierKind, DetectorOutput, EmbeddedBlob, Family, FileKind, RawFinding, RuleStatus,
+    Severity, SkipReason, Span,
 };
 use crate::text::TextDoc;
 
 pub(crate) const EVIDENCE_CAP: usize = 4096;
+const TRAILER_MESSAGE: &str = "data after the end of the image";
 
 const FTYP_BRANDS: [&[u8; 4]; 9] = [
     b"avif", b"avis", b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1",
@@ -98,6 +99,38 @@ pub fn sniff(bytes: &[u8], path: &str) -> FileKind {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    Shown,
+    Hidden,
+}
+
+fn embedded_blob(tail: &[u8], start: usize, end: usize) -> Option<EmbeddedBlob> {
+    let format = crate::encoded::unscannable_signature(tail);
+    let kind = match sniff(tail, "") {
+        kind @ (FileKind::Png
+        | FileKind::Jpeg
+        | FileKind::Gif
+        | FileKind::Webp
+        | FileKind::Avif
+        | FileKind::Pdf) => kind,
+        _ if format.is_some() => FileKind::UnknownBinary,
+        _ => return None,
+    };
+    Some(EmbeddedBlob {
+        kind,
+        declared_type: None,
+        format,
+        span: span(start, end),
+        bytes: if format.is_none() {
+            tail.to_vec()
+        } else {
+            Vec::new()
+        },
+        evidence: tail[..tail.len().min(EVIDENCE_CAP)].to_vec(),
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Placement {
     Mapped(usize),
@@ -120,6 +153,7 @@ impl Sink {
                 findings: Vec::new(),
                 carriers: Vec::new(),
                 skip: None,
+                embedded: Vec::new(),
             },
             stop: false,
             input_len,
@@ -195,6 +229,57 @@ impl Sink {
         end: usize,
         evidence: &[u8],
     ) -> bool {
+        self.push_carrier(Visibility::Shown, label, text, (start, end), evidence)
+    }
+
+    pub(crate) fn hidden_carrier(
+        &mut self,
+        label: &str,
+        text: &str,
+        start: usize,
+        end: usize,
+        evidence: &[u8],
+    ) -> bool {
+        self.push_carrier(Visibility::Hidden, label, text, (start, end), evidence)
+    }
+
+    pub(crate) fn trailer(&mut self, label: &str, bytes: &[u8], start: usize, flag_known: bool) {
+        let Some(tail) = bytes.get(start..) else {
+            return;
+        };
+        if tail.iter().all(|&b| b == 0 || b.is_ascii_whitespace()) {
+            return;
+        }
+        let end = bytes.len();
+        let blob = embedded_blob(tail, start, end);
+        let flagged = flag_known || blob.is_none();
+        self.out.embedded.extend(blob);
+        if !flagged {
+            return;
+        }
+        self.out.findings.push(RawFinding {
+            rule_id: "B004",
+            family: Family::B,
+            base: Severity::High,
+            status: RuleStatus::Stable,
+            span: span(start, end),
+            carrier: CarrierKind::HiddenText,
+            payload: None,
+            message: TRAILER_MESSAGE.to_string(),
+            evidence: tail[..tail.len().min(EVIDENCE_CAP)].to_vec(),
+        });
+        let text = TextDoc::decode(tail).map_or_else(|| lossy(tail), |doc| doc.text);
+        self.hidden_carrier(label, &text, start, end, tail);
+    }
+
+    fn push_carrier(
+        &mut self,
+        visibility: Visibility,
+        label: &str,
+        text: &str,
+        (start, end): (usize, usize),
+        evidence: &[u8],
+    ) -> bool {
         if self.stop {
             return false;
         }
@@ -210,11 +295,16 @@ impl Sink {
             return false;
         }
         self.used += cost;
+        let hidden = visibility == Visibility::Hidden;
         self.out.carriers.push(Carrier {
-            kind: CarrierKind::MetadataField,
+            kind: if hidden {
+                CarrierKind::HiddenText
+            } else {
+                CarrierKind::MetadataField
+            },
             text: full,
             span: span(start, end),
-            hidden: false,
+            hidden,
             evidence: evidence.to_vec(),
         });
         true

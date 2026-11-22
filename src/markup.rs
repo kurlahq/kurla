@@ -732,6 +732,7 @@ pub fn scan_markup(doc: &TextDoc, budget: &mut Budget, flavour: Markup) -> Detec
         findings: Vec::new(),
         carriers: Vec::new(),
         skip: None,
+        embedded: Vec::new(),
     };
     let mut stack: Vec<String> = Vec::new();
     let mut root: Option<Root> = None;

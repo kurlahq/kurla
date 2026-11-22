@@ -1573,6 +1573,7 @@ pub fn scan_svg(bytes: &[u8], budget: &mut Budget, limits: &Limits) -> DetectorO
         findings: Vec::new(),
         carriers: Vec::new(),
         skip: None,
+        embedded: Vec::new(),
     };
     let Some(doc) = TextDoc::decode(bytes) else {
         out.skip = Some(SkipReason::Unreadable);
