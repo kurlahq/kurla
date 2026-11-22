@@ -81,4 +81,6 @@ Each exempted crate needs a summary from an agent with no tools, no network and 
 
 ## Licence exceptions
 
-- `libfuzzer-sys` 0.4.13 is licensed (MIT OR Apache-2.0) AND NCSA. `deny.toml` allows `NCSA` for that crate only, through `[licenses] exceptions`. Reason: it bundles LLVM's libFuzzer; the fuzz crate is never part of the shipped binary.
+- `libfuzzer-sys` 0.4.13 is licensed (MIT OR Apache-2.0) AND NCSA. `fuzz/deny.toml` allows `NCSA` for that crate only, through `[licenses] exceptions`. Reason: it bundles LLVM's libFuzzer; the fuzz crate is never part of the shipped binary.
+- `fuzz/deny.toml` is used only for the fuzz workspace's cargo-deny check. It is the root `deny.toml` plus that one exception line, and an xtask test fails if the two files differ in any other way. The root config therefore holds no exception that its own dependency graph never uses.
+- The licence allow list is `Apache-2.0`, `MIT` and `Zlib`. `Unicode-3.0` and `BSD-3-Clause` were removed (2026-11-22) because no compiled crate needs them, so cargo-deny reported them as not encountered. `unicode-ident` (MIT OR Apache-2.0 AND Unicode-3.0) is listed in `Cargo.lock` only through `serde_derive`, which is not compiled.
