@@ -51,6 +51,10 @@
 | cargo-mutants | 27.1.0 | crates.io, `cargo install --locked` | 2026-06-02 | Mutation testing, run in CI only. `rust-version` 1.88. |
 | cargo-fuzz | 0.13.2 | crates.io, `cargo install --locked` | 2026-06-09 | Fuzz target runner, used with the dated nightly. No declared `rust-version`. |
 | actions/cache | v6.1.0 (`55cc8345863c7cc4c66a329aec7e433d2d1c52a9`) | GitHub Actions | 2026-06-26 | Caches the dev container image between CI runs, keyed on `dev/Dockerfile`. GitHub's own action, pinned by full commit SHA. |
+| actions/attest-build-provenance | v4.2.2 (`4d101475d8b20a2381f78447822ac1eab6504dd8`) | GitHub Actions | 2026-08-06 | Writes the build provenance attestation for the four release binaries in the `attest` job of `.github/workflows/release.yml`. GitHub's own action, pinned by full commit SHA. A composite action whose only step calls `actions/attest`, listed next. |
+| actions/attest | v4.2.1 (`508db95dd578ae2727ebd6217d5ba78e4fbda05d`) | GitHub Actions | 2026-07-29 | Called by `actions/attest-build-provenance` v4.2.2, pinned there by full commit SHA. A Node 24 action. Not referenced from our workflows. |
+| macOS runner `macos-15` | arm64 image 20261118.0550.1 | GitHub-hosted runner, label from the runner-images README | image current on 2026-11-22 | Runs the `build-macos` job of `.github/workflows/release.yml`. The label is fixed to a macOS version rather than `macos-latest`. The image ships rustup 1.29.3 and Rust 1.100.0, which the job does not use. |
+| Rust 1.98.1 on macOS | 1.98.1 with `aarch64-apple-darwin` and `x86_64-apple-darwin` | `rustup toolchain install` in the `build-macos` job | same as the Rust toolchain row | The toolchain pinned in `rust-toolchain.toml`, installed explicitly so that no later download is implicit. The macOS build runs with `--locked --offline` and the vendored sources, but the runner keeps network access, so it is offline by flag only. |
 
 ## Notes
 

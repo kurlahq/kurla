@@ -1,0 +1,182 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build, for example v0.1.0
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  DEV_RUN: docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/tmp/cargo-home -v "$PWD":/src -w /src kurla-dev
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check the tag
+        id: tag
+        run: |
+          if [ "$EVENT_NAME" = push ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="$INPUT_TAG"
+          fi
+          pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$TAG" =~ $pattern ]]; then
+            echo "plan: tag-format check failed: the tag must look like v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "refs/tags/$TAG^{commit}" > /dev/null; then
+            echo "plan: tag-exists check failed: the tag $TAG does not exist in this repository"
+            exit 1
+          fi
+          core="${TAG#v}"
+          core="${core%%-*}"
+          manifest="$(git show "refs/tags/$TAG:Cargo.toml")"
+          version="$(printf '%s\n' "$manifest" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "plan: version check failed: no version found in Cargo.toml at $TAG"
+            exit 1
+          fi
+          if [ "$core" != "$version" ]; then
+            echo "plan: version check failed: the tag is $core but Cargo.toml at $TAG has $version"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build-linux-windows:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+      - uses: ./.github/actions/dev-image
+      - name: Build both targets with the network off
+        run: |
+          for target in x86_64-unknown-linux-musl x86_64-pc-windows-gnu; do
+            eval "$DEV_RUN cargo build --release --locked --offline --target $target"
+          done
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/kurla dist/kurla-x86_64-unknown-linux-musl
+          cp target/x86_64-pc-windows-gnu/release/kurla.exe dist/kurla-x86_64-pc-windows-gnu.exe
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: build-linux-windows
+          path: dist/
+          if-no-files-found: error
+
+  build-macos:
+    needs: plan
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy --target aarch64-apple-darwin,x86_64-apple-darwin
+          if ! rustc --version | grep -q '^rustc 1\.98\.1 '; then
+            echo "build-macos: toolchain check failed: rustc is not 1.98.1"
+            rustc --version
+            exit 1
+          fi
+      - name: Build both targets with the offline flag
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --offline --target "$target"
+          done
+          mkdir dist
+          cp target/aarch64-apple-darwin/release/kurla dist/kurla-aarch64-apple-darwin
+          cp target/x86_64-apple-darwin/release/kurla dist/kurla-x86_64-apple-darwin
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: build-macos
+          path: dist/
+          if-no-files-found: error
+
+  attest:
+    needs: [plan, build-linux-windows, build-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: dist
+      - name: Check the four binaries and write SHA256SUMS
+        run: |
+          expected="kurla-aarch64-apple-darwin kurla-x86_64-apple-darwin kurla-x86_64-pc-windows-gnu.exe kurla-x86_64-unknown-linux-musl"
+          found="$(ls -1A dist | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+          if [ "$found" != "$expected" ]; then
+            echo "attest: file-set check failed: expected [$expected] but found [$found]"
+            exit 1
+          fi
+          for name in $expected; do
+            if [ ! -f "dist/$name" ]; then
+              echo "attest: file-set check failed: dist/$name is not a regular file"
+              exit 1
+            fi
+          done
+          cd dist
+          sha256sum $expected > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: |
+            dist/kurla-aarch64-apple-darwin
+            dist/kurla-x86_64-apple-darwin
+            dist/kurla-x86_64-pc-windows-gnu.exe
+            dist/kurla-x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [plan, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release-files
+          path: dist
+      - name: Create the draft release
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$TAG" --notes "Draft. Check the downloads with sha256sum -c SHA256SUMS, and check their build provenance with gh attestation verify FILE --repo OWNER/REPO. The macOS binaries were built with the offline flag only. None of the binaries are signed, so SmartScreen and Gatekeeper may warn." dist/kurla-aarch64-apple-darwin dist/kurla-x86_64-apple-darwin dist/kurla-x86_64-pc-windows-gnu.exe dist/kurla-x86_64-unknown-linux-musl dist/SHA256SUMS
