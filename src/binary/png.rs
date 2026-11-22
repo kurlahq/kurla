@@ -12,6 +12,7 @@ const CRC_LEN: usize = 4;
 const CORRUPT_STREAM: &str = "malformed PNG: compressed text is not a valid zlib stream";
 const UNKNOWN_METHOD: &str = "malformed PNG: unknown compression method";
 const TRUNCATED_CHUNK: &str = "malformed PNG: truncated chunk";
+const INCOMPLETE_HEADER: &str = "malformed PNG: text chunk header is incomplete";
 
 pub(crate) enum Inflated {
     Text(Vec<u8>),
@@ -76,6 +77,33 @@ fn split_nul(data: &[u8]) -> (&[u8], Option<&[u8]>) {
     }
 }
 
+struct ItxtHeader<'a> {
+    keyword: &'a [u8],
+    flag: u8,
+    method: u8,
+    language: &'a [u8],
+    translated: &'a [u8],
+    body: &'a [u8],
+}
+
+impl<'a> ItxtHeader<'a> {
+    fn parse(data: &'a [u8]) -> Option<ItxtHeader<'a>> {
+        let (keyword, rest) = split_nul(data);
+        let (&flag, rest) = rest?.split_first()?;
+        let (&method, rest) = rest.split_first()?;
+        let (language, rest) = split_nul(rest);
+        let (translated, body) = split_nul(rest?);
+        Some(ItxtHeader {
+            keyword,
+            flag,
+            method,
+            language,
+            translated,
+            body: body?,
+        })
+    }
+}
+
 struct Walker<'a> {
     sink: Sink,
     budget: &'a mut Budget,
@@ -83,15 +111,55 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
+    fn incomplete_header(&mut self, chunk: &Chunk<'_>) {
+        self.sink.malformed(
+            INCOMPLETE_HEADER,
+            chunk.data_start,
+            chunk.data_start + chunk.data.len(),
+        );
+    }
+
+    fn text_carrier(
+        &mut self,
+        kind: &str,
+        chunk: &Chunk<'_>,
+        keyword: &[u8],
+        text: &str,
+        (start, end): (usize, usize),
+    ) {
+        if text.is_empty() {
+            let label = format!("PNG {kind} keyword");
+            let keyword_end = chunk.data_start + keyword.len();
+            self.sink.carrier(
+                &label,
+                &latin1(keyword),
+                chunk.data_start,
+                keyword_end,
+                chunk.data,
+            );
+        } else {
+            let label = format!("PNG {kind} {}", latin1(keyword));
+            self.sink.carrier(&label, text, start, end, chunk.data);
+        }
+    }
+
     fn text_chunk(&mut self, chunk: &Chunk<'_>) {
         let (keyword, rest) = split_nul(chunk.data);
         let Some(text) = rest else {
+            let end = chunk.data_start + chunk.data.len();
+            self.sink.carrier(
+                "PNG tEXt",
+                &latin1(chunk.data),
+                chunk.data_start,
+                end,
+                chunk.data,
+            );
+            self.incomplete_header(chunk);
             return;
         };
         let start = chunk.data_start + keyword.len() + 1;
-        let label = format!("PNG tEXt {}", latin1(keyword));
-        self.sink
-            .carrier(&label, &latin1(text), start, start + text.len(), chunk.data);
+        let span = (start, start + text.len());
+        self.text_carrier("tEXt", chunk, keyword, &latin1(text), span);
     }
 
     fn inflated(&mut self, compressed: &[u8], start: usize) -> Option<Vec<u8>> {
@@ -124,53 +192,51 @@ impl Walker<'_> {
     fn ztxt_chunk(&mut self, chunk: &Chunk<'_>) {
         let (keyword, rest) = split_nul(chunk.data);
         let Some((&method, compressed)) = rest.and_then(|r| r.split_first()) else {
+            self.incomplete_header(chunk);
             return;
         };
         let start = chunk.data_start + keyword.len() + 2;
+        let span = (start, start + compressed.len());
         if method != 0 {
-            self.sink
-                .malformed(UNKNOWN_METHOD, start, start + compressed.len());
+            self.sink.malformed(UNKNOWN_METHOD, span.0, span.1);
             return;
         }
         if let Some(text) = self.inflated(compressed, start) {
-            let label = format!("PNG zTXt {}", latin1(keyword));
-            self.sink.carrier(
-                &label,
-                &latin1(&text),
-                start,
-                start + compressed.len(),
-                chunk.data,
-            );
+            self.text_carrier("zTXt", chunk, keyword, &latin1(&text), span);
         }
     }
 
     fn itxt_chunk(&mut self, chunk: &Chunk<'_>) {
-        let (keyword, rest) = split_nul(chunk.data);
-        let Some(rest) = rest else {
+        let Some(header) = ItxtHeader::parse(chunk.data) else {
+            self.incomplete_header(chunk);
             return;
         };
-        let (Some(&flag), Some(&method), Some(after)) = (rest.first(), rest.get(1), rest.get(2..))
-        else {
-            return;
-        };
-        let (_, after_language) = split_nul(after);
-        let Some((_, after_translated)) = after_language.map(split_nul) else {
-            return;
-        };
-        let Some(body) = after_translated else {
-            return;
-        };
+        let keyword = latin1(header.keyword);
+        let language_start = chunk.data_start + header.keyword.len() + 3;
+        let translated_start = language_start + header.language.len() + 1;
+        self.sink.carrier(
+            &format!("PNG iTXt {keyword} language"),
+            &lossy(header.language),
+            language_start,
+            language_start + header.language.len(),
+            chunk.data,
+        );
+        self.sink.carrier(
+            &format!("PNG iTXt {keyword} translated keyword"),
+            &lossy(header.translated),
+            translated_start,
+            translated_start + header.translated.len(),
+            chunk.data,
+        );
+        let body = header.body;
         let start = chunk.data_start + (chunk.data.len() - body.len());
-        let label = format!("PNG iTXt {}", latin1(keyword));
-        if flag == 0 {
-            self.sink
-                .carrier(&label, &lossy(body), start, start + body.len(), chunk.data);
-        } else if method != 0 {
-            self.sink
-                .malformed(UNKNOWN_METHOD, start, start + body.len());
+        let span = (start, start + body.len());
+        if header.flag == 0 {
+            self.text_carrier("iTXt", chunk, header.keyword, &lossy(body), span);
+        } else if header.method != 0 {
+            self.sink.malformed(UNKNOWN_METHOD, span.0, span.1);
         } else if let Some(text) = self.inflated(body, start) {
-            self.sink
-                .carrier(&label, &lossy(&text), start, start + body.len(), chunk.data);
+            self.text_carrier("iTXt", chunk, header.keyword, &lossy(&text), span);
         }
     }
 
@@ -300,7 +366,11 @@ mod tests {
         let out = scan_png(&bytes, &mut budget());
         assert_eq!(
             texts(&out),
-            vec!["PNG tEXt Comment: hello", "PNG iTXt Title: héllo"]
+            vec![
+                "PNG tEXt Comment: hello",
+                "PNG iTXt Title language: en",
+                "PNG iTXt Title: héllo"
+            ]
         );
         let first = &out.carriers[0];
         assert_eq!(first.kind, CarrierKind::MetadataField);
@@ -315,7 +385,7 @@ mod tests {
             (49, 54, None, None)
         );
         assert_eq!(first.evidence, b"Comment\0hello".to_vec());
-        let second = &out.carriers[1];
+        let second = &out.carriers[2];
         assert_eq!((second.span.byte_start, second.span.byte_end), (78, 84));
         assert_eq!(second.evidence, itxt);
         assert!(out.findings.is_empty());
@@ -504,7 +574,10 @@ mod tests {
             chunk(b"tEXt", b"After\0ok"),
         ]);
         let out = scan_png(&bytes, &mut budget());
-        assert_eq!(texts(&out), vec!["PNG tEXt After: ok"]);
+        assert_eq!(
+            texts(&out),
+            vec!["PNG zTXt keyword: K", "PNG tEXt After: ok"]
+        );
         assert_eq!(
             findings(&out),
             vec![(
@@ -518,10 +591,107 @@ mod tests {
     }
 
     #[test]
-    fn empty_text_makes_no_carrier() {
-        let bytes = png(&[chunk(b"tEXt", b"Key\0"), chunk(b"tEXt", b"K2\0x")]);
+    fn empty_text_keeps_the_keyword_as_a_carrier() {
+        let mut ztxt = b"Kz\0\0".to_vec();
+        ztxt.extend_from_slice(&compress_to_vec_zlib(b"", 6));
+        let bytes = png(&[
+            chunk(b"tEXt", b"Key\0"),
+            chunk(b"zTXt", &ztxt),
+            chunk(b"iTXt", b"Ki\0\0\0\0\0"),
+            chunk(b"tEXt", b"K2\0x"),
+        ]);
         let out = scan_png(&bytes, &mut budget());
-        assert_eq!(texts(&out), vec!["PNG tEXt K2: x"]);
+        assert_eq!(
+            texts(&out),
+            vec![
+                "PNG tEXt keyword: Key",
+                "PNG zTXt keyword: Kz",
+                "PNG iTXt keyword: Ki",
+                "PNG tEXt K2: x"
+            ]
+        );
+        assert_eq!(
+            (
+                out.carriers[0].span.byte_start,
+                out.carriers[0].span.byte_end
+            ),
+            (16, 19)
+        );
+        assert!(out.findings.is_empty());
+        assert_eq!(out.skip, None);
+    }
+
+    #[test]
+    fn a_text_chunk_without_a_separator_is_a_carrier_and_marks_the_png_malformed() {
+        let bytes = png(&[chunk(b"tEXt", b"no separator here")]);
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["PNG tEXt: no separator here"]);
+        assert_eq!(
+            (
+                out.carriers[0].span.byte_start,
+                out.carriers[0].span.byte_end
+            ),
+            (16, 33)
+        );
+        assert_eq!(
+            findings(&out),
+            vec![(
+                "L001",
+                "malformed PNG: text chunk header is incomplete",
+                16,
+                33
+            )]
+        );
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn a_compressed_text_chunk_with_missing_header_fields_marks_the_png_malformed() {
+        let cases: [(&[u8; 4], &[u8]); 7] = [
+            (b"zTXt", b"no separator"),
+            (b"zTXt", b"K\0"),
+            (b"iTXt", b"no separator"),
+            (b"iTXt", b"K\0"),
+            (b"iTXt", b"K\0\x01"),
+            (b"iTXt", b"K\0\0\0en"),
+            (b"iTXt", b"K\0\0\0en\0Kt"),
+        ];
+        for (kind, data) in cases {
+            let out = scan_png(&png(&[chunk(kind, data)]), &mut budget());
+            assert!(out.carriers.is_empty(), "{data:?}");
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed PNG: text chunk header is incomplete",
+                    16,
+                    16 + data.len() as u64
+                )],
+                "{data:?}"
+            );
+            assert_eq!(out.skip, Some(SkipReason::Malformed), "{data:?}");
+        }
+    }
+
+    #[test]
+    fn itxt_language_tag_and_translated_keyword_are_carriers() {
+        let bytes = png(&[chunk(b"iTXt", b"Title\0\0\0en-GB\0Titel\0body")]);
+        let out = scan_png(&bytes, &mut budget());
+        assert_eq!(
+            texts(&out),
+            vec![
+                "PNG iTXt Title language: en-GB",
+                "PNG iTXt Title translated keyword: Titel",
+                "PNG iTXt Title: body"
+            ]
+        );
+        let spans: Vec<(u64, u64)> = out
+            .carriers
+            .iter()
+            .map(|c| (c.span.byte_start, c.span.byte_end))
+            .collect();
+        assert_eq!(spans, vec![(24, 29), (30, 35), (36, 40)]);
+        assert!(out.findings.is_empty());
     }
 
     #[test]
