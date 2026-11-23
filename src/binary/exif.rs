@@ -224,7 +224,7 @@ fn decode(raw: &Raw<'_>) -> Vec<Value> {
         return one(decode_prefixed(raw.value, raw.big).unwrap_or_else(|| lossy(raw.value)));
     }
     match raw.typ {
-        TYPE_ASCII => {
+        TYPE_ASCII | TYPE_UTF8 => {
             let trimmed = trim_nul(raw.value);
             let split = trimmed.iter().position(|&b| b == 0);
             match split.filter(|_| raw.tag != TAG_COPYRIGHT) {
@@ -256,7 +256,6 @@ fn decode(raw: &Raw<'_>) -> Vec<Value> {
                 None => one(lossy(trimmed)),
             }
         }
-        TYPE_UTF8 => one(lossy(raw.value)),
         _ => clean_text(trim_nul(raw.value)).map_or_else(Vec::new, one),
     }
 }
@@ -815,6 +814,40 @@ mod tests {
         assert_eq!(
             exif_text_fields(&tiff),
             Ok(vec![pair("ImageDescription", "h\u{e9}llo")])
+        );
+    }
+
+    #[test]
+    fn a_utf8_value_with_control_characters_is_read_in_full() {
+        let text = "caf\u{e9} \u{1b}[8mhidden words\u{1b}[0m";
+        let tiff = single_ifd(LE, 0x010E, 129, format!("{text}\0").as_bytes());
+        assert_eq!(
+            exif_text_fields(&tiff),
+            Ok(vec![pair("ImageDescription", text)])
+        );
+    }
+
+    #[test]
+    fn a_utf8_value_hides_the_text_after_an_internal_nul() {
+        let tiff = single_ifd(LE, 0x010E, 129, "caf\u{e9}\0hidden words\0".as_bytes());
+        assert_eq!(
+            shown(&tiff),
+            vec![
+                (
+                    "ImageDescription".to_string(),
+                    "caf\u{e9}".to_string(),
+                    26,
+                    31,
+                    false
+                ),
+                (
+                    "ImageDescription".to_string(),
+                    "hidden words".to_string(),
+                    32,
+                    45,
+                    true
+                )
+            ]
         );
     }
 
