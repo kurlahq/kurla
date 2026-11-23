@@ -22,31 +22,37 @@ pub(crate) enum Inflated {
 }
 
 pub(crate) fn inflate(data: &[u8], budget: &mut Budget) -> Inflated {
+    inflate_stream(data, budget, inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER).0
+}
+
+pub(crate) fn inflate_stream(data: &[u8], budget: &mut Budget, format: u32) -> (Inflated, usize) {
     let allowed = usize::try_from(budget.remaining_decompressed()).unwrap_or(usize::MAX);
-    let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
-        .bitor(inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    let flags = format.bitor(inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
     let mut decompressor = Box::<DecompressorOxide>::default();
     let mut out = vec![0; data.len().saturating_mul(2).min(allowed)];
     let mut input = data;
     let mut produced = 0;
+    let mut used = 0;
     loop {
         let (status, consumed, written) =
             decompress(&mut decompressor, input, &mut out, produced, flags);
         produced += written;
+        used += consumed;
         input = input.get(consumed..).unwrap_or_default();
         match status {
             TINFLStatus::HasMoreOutput if out.len() < allowed => {
                 out.resize(out.len().saturating_mul(2).min(allowed), 0);
             }
-            TINFLStatus::HasMoreOutput => return Inflated::LimitHit,
+            TINFLStatus::HasMoreOutput => return (Inflated::LimitHit, used),
             finished => {
                 out.truncate(produced);
                 let _ = budget.take_decompressed(produced as u64);
-                return if finished == TINFLStatus::Done {
+                let inflated = if finished == TINFLStatus::Done {
                     Inflated::Text(out)
                 } else {
                     Inflated::Corrupt(out)
                 };
+                return (inflated, used);
             }
         }
     }

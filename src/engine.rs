@@ -1,6 +1,6 @@
 use crate::agent_files::{active_commands, is_agent_file};
 use crate::aimed::{self, PatternHit};
-use crate::binary::{self, scan_avif, scan_gif, scan_jpeg, scan_png, scan_webp};
+use crate::binary::{self, gunzip, scan_avif, scan_gif, scan_jpeg, scan_png, scan_webp};
 use crate::encoded::{EncodedOutput, scan_encoded};
 use crate::limits::{Budget, Limits};
 use crate::location;
@@ -374,6 +374,37 @@ impl<'a> Engine<'a> {
         self.absorb_encoded(encoded, 0, None);
     }
 
+    fn svgz(&mut self, bytes: &[u8]) {
+        let span = whole(self.len);
+        let gunzipped = gunzip(bytes, &mut self.budget);
+        self.absorb(gunzipped.out, 0, None);
+        let Some(data) = gunzipped.data else {
+            return;
+        };
+        let Some(doc) = TextDoc::decode(&data) else {
+            self.unreadable(span);
+            return;
+        };
+        let first = self.entries.len();
+        let out = scan_svg(&data, &mut self.budget, self.limits);
+        self.absorb(out, 0, Some(span));
+        if gunzipped.malformed {
+            let added = self.entries.split_off(first);
+            self.entries.extend(
+                added
+                    .into_iter()
+                    .filter(|entry| entry.raw.message != MALFORMED_XML),
+            );
+        }
+        let mut found = scan_text(&doc, self.location);
+        for raw in &mut found {
+            raw.span = span;
+        }
+        self.push_unicode(found, None);
+        let encoded = scan_encoded(&doc, 0, &mut self.budget);
+        self.absorb_encoded(encoded, 0, Some(span));
+    }
+
     fn agent_file(&mut self, doc: &TextDoc) {
         self.queue.push_back(Job {
             carrier: Carrier {
@@ -567,6 +598,7 @@ fn scan_kind(rel_path: &str, bytes: &[u8], limits: &Limits, kind: FileKind) -> S
     let location = location::classify(rel_path, max_line);
     let mut engine = Engine::new(rel_path, limits, kind, location, bytes.len());
     match (kind, doc) {
+        (FileKind::Svg, _) if bytes.starts_with(&binary::gzip::MAGIC) => engine.svgz(bytes),
         (FileKind::Text | FileKind::Svg, None) => engine.unreadable(whole(bytes.len())),
         (FileKind::Text, Some(doc)) => engine.text(&doc),
         (FileKind::Svg, Some(doc)) => engine.svg(bytes, &doc),
@@ -1421,6 +1453,82 @@ mod tests {
             .find(|f| f.raw.payload.as_deref() == Some("some quiet words"))
             .unwrap();
         assert_eq!(quiet.severity, Severity::High);
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0, 0, 0xFF];
+        v.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(data, 6));
+        v.extend_from_slice(&[0; 8]);
+        v
+    }
+
+    #[test]
+    fn svgz_is_inflated_and_scanned_as_svg_over_the_whole_file() {
+        let svg = format!(
+            "{SVG_OPEN}<script>alert(1)</script><text>{}</text><g id=\"{}\"/></svg>",
+            tags("hi"),
+            base64(PHRASE.as_bytes())
+        );
+        let bytes = gzip(svg.as_bytes());
+        let (findings, coverage, _) = scan("a.svgz", &bytes);
+        assert_eq!(coverage.kind, FileKind::Svg);
+        assert!(!coverage.drawn_text_unscanned);
+        assert_eq!(coverage.skip, None);
+        let ids = rule_ids(&findings);
+        assert!(ids.contains(&"S003") && ids.contains(&"E001"), "{ids:?}");
+        assert!(findings.iter().any(|f| f.raw.family == Family::U));
+        assert!(findings.iter().all(|f| f.raw.span == whole(bytes.len())));
+        let (plain, coverage, _) = scan("a.svgz", SCRIPT_SVG.as_bytes());
+        assert_eq!(coverage.kind, FileKind::Svg);
+        assert_eq!(rule_ids(&plain), vec!["S003"]);
+    }
+
+    #[test]
+    fn an_svgz_bomb_is_b002() {
+        let limits = Limits {
+            max_decompressed_bytes: 1000,
+            ..Limits::default()
+        };
+        let svg = format!("{SVG_OPEN}{}</svg>", " ".repeat(5000));
+        let (findings, coverage, _) = scan_file("a.svgz", &gzip(svg.as_bytes()), &limits);
+        assert_eq!(rule_ids(&findings), vec!["B002"]);
+        assert_eq!(findings[0].severity, Severity::High);
+        assert_eq!(coverage.skip, Some(SkipReason::DecompressionLimit));
+        assert_eq!(coverage.kind, FileKind::Svg);
+    }
+
+    #[test]
+    fn a_corrupt_svgz_is_malformed_once_and_its_partial_svg_is_scanned() {
+        let partial = format!("{SVG_OPEN}<script>alert(1)</script><g></g></g>{PHRASE}");
+        let declared = (partial.len() + 50) as u16;
+        let mut bytes = vec![0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0, 0, 0xFF, 0x01];
+        bytes.extend_from_slice(&declared.to_le_bytes());
+        bytes.extend_from_slice(&(!declared).to_le_bytes());
+        bytes.extend_from_slice(partial.as_bytes());
+        let (findings, coverage, _) = scan("a.svgz", &bytes);
+        let l001 = of_rule(&findings, "L001");
+        assert_eq!(l001.len(), 1);
+        assert_eq!(l001[0].raw.message, "malformed gzip: corrupt stream");
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+        assert!(rule_ids(&findings).contains(&"S003"));
+        assert_eq!(of_rule(&findings, "S002")[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn a_whole_svgz_with_broken_xml_keeps_the_malformed_xml_finding() {
+        let svg = format!("{SVG_OPEN}<g></g></g>");
+        let (findings, coverage, _) = scan("a.svgz", &gzip(svg.as_bytes()));
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(findings[0].raw.message, MALFORMED_XML);
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn svgz_that_inflates_to_binary_is_unreadable() {
+        let (findings, coverage, _) = scan("a.svgz", &gzip(&[0, 255, 1, 254]));
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(findings[0].raw.message, "unreadable file");
+        assert_eq!(coverage.skip, Some(SkipReason::Unreadable));
     }
 
     #[test]

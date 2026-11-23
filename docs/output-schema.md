@@ -139,7 +139,7 @@ Each finding has exactly these fields.
 | `path` | string | The file, relative to the working directory when it is inside it. |
 | `location` | string | `agent_file`, `docs_template`, `code`, `data_asset` or `dependency`. |
 | `line`, `column` | number or null | One-based, counted in Unicode code points. Null for binary files. |
-| `byte_start`, `byte_end` | number | The byte range in the file. |
+| `byte_start`, `byte_end` | number | The byte range in the file. A finding inside a compressed SVG (`.svgz`) covers the whole file, because positions in the decompressed text do not exist in the file; its `line` and `column` are null. |
 | `carrier` | string | `hidden_text`, `decoded_payload`, `html_comment`, `svg_text`, `metadata_field`, `agent_file_text`, `active_content` or `resource_limit`. |
 | `message` | string | A short description. |
 | `payload` | string or null | The text that was hidden or decoded, when there is one. |

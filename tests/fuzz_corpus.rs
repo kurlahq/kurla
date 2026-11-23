@@ -285,6 +285,22 @@ fn hand_built_seeds_reach_the_metadata_they_were_built_to_carry() {
     );
 }
 
+#[test]
+fn the_svgz_seed_reaches_the_svg_scanner_through_every_header_field() {
+    let bytes = fs::read(root().join("fuzz/corpus/scan_file/two_members_all_fields.svgz"))
+        .expect("seed exists");
+    assert!(scan_file::NAMES.contains(&"x.svgz"));
+    let gunzipped = kurla::binary::gunzip(
+        &bytes,
+        &mut kurla::limits::Budget::new(&scan_file::limits()),
+    );
+    assert!(!gunzipped.malformed);
+    assert_eq!(gunzipped.out.carriers.len(), 3);
+    let (findings, coverage, _) = kurla::engine::scan_file("x.svgz", &bytes, &scan_file::limits());
+    assert_eq!(coverage.skip, None);
+    assert!(findings.iter().any(|f| f.raw.rule_id == "S003"));
+}
+
 fn limit_output(skip: Option<SkipReason>, rule: &'static str) -> DetectorOutput {
     let mut raw = finding(0, 1);
     raw.rule_id = rule;

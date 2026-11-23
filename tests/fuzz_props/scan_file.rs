@@ -5,10 +5,11 @@ use kurla::model::{DetectorOutput, SkipReason};
 
 use crate::spans;
 
-const NAMES: [&str; 5] = [
+pub const NAMES: [&str; 6] = [
     "fuzz.bin",
     "x.md",
     "x.svg",
+    "x.svgz",
     "x.png",
     ".claude/settings.json",
 ];

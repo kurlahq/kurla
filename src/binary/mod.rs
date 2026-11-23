@@ -1,6 +1,7 @@
 pub mod bmff;
 pub mod exif;
 pub mod gif;
+pub mod gzip;
 pub mod jpeg;
 pub mod png;
 pub mod xmp;
@@ -8,6 +9,7 @@ pub mod xmp;
 pub use bmff::{scan_avif, scan_webp};
 pub use exif::{ExifError, exif_text_fields};
 pub use gif::scan_gif;
+pub use gzip::gunzip;
 pub use jpeg::scan_jpeg;
 pub use png::scan_png;
 pub use xmp::xmp_text;
@@ -108,7 +110,8 @@ pub fn sniff(bytes: &[u8], path: &str) -> FileKind {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase());
     match extension.as_deref() {
-        Some("svg") if TextDoc::decode(bytes).is_some() => return FileKind::Svg,
+        Some("svg" | "svgz") if TextDoc::decode(bytes).is_some() => return FileKind::Svg,
+        Some("svgz") if bytes.starts_with(&gzip::MAGIC) => return FileKind::Svg,
         Some(ext) if OTHER_IMAGE_EXTENSIONS.contains(&ext) => return FileKind::OtherImage,
         _ => {}
     }
@@ -579,6 +582,16 @@ mod tests {
             );
         }
         assert_eq!(sniff(b"hello", "a.BMP"), FileKind::OtherImage);
+    }
+
+    #[test]
+    fn sniff_svgz_by_gzip_magic_or_text() {
+        let gzip_bytes = [0x1F, 0x8B, 0x08, 0x08, 0xC3, 0x28];
+        assert!(TextDoc::decode(&gzip_bytes).is_none());
+        assert_eq!(sniff(&gzip_bytes, "x/a.svgz"), FileKind::Svg);
+        assert_eq!(sniff(b"<svg/>", "a.SVGZ"), FileKind::Svg);
+        assert_eq!(sniff(&[0x80, 0x00, 0x01], "a.svgz"), FileKind::OtherImage);
+        assert_ne!(sniff(&[0x1F, 0x8B, 0x08, 0x00], "a.gz"), FileKind::Svg);
     }
 
     #[test]

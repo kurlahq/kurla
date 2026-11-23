@@ -15,7 +15,7 @@ Kurla parses untrusted bytes, so every parser has a libFuzzer target. The fuzz c
 | `markup` | `markup::scan_markup`, as HTML and as Markdown |
 | `encoded` | `encoded::scan_encoded` at every decode depth |
 | `text_unicode` | `unicode::scan_text` for every location kind, `aimed::classify`, `unicode::confusable_skeleton` |
-| `scan_file` | `engine::scan_file` on the input named `fuzz.bin`, `x.md`, `x.svg`, `x.png` and `.claude/settings.json` |
+| `scan_file` | `engine::scan_file` on the input named `fuzz.bin`, `x.md`, `x.svg`, `x.svgz`, `x.png` and `.claude/settings.json`. Under `x.svgz` an input that starts with the gzip signature goes through the gzip reader, which uses the PNG inflater and the same decompression budget, and the seed `two_members_all_fields.svgz` reaches every gzip header field and a second member. |
 
 Each target in `fuzz/fuzz_targets/` is a thin wrapper. It includes the matching module of `tests/fuzz_props/` with `#[path = ...]` and calls `check(data)`.
 
