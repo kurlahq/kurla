@@ -4,6 +4,8 @@ Kurla is a local command-line scanner for repositories. It looks for content tha
 
 Kurla runs on your machine and never contacts the network. It reads the files under the paths you give it. It does not execute, render or follow anything it finds in them.
 
+**Status: pre-release.** There is no release yet. Kurla's detection rates (how much hidden content it finds, and how often it flags harmless content) have not been measured yet.
+
 ## What it detects
 
 | Family | What it looks for |
@@ -114,13 +116,13 @@ Every payload, path and message in every format escapes control, bidirectional a
 
 - Every dependency is pinned to an exact version and recorded in [docs/dependencies.md](docs/dependencies.md). A version must have been published at least 14 days before it is adopted, and `cargo xtask cooldown-check` enforces that rule.
 - Sources are vendored in `vendor/`, and builds use `--locked --offline`.
-- The Linux and Windows release binaries are built in a container with `--network none`.
+- The Linux and Windows release binaries will be built in a container with `--network none`.
 - `cargo-deny`, `cargo-audit` and `cargo-vet` run in CI.
 - The parsers have fuzz targets, and mutation testing runs in CI.
 - GitHub Actions are pinned by full commit SHA, and the release workflow gives its build jobs a read-only token.
-- Each release is created as a draft by the release workflow, with a `SHA256SUMS` file and a build provenance attestation for every binary.
+- Each release will be created as a draft by the release workflow, with a `SHA256SUMS` file and a build provenance attestation for every binary.
 
-To check a download, run these in the directory that holds the files:
+Once there are releases, you will be able to check a download by running these in the directory that holds the files:
 
 ```
 sha256sum -c SHA256SUMS
