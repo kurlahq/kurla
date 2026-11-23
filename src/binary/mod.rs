@@ -27,6 +27,8 @@ pub(crate) const EVIDENCE_CAP: usize = 4096;
 const TRAILER_MESSAGE: &str = "data after the end of the image";
 const HIDDEN_MESSAGE: &str = "readable text hidden in the image";
 const REPLACEMENT_UTF8: [u8; 3] = [0xEF, 0xBF, 0xBD];
+const MOTION_PHOTO_MARKER: &[u8] = b"MotionPhoto_Data";
+const FTYP_MIN_SIZE: usize = 16;
 const EXIF_BAD_HEADER: &str = "malformed EXIF: invalid TIFF header";
 const EXIF_OUTSIDE: &str = "malformed EXIF: entry or value outside the block";
 const EXIF_IFD_LIMIT: &str = "EXIF IFD limit";
@@ -160,6 +162,33 @@ fn embedded_blob(tail: &[u8], start: usize, end: usize) -> Option<EmbeddedBlob> 
         } else {
             Vec::new()
         },
+        evidence: tail[..tail.len().min(EVIDENCE_CAP)].to_vec(),
+    })
+}
+
+fn is_mp4_ftyp(bytes: &[u8]) -> bool {
+    let size = bytes
+        .get(..4)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .and_then(|b| usize::try_from(u32::from_be_bytes(b)).ok())
+        .unwrap_or(0);
+    let brand_ok = bytes
+        .get(8..12)
+        .is_some_and(|brand| brand.iter().all(|b| b.is_ascii_graphic() || *b == b' '));
+    (FTYP_MIN_SIZE..=bytes.len()).contains(&size)
+        && size.is_multiple_of(4)
+        && brand_ok
+        && crate::encoded::unscannable_signature(bytes) == Some("mp4/mov")
+}
+
+fn motion_photo(tail: &[u8], start: usize, end: usize) -> Option<EmbeddedBlob> {
+    let mp4 = tail.strip_prefix(MOTION_PHOTO_MARKER)?;
+    is_mp4_ftyp(mp4).then(|| EmbeddedBlob {
+        kind: FileKind::UnknownBinary,
+        declared_type: None,
+        format: Some("mp4/mov"),
+        span: span(start, end),
+        bytes: Vec::new(),
         evidence: tail[..tail.len().min(EVIDENCE_CAP)].to_vec(),
     })
 }
@@ -307,6 +336,10 @@ impl Sink {
             return;
         }
         let end = bytes.len();
+        if let Some(blob) = motion_photo(tail, start, end).filter(|_| companions) {
+            self.out.embedded.push(blob);
+            return;
+        }
         let blob = embedded_blob(tail, start, end);
         let flagged = !(companions && blob.as_ref().is_some_and(is_jpeg_companion));
         self.out.embedded.extend(blob);
@@ -938,6 +971,20 @@ mod tests {
         assert!(!sink.hidden_carrier("L", &text, 0, 1, &[]));
         let ids: Vec<&str> = sink.out.findings.iter().map(|f| f.rule_id).collect();
         assert_eq!(ids, vec!["B003"]);
+    }
+
+    #[test]
+    fn a_motion_photo_after_an_image_other_than_a_jpeg_stays_b004() {
+        let mut bytes = b"xxMotionPhoto_Data\0\0\0\x10ftypmp42\0\0\0\0".to_vec();
+        let mut sink = Sink::new(bytes.len());
+        sink.trailer("T", &bytes, 2, false);
+        let ids: Vec<&str> = sink.out.findings.iter().map(|f| f.rule_id).collect();
+        assert_eq!(ids, vec!["B004"]);
+        assert!(sink.out.embedded.is_empty());
+        bytes.truncate(2);
+        let mut quiet = Sink::new(bytes.len());
+        quiet.trailer("T", &bytes, 2, true);
+        assert!(quiet.out.findings.is_empty() && quiet.out.embedded.is_empty());
     }
 
     #[test]

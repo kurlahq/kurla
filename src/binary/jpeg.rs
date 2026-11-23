@@ -630,6 +630,77 @@ mod tests {
         assert_eq!(out.skip, Some(SkipReason::Malformed));
     }
 
+    fn after_eoi(tail: &[u8]) -> DetectorOutput {
+        let mut bytes = jpeg(&[seg(0xFE, b"one"), vec![0xFF, 0xD9]]);
+        bytes.extend_from_slice(tail);
+        scan_jpeg(&bytes, &mut budget())
+    }
+
+    fn ftyp_box(size: u32, brand: &[u8; 4], extra: usize) -> Vec<u8> {
+        let mut v = size.to_be_bytes().to_vec();
+        v.extend_from_slice(b"ftyp");
+        v.extend_from_slice(brand);
+        v.extend_from_slice(&[0, 0, 0, 0]);
+        v.extend(std::iter::repeat_n(b'i', extra));
+        v
+    }
+
+    #[test]
+    fn a_samsung_motion_photo_is_listed_without_b004() {
+        for (mp4, rest) in [
+            (ftyp_box(16, b"mp42", 0), &b"\0\0\0\x08mdat SEFH SEFT"[..]),
+            (ftyp_box(24, b"qt  ", 8), &b"\0\0\0\x08mdat SEFH SEFT"[..]),
+            (ftyp_box(20, b"isom", 4), &b""[..]),
+        ] {
+            let mut tail = b"MotionPhoto_Data".to_vec();
+            tail.extend_from_slice(&mp4);
+            tail.extend_from_slice(rest);
+            let out = after_eoi(&tail);
+            assert!(out.findings.is_empty(), "{mp4:?}");
+            assert_eq!(texts(&out), vec!["JPEG COM: one"]);
+            assert_eq!(out.embedded.len(), 1);
+            let blob = &out.embedded[0];
+            assert_eq!(
+                (blob.kind, blob.format),
+                (FileKind::UnknownBinary, Some("mp4/mov"))
+            );
+            let span = (blob.span.byte_start, blob.span.byte_end);
+            assert_eq!(span, (11, 11 + tail.len() as u64));
+        }
+    }
+
+    #[test]
+    fn anything_else_after_the_motion_photo_marker_stays_b004() {
+        let marker = b"MotionPhoto_Data".to_vec();
+        let with = |rest: &[u8]| [marker.as_slice(), rest].concat();
+        let mut avif = 20u32.to_be_bytes().to_vec();
+        avif.extend_from_slice(b"ftypavif\0\0\0\0mif1");
+        let tails = [
+            marker.clone(),
+            with(b"junk after the marker"),
+            with(&ftyp_box(12, b"mp42", 0)),
+            with(&ftyp_box(18, b"mp42", 2)),
+            with(&ftyp_box(24, b"mp42", 4)),
+            with(&ftyp_box(16, b"mp\x004", 0)),
+            with(&avif),
+            [b"motionphoto_data".as_slice(), &ftyp_box(16, b"mp42", 0)].concat(),
+            [b"xMotionPhoto_Data".as_slice(), &ftyp_box(16, b"mp42", 0)].concat(),
+        ];
+        for tail in tails {
+            let out = after_eoi(&tail);
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "B004",
+                    "data after the end of the image",
+                    11,
+                    11 + tail.len() as u64
+                )],
+                "{tail:?}"
+            );
+        }
+    }
+
     #[test]
     fn readable_stray_bytes_are_b005() {
         let stray = b"meet me at the usual place".to_vec();
