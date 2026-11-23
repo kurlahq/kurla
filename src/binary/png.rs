@@ -814,6 +814,43 @@ mod tests {
     }
 
     #[test]
+    fn data_after_an_iend_chunk_that_holds_data_starts_after_its_crc() {
+        let mut bytes = png(&[chunk(b"tEXt", b"A\0one"), chunk(b"IEND", b"abcd")]);
+        bytes.extend_from_slice(b"note for the reader");
+        let out = scan_png(&bytes, &mut budget());
+        let trailer: Vec<(&str, u64, u64, &[u8])> = out
+            .carriers
+            .iter()
+            .filter(|c| c.hidden)
+            .map(|c| {
+                (
+                    c.text.as_str(),
+                    c.span.byte_start,
+                    c.span.byte_end,
+                    c.evidence.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            trailer,
+            vec![(
+                "PNG data after IEND: note for the reader",
+                41,
+                60,
+                &b"note for the reader"[..]
+            )]
+        );
+        let b004: Vec<(&str, &str, u64, u64)> = findings(&out)
+            .into_iter()
+            .filter(|f| f.0 == "B004")
+            .collect();
+        assert_eq!(
+            b004,
+            vec![("B004", "data after the end of the image", 41, 60)]
+        );
+    }
+
+    #[test]
     fn a_trailer_of_only_nul_bytes_or_ascii_whitespace_gives_nothing() {
         let tails: [&[u8]; 3] = [b"\0\0\0\0", b" \t\r\n\x0C", b"\0 \n\0"];
         for tail in tails {
