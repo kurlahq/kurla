@@ -417,6 +417,21 @@ mod tests {
     }
 
     #[test]
+    fn readable_plain_text_is_b005() {
+        let mut bytes = head();
+        bytes.extend_from_slice(&[0x21, 0x01, 0x0C]);
+        bytes.extend_from_slice(&[0; 12]);
+        bytes.push(26);
+        bytes.extend_from_slice(b"meet me at the usual place");
+        bytes.extend_from_slice(&[0x00, 0x3B]);
+        let out = scan_gif(&bytes, &mut budget());
+        assert_eq!(
+            findings(&out),
+            vec![("B005", "readable text hidden in the image", 35, 61)]
+        );
+    }
+
+    #[test]
     fn xmp_application_extension_stops_at_the_magic_trailer() {
         let xml = "<a><b>gif hidden</b></a>";
         let mut bytes = head();

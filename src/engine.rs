@@ -257,16 +257,21 @@ impl<'a> Engine<'a> {
             let mut classified = false;
             if carrier.hidden && carrier.kind != CarrierKind::DecodedPayload {
                 let hit = !aimed::classify(&carrier.text).is_empty();
-                classified = !hit;
+                let mut covered = false;
                 for entry in &mut entries {
-                    if hit
-                        && entry.raw.carrier == CarrierKind::HiddenText
+                    if entry.raw.carrier == CarrierKind::HiddenText
                         && covers(&entry.raw.span, &carrier.span)
                     {
-                        entry.instruction_like = true;
-                        classified = true;
+                        covered = true;
+                        if hit {
+                            entry.instruction_like = true;
+                        }
                     }
                 }
+                if !hit && !covered {
+                    *self.counts.entry(carrier.kind).or_insert(0) += 1;
+                }
+                classified = !hit || covered;
             }
             jobs.push((carrier, classified));
         }
@@ -1717,6 +1722,59 @@ mod tests {
         assert_eq!(rule_ids(&findings), vec!["B004"]);
         assert_eq!(findings[0].severity, Severity::Critical);
         assert_eq!(findings[0].raw.span.byte_start, 20);
+    }
+
+    fn jpeg_with_exif_value(tag: u16, value: &[u8]) -> Vec<u8> {
+        let mut tiff = vec![0x49, 0x49, 0x2A, 0, 8, 0, 0, 0, 1, 0];
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&26u32.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(value);
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        v.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    #[test]
+    fn readable_hidden_text_in_an_image_is_b005_high_and_critical_when_instruction_like() {
+        let bytes = jpeg_with_exif_value(0x010E, b"shown\0meet me at the usual place");
+        let (findings, _, counts) = scan("a.jpg", &bytes);
+        assert_eq!(rule_ids(&findings), vec!["B005"]);
+        assert_eq!(findings[0].severity, Severity::High);
+        let span = (
+            findings[0].raw.span.byte_start,
+            findings[0].raw.span.byte_end,
+        );
+        assert_eq!(span, (44, 70));
+        assert_eq!(counts.get(&CarrierKind::HiddenText), None);
+        assert_eq!(counts.get(&CarrierKind::MetadataField), Some(&1));
+        let aimed = jpeg_with_exif_value(0x010E, format!("shown\0{PHRASE}").as_bytes());
+        let (findings, _, counts) = scan("a.jpg", &aimed);
+        assert_eq!(rule_ids(&findings), vec!["B005"]);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(counts.get(&CarrierKind::HiddenText), None);
+    }
+
+    #[test]
+    fn camera_style_nul_padded_exif_fields_with_leftover_junk_stay_quiet() {
+        let mut binary_junk = b"NIKON D850".to_vec();
+        binary_junk.extend_from_slice(&[0; 6]);
+        binary_junk.extend_from_slice(&[0x01, 0x00, 0x9C, 0x02, 0x10, 0xFF]);
+        binary_junk.extend_from_slice(&[0; 10]);
+        let leftover_name = b"Canon EOS R5\0 Mark II\0\0\0\0\0\0\0\0\0\0\0".to_vec();
+        for value in [binary_junk, leftover_name] {
+            assert_eq!(value.len(), 32);
+            let (findings, coverage, counts) = scan("a.jpg", &jpeg_with_exif_value(0x0110, &value));
+            assert!(findings.is_empty(), "{findings:?}");
+            assert_eq!(coverage.skip, None);
+            assert_eq!(counts.get(&CarrierKind::MetadataField), Some(&1));
+            assert_eq!(counts.get(&CarrierKind::HiddenText), Some(&1));
+        }
     }
 
     #[test]

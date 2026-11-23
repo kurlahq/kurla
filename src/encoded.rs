@@ -451,6 +451,10 @@ fn qualifies_as_payload(text: &str) -> bool {
             || has_candidates(text))
 }
 
+pub(crate) fn is_readable_text(text: &str) -> bool {
+    !text.contains(char::REPLACEMENT_CHARACTER) && qualifies_as_payload(text)
+}
+
 struct Scanner<'a> {
     doc: &'a TextDoc,
     chars: Vec<char>,
@@ -1137,6 +1141,14 @@ mod tests {
         assert_eq!(run(&b64(three_words.as_bytes()), 0).out.carriers.len(), 1);
         let two_words = format!("aa bb{}", ".".repeat(50));
         assert_empty(&run(&b64(two_words.as_bytes()), 0));
+    }
+
+    #[test]
+    fn readable_text_needs_valid_utf8_printable_characters_and_three_words() {
+        assert!(is_readable_text("meet me at the usual place"));
+        assert!(!is_readable_text("two words"));
+        assert!(!is_readable_text("meet me at the usual place\u{FFFD}"));
+        assert!(!is_readable_text("one two three\u{1}\u{1}"));
     }
 
     #[test]

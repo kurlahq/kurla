@@ -631,6 +631,20 @@ mod tests {
     }
 
     #[test]
+    fn readable_stray_bytes_are_b005() {
+        let stray = b"meet me at the usual place".to_vec();
+        let bytes = jpeg(&[seg(0xFE, b"one"), stray, seg(0xFE, b"two")]);
+        let out = scan_jpeg(&bytes, &mut budget());
+        assert_eq!(
+            findings(&out),
+            vec![
+                ("L001", "malformed JPEG: bytes between segments", 9, 35),
+                ("B005", "readable text hidden in the image", 9, 35)
+            ]
+        );
+    }
+
+    #[test]
     fn stray_bytes_between_segments_are_a_hidden_carrier_and_mark_the_jpeg_malformed() {
         let bytes = jpeg(&[seg(0xFE, b"one"), vec![0x41, 0x42], seg(0xFE, b"two")]);
         let out = scan_jpeg(&bytes, &mut budget());

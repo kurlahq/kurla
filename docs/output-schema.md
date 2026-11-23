@@ -123,7 +123,7 @@ The top-level object has exactly these fields.
 | `threshold` | string | The `--fail-on` level: `info`, `low`, `medium`, `high` or `critical`. |
 | `findings` | array | Findings, ordered by path, byte offset and rule. |
 | `coverage` | object | What was and was not scanned. |
-| `carrier_counts` | object | Number of carriers seen, keyed by carrier name. Names with no carriers are absent. |
+| `carrier_counts` | object | Number of carriers that gave no finding of their own, keyed by carrier name: visible text that family A did not flag, and hidden bytes in an image that do not read as text. Names with no carriers are absent. |
 | `invalid_decisions` | array | Decisions entries that matched a finding but are not valid. |
 | `decisions_errors` | array | Decisions files that were rejected. |
 | `warnings` | array of strings | Problems that did not stop the run, for example the cache problems listed above. Each is also printed on standard error. `--no-cache` gives no warning. |
