@@ -1421,7 +1421,7 @@ mod tests {
 
     #[test]
     fn an_iloc_with_a_field_size_other_than_0_4_or_8_or_a_version_above_2_is_malformed() {
-        let cases: [(u8, (usize, usize, usize, usize), bool); 5] = [
+        let cases = [
             (0, (2, 4, 0, 0), false),
             (0, (4, 2, 0, 0), false),
             (0, (4, 4, 2, 0), true),
