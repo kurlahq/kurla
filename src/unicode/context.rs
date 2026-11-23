@@ -8,6 +8,7 @@ const ZWNJ: char = '\u{200C}';
 const ZWJ: char = '\u{200D}';
 const SOFT_HYPHEN: char = '\u{00AD}';
 const BOM: char = '\u{FEFF}';
+const MONGOLIAN_VOWEL_SEPARATOR: char = '\u{180E}';
 const VS16: char = '\u{FE0F}';
 const BLACK_FLAG: char = '\u{1F3F4}';
 const MAX_TAG_SEQUENCE_CHARS: usize = 32;
@@ -30,6 +31,9 @@ fn is_joiner_script(s: Script) -> bool {
             | Script::Sinhala
             | Script::Myanmar
             | Script::Khmer
+            | Script::Mongolian
+            | Script::Nko
+            | Script::Adlam
     )
 }
 
@@ -67,6 +71,7 @@ impl<'a> Context<'a> {
             BOM => i == 0,
             ZWJ => self.zwj_between_emoji(i) || self.joiner_between_letters(i),
             ZWNJ => self.joiner_between_letters(i),
+            MONGOLIAN_VOWEL_SEPARATOR => self.between_mongolian_letters(i),
             SOFT_HYPHEN => self.location != LocationKind::Code && self.between_letters(i),
             _ if is_bidi_control(c) => self.bidi_exempt,
             _ => self.rgi[i],
@@ -77,6 +82,13 @@ impl<'a> Context<'a> {
         i > 0
             && self.chars[i - 1].is_alphabetic()
             && self.chars.get(i + 1).is_some_and(|c| c.is_alphabetic())
+    }
+
+    fn between_mongolian_letters(&self, i: usize) -> bool {
+        let mongolian_letter = |c: &char| script(*c) == Script::Mongolian && c.is_alphabetic();
+        i > 0
+            && mongolian_letter(&self.chars[i - 1])
+            && self.chars.get(i + 1).is_some_and(mongolian_letter)
     }
 
     fn zwj_between_emoji(&self, i: usize) -> bool {
@@ -94,7 +106,10 @@ impl<'a> Context<'a> {
 
     fn joiner_between_letters(&self, i: usize) -> bool {
         let mut j = i;
-        while j > 0 && script(self.chars[j - 1]) == Script::Inherited {
+        while j > 0
+            && script(self.chars[j - 1]) == Script::Inherited
+            && !matches!(self.chars[j - 1], ZWJ | ZWNJ)
+        {
             j -= 1;
         }
         j > 0

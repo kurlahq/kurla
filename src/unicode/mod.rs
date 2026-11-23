@@ -29,6 +29,7 @@ pub enum Script {
     Myanmar,
     Khmer,
     Mongolian,
+    Adlam,
     Common,
     Inherited,
     Other,

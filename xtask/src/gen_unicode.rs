@@ -6,7 +6,7 @@ use std::process::{Command, ExitCode};
 const DATA_DIR: &str = "unicode-data";
 const OUTPUT_PATH: &str = "src/unicode/tables.rs";
 
-const SCRIPT_NAMES: [&str; 23] = [
+const SCRIPT_NAMES: [&str; 24] = [
     "Latin",
     "Cyrillic",
     "Greek",
@@ -28,6 +28,7 @@ const SCRIPT_NAMES: [&str; 23] = [
     "Myanmar",
     "Khmer",
     "Mongolian",
+    "Adlam",
     "Common",
     "Inherited",
 ];

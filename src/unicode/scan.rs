@@ -404,6 +404,58 @@ mod tests {
     }
 
     #[test]
+    fn mongolian_zwj_not_flagged() {
+        let text = "\u{1820}\u{200D}\u{1821}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+    }
+
+    #[test]
+    fn nko_zwnj_not_flagged() {
+        let text = "\u{07CA}\u{200C}\u{07CB}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+    }
+
+    #[test]
+    fn adlam_zwj_not_flagged() {
+        let text = "\u{1E922}\u{200D}\u{1E923}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+    }
+
+    #[test]
+    fn mongolian_vowel_separator_not_flagged() {
+        let text = "\u{1828}\u{180E}\u{1820}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+        for other in [
+            "a\u{180E}b",
+            "\u{1810}\u{180E}\u{1811}",
+            "\u{1828}\u{180E}",
+            "\u{180E}\u{1820}",
+        ] {
+            let findings = scan_text(&doc_str(other), LocationKind::DocsTemplate);
+            assert_single(
+                &findings,
+                "U001",
+                Severity::High,
+                RuleStatus::Stable,
+                Some("1"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_of_joiners_between_letters_is_flagged_in_full() {
+        let text = "\u{0645}\u{200C}\u{200C}\u{200C}\u{200C}\u{200C}\u{06CC}";
+        let findings = scan_text(&doc_str(text), LocationKind::DocsTemplate);
+        assert_single(
+            &findings,
+            "U001",
+            Severity::High,
+            RuleStatus::Stable,
+            Some("5"),
+        );
+    }
+
+    #[test]
     fn zwj_between_letters_of_unlisted_script_is_u001() {
         let findings = scan_text(&doc_str("a\u{200D}b"), LocationKind::DocsTemplate);
         assert_single(
