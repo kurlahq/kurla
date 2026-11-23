@@ -182,11 +182,9 @@ pub(crate) fn scan(packet: &[u8], budget: &Budget, emit: Emit<'_>) -> Outcome {
         let start = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
         let Ok(event) = reader.read_event() else {
             scan.outcome.malformed = true;
-            let rest = text.get(start..).unwrap_or_default();
-            let tail = rest.trim();
+            let tail = text.get(start..).unwrap_or_default().trim_end();
             if !tail.is_empty() {
-                let from = start + (rest.len() - rest.trim_start().len());
-                let range = base.map(|base| (base + from, base + from + tail.len()));
+                let range = base.map(|base| (base + start, base + start + tail.len()));
                 scan.outcome.tail = Some((tail.to_string(), range));
             }
             break;

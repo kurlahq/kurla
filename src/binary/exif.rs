@@ -240,7 +240,7 @@ fn decode(raw: &Raw<'_>) -> Vec<Value> {
                             hidden: false,
                         });
                     }
-                    let after = lossy(&trimmed[nul + 1..]);
+                    let after = lossy(&trimmed[nul..]);
                     let after = after.trim_matches('\0');
                     if !after.is_empty() {
                         values.push(Value {
