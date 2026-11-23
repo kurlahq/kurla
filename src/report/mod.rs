@@ -79,6 +79,17 @@ pub(crate) fn sarif_uri(path: &str) -> String {
     percent_encode(path)
 }
 
+pub(crate) const SRCROOT: &str = "%SRCROOT%";
+
+pub(crate) fn artifact_location(path: &str) -> Value {
+    let uri = sarif_uri(path);
+    if uri.starts_with("file:") {
+        json!({ "uri": uri })
+    } else {
+        json!({ "uri": uri, "uriBaseId": SRCROOT })
+    }
+}
+
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -595,6 +606,28 @@ mod tests {
         assert_eq!(sarif_uri("1:/x"), "1%3A/x");
         assert_eq!(sarif_uri("C:x/y"), "C%3Ax/y");
         assert_eq!(sarif_uri("C|/y"), "C%7C/y");
+    }
+
+    #[test]
+    fn sarif_locations_inside_the_root_are_relative_to_srcroot() {
+        let relative = json!({"uri": "dir/a%20b.txt", "uriBaseId": "%SRCROOT%"});
+        assert_eq!(artifact_location("dir/a b.txt"), relative);
+        let hex = json!({"uri": "hex%3A00ff", "uriBaseId": "%SRCROOT%"});
+        assert_eq!(artifact_location("hex:00ff"), hex);
+        assert_eq!(artifact_location("/abs/x"), json!({"uri": "file:///abs/x"}));
+        assert_eq!(artifact_location("C:/x"), json!({"uri": "file:///C:/x"}));
+        let fixture = rich();
+        let sarif: Value =
+            serde_json::from_str(&sarif::render(&fixture.report(), &no_source)).unwrap();
+        let run = &sarif["runs"][0];
+        assert_eq!(
+            run["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"],
+            json!({"uri": "dir/%E2%80%AEtail", "uriBaseId": "%SRCROOT%"})
+        );
+        assert_eq!(
+            run["originalUriBaseIds"],
+            json!({"%SRCROOT%": {"description": {"text": "The directory the scan ran from."}}})
+        );
     }
 
     #[test]

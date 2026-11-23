@@ -1327,6 +1327,43 @@ fn e2e_rlo_in_a_file_name_is_escaped_on_every_stream() {
     assert!(!stderr_of(&output).contains('\u{202E}'));
 }
 
+fn absolute_forms(path: &str) -> Vec<String> {
+    let slashed = path.replace('\\', "/");
+    let escaped = path.replace('\\', "\\\\");
+    vec![path.to_string(), slashed, escaped]
+}
+
+#[test]
+fn e2e_sarif_uses_srcroot_and_no_report_contains_the_home_path() {
+    let dir = TestDir::new();
+    dir.write("sub/a.md", &hidden());
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let mut forbidden = absolute_forms(&dir.shown(""));
+    if home.len() > 3 {
+        forbidden.extend(absolute_forms(&home));
+    }
+    for format in ["human", "json", "sarif"] {
+        let output = kurla(&dir, &["scan", "--no-cache", "--format", format]);
+        assert_eq!(code_of(&output), 1, "{format}");
+        let out = stdout_of(&output);
+        for path in &forbidden {
+            assert!(!out.contains(path.as_str()), "{format} contains {path}");
+        }
+        if format == "sarif" {
+            let sarif: Value = serde_json::from_str(&out).unwrap();
+            let run = &sarif["runs"][0];
+            let location = &run["results"][0]["locations"][0]["physicalLocation"];
+            assert_eq!(
+                location["artifactLocation"],
+                serde_json::json!({"uri": "sub/a.md", "uriBaseId": "%SRCROOT%"})
+            );
+            assert!(run["originalUriBaseIds"]["%SRCROOT%"].get("uri").is_none());
+        }
+    }
+}
+
 #[test]
 fn e2e_a_missing_base_is_rejected_and_a_missing_rlo_path_is_escaped() {
     let dir = TestDir::new();
