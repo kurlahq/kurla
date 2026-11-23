@@ -119,7 +119,7 @@ impl<'a> Context<'a> {
             && self
                 .chars
                 .get(i + 1)
-                .is_some_and(|&c| is_joiner_neighbour(c))
+                .is_some_and(|&c| is_joiner_neighbour(c) && script(c) == script(self.chars[j - 1]))
     }
 }
 

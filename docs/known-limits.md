@@ -23,6 +23,7 @@ Kurla reports what it scanned and what it did not. This page lists content that 
 
 - **Ideographic variation sequences** are reported as U003 (high). An ideographic variation sequence is a CJK ideograph followed by a selector from U+E0100 to U+E01EF, used mostly for Japanese place and personal names. Kurla does not ship the Ideographic Variation Database, which lists the registered sequences, so it cannot tell a registered sequence from a selector that carries data. A reviewer can mark such a finding as reviewed.
 - **Blank-looking characters that are not default-ignorable** are not flagged. Kurla finds invisible characters by the Unicode `Default_Ignorable_Code_Point` property, and also flags U+2800 BRAILLE PATTERN BLANK unless the same line holds another braille character. Other characters that draw as empty space are not flagged: the space characters U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F and U+3000, and symbols that draw nothing, such as U+1D159 MUSICAL SYMBOL NULL NOTEHEAD. They show as a gap, so a reader sees spacing where they are.
+- **A joiner next to punctuation of a joining script is not flagged.** U+200C ZERO WIDTH NON-JOINER and U+200D ZERO WIDTH JOINER are not flagged between two characters of the same joining script, such as Arabic or Devanagari, other than digits; combining marks before the joiner are skipped. Kurla tells these characters apart by script only, so a joiner beside that script's own punctuation, such as U+06D4 ARABIC FULL STOP, is not flagged either.
 
 ## Markup in Markdown and HTML
 

@@ -506,6 +506,54 @@ mod tests {
         );
     }
 
+    fn assert_each_is_one_u001(texts: &[&str]) {
+        for text in texts {
+            let findings = scan_text(&doc_str(text), LocationKind::DocsTemplate);
+            assert_eq!(findings.len(), 1, "{text:?}");
+            assert_eq!(findings[0].rule_id, "U001", "{text:?}");
+            assert_eq!(findings[0].payload.as_deref(), Some("1"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_joiner_at_either_end_of_the_text_is_u001() {
+        assert_each_is_one_u001(&[
+            "\u{200C}\u{0628}",
+            "\u{200D}\u{0915}",
+            "\u{0628}\u{200C}",
+            "\u{0915}\u{200D}",
+        ]);
+    }
+
+    #[test]
+    fn a_joiner_next_to_a_non_letter_is_u001() {
+        assert_each_is_one_u001(&[
+            "\u{0628}\u{200C}\u{0661}",
+            "\u{0661}\u{200C}\u{0628}",
+            "\u{0915}\u{200D}\u{0967}",
+            "\u{0628}\u{200C} \u{0628}",
+            "\u{0628}\u{200C}.",
+        ]);
+    }
+
+    #[test]
+    fn a_joiner_between_letters_of_two_scripts_is_u001() {
+        assert_each_is_one_u001(&[
+            "\u{0628}\u{200C}\u{0915}",
+            "\u{0915}\u{200D}\u{0628}",
+            "\u{1820}\u{200D}\u{07CA}",
+            "\u{0628}\u{200C}b",
+            "b\u{200D}\u{0915}",
+        ]);
+    }
+
+    #[test]
+    fn a_joiner_after_combining_marks_is_judged_by_the_letter_before_them() {
+        let text = "\u{0645}\u{0650}\u{0651}\u{200C}\u{06CC}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+        assert_each_is_one_u001(&["\u{0650}\u{200C}\u{0628}", "\u{0645}\u{0650}\u{200C}b"]);
+    }
+
     #[test]
     fn emoji_zwj_with_modifier_and_vs16_not_flagged() {
         let s = "\u{1F468}\u{1F3FB}\u{200D}\u{2695}\u{FE0F}\u{200D}\u{2764}\u{FE0F}";
