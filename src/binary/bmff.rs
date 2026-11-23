@@ -21,6 +21,10 @@ const AVIF_TRAILER: &str = "AVIF data after the last box";
 const REFERENCED_ITEM: &str = "referenced item";
 const ENCODED_ITEM: &str = "encoded item";
 const INFLATE_LIMIT: &str = "compressed AVIF item inflates past the decompression budget";
+const XMP_LABEL: &str = "AVIF XMP";
+const XMP_UUID: [u8; 16] = [
+    0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, 0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF, 0xAC,
+];
 const TOP_LEVEL_BOXES: [&[u8; 4]; 11] = [
     b"ftyp", b"styp", b"meta", b"moov", b"moof", b"mfra", b"mdat", b"free", b"skip", b"uuid",
     b"sidx",
@@ -377,6 +381,14 @@ impl<'a> Avif<'a> {
                     Some(p) => metas.push((p, b.end)),
                     None => self.sink.malformed(TRUNCATED_BOX, b.start, b.end),
                 },
+                b"uuid" => {
+                    let body = self.bytes.get(b.payload..b.end).unwrap_or_default();
+                    if let Some(packet) = body.strip_prefix(&XMP_UUID) {
+                        let start = b.end - packet.len();
+                        let budget = &*self.budget;
+                        self.sink.xmp(XMP_LABEL, packet, start, b.end, true, budget);
+                    }
+                }
                 b"moov" | b"trak" => {
                     if stack.len() > MAX_DEPTH {
                         if !depth_reported {
@@ -410,11 +422,16 @@ impl<'a> Avif<'a> {
                 return;
             }
             at = b.end;
-            match &b.kind {
-                b"iinf" => iinf = iinf.or(Some(b)),
-                b"iloc" => iloc = iloc.or(Some(b)),
-                b"idat" => idat = idat.or(Some(b)),
-                _ => {}
+            let slot = match &b.kind {
+                b"iinf" => &mut iinf,
+                b"iloc" => &mut iloc,
+                b"idat" => &mut idat,
+                _ => continue,
+            };
+            if slot.is_some() {
+                self.invalid(b.start, b.end);
+            } else {
+                *slot = Some(b);
             }
         }
         match (iinf, iloc) {
@@ -754,7 +771,7 @@ impl<'a> Avif<'a> {
             }
             Wanted::Xmp => {
                 self.sink
-                    .xmp("AVIF XMP", &data, start, end, contiguous.is_some(), budget);
+                    .xmp(XMP_LABEL, &data, start, end, contiguous.is_some(), budget);
             }
             Wanted::Xml => {
                 self.sink
@@ -1354,6 +1371,60 @@ mod tests {
         let mut both_empty = ftyp();
         both_empty.extend_from_slice(&full(b"meta", 0, &empty));
         assert!(scan_avif(&both_empty, &mut budget()).findings.is_empty());
+    }
+
+    const XMP_UUID: [u8; 16] = [
+        0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, 0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF,
+        0xAC,
+    ];
+
+    #[test]
+    fn a_uuid_xmp_box_is_read_at_the_top_level_and_in_moov() {
+        let mut payload = XMP_UUID.to_vec();
+        payload.extend_from_slice(b"<a>uuid words</a>");
+        let mut top = ftyp();
+        let at = top.len() as u64;
+        top.extend_from_slice(&bx(b"uuid", &payload));
+        let out = scan_avif(&top, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF XMP: uuid words"]);
+        assert_eq!(spans(&out), vec![(at + 27, at + 37)]);
+        let mut nested = ftyp();
+        nested.extend_from_slice(&bx(b"moov", &bx(b"uuid", &payload)));
+        let out = scan_avif(&nested, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF XMP: uuid words"]);
+        let mut other = vec![0; 16];
+        other.extend_from_slice(b"<a>not xmp</a>");
+        let mut bytes = ftyp();
+        bytes.extend_from_slice(&bx(b"uuid", &other));
+        let out = scan_avif(&bytes, &mut budget());
+        assert!(out.carriers.is_empty() && out.findings.is_empty());
+    }
+
+    #[test]
+    fn a_second_iinf_iloc_or_idat_in_one_meta_is_malformed() {
+        let cases: [(&[u8; 4], usize); 3] = [(b"iinf", 1), (b"iloc", 1), (b"idat", 2)];
+        for (kind, count) in cases {
+            let bytes = assemble(
+                0,
+                &|base| {
+                    let mut v = iinf(&[infe(2, 1, b"Exif", None)]);
+                    v.extend_from_slice(&iloc0(&[(1, vec![(base, 4 + TIFF.len() as u32)])]));
+                    for _ in 0..count {
+                        v.extend_from_slice(&bx(kind, &[0, 0, 0, 0, 0, 0]));
+                    }
+                    v
+                },
+                &exif_item(),
+            );
+            let out = scan_avif(&bytes, &mut budget());
+            assert!(!out.carriers.is_empty(), "{kind:?}");
+            let found: Vec<(&str, &str)> = findings(&out).iter().map(|f| (f.0, f.1)).collect();
+            assert_eq!(
+                found,
+                vec![("L001", "malformed AVIF: invalid item information")],
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
