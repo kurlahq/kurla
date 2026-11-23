@@ -312,10 +312,17 @@ impl Walk<'_> {
             return pointers;
         };
         let declared = usize::from(declared);
-        if declared > MAX_IFD_ENTRIES {
-            self.outcome.entry_limit = true;
-        }
         let entries_at = offset.saturating_add(2);
+        if declared > MAX_IFD_ENTRIES {
+            let next_entry_end = (MAX_IFD_ENTRIES + 1)
+                .checked_mul(ENTRY_LEN)
+                .and_then(|n| n.checked_add(entries_at));
+            if next_entry_end.is_some_and(|end| end <= self.tiff.len()) {
+                self.outcome.entry_limit = true;
+            } else {
+                self.outcome.malformed = true;
+            }
+        }
         for index in 0..declared.min(MAX_IFD_ENTRIES) {
             if (self.expired)() {
                 self.outcome.timed_out = true;
@@ -1014,6 +1021,30 @@ mod tests {
         tiff.extend_from_slice(b"hello\0");
         let (seen, _) = values(&tiff);
         assert_eq!(seen, vec![("ImageDescription".to_string(), 50, 56)]);
+    }
+
+    #[test]
+    fn an_ifd_declaring_more_entries_than_its_block_holds_is_malformed_not_a_limit() {
+        let build = |declared: u16, present: u16| {
+            let mut tiff = header(LE);
+            tiff.extend_from_slice(&u16b(LE, declared));
+            for _ in 0..present {
+                tiff.extend_from_slice(&entry(LE, 0x010F, 2, 3, *b"ab\0\0"));
+            }
+            tiff
+        };
+        let (seen, outcome) = values(&build(5000, 2));
+        assert_eq!(seen.len(), 2);
+        assert!(!outcome.entry_limit);
+        assert!(outcome.malformed);
+        let (seen, outcome) = values(&build(5000, 1000));
+        assert_eq!(seen.len(), 1000);
+        assert!(!outcome.entry_limit);
+        assert!(outcome.malformed);
+        let (seen, outcome) = values(&build(5000, 1001));
+        assert_eq!(seen.len(), 1000);
+        assert!(outcome.entry_limit);
+        assert!(!outcome.malformed);
     }
 
     #[test]

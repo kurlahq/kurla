@@ -175,6 +175,7 @@ pub(crate) struct Sink {
     inflated: usize,
     used: usize,
     malformed: bool,
+    limits: Vec<String>,
 }
 
 impl Sink {
@@ -191,6 +192,7 @@ impl Sink {
             inflated: 0,
             used: 0,
             malformed: false,
+            limits: Vec::new(),
         }
     }
 
@@ -212,7 +214,10 @@ impl Sink {
     }
 
     fn l001(&mut self, message: &str, start: usize, end: usize) {
-        self.low_finding(SkipReason::SizeLimit, message, start, end);
+        if !self.limits.iter().any(|seen| seen == message) {
+            self.limits.push(message.to_string());
+            self.low_finding(SkipReason::SizeLimit, message, start, end);
+        }
     }
 
     pub(crate) fn malformed(&mut self, message: &str, start: usize, end: usize) {
@@ -708,6 +713,31 @@ mod tests {
         assert_eq!(finding.rule_id, "L001");
         assert_eq!(finding.span.byte_start, 100);
         assert_eq!(finding.span.byte_end, 100 + 12026);
+    }
+
+    #[test]
+    fn each_limit_is_reported_once_per_file() {
+        let tiff = many_inline_entries(1001);
+        let mut sink = Sink::new(3 * tiff.len());
+        for base in [0, tiff.len(), 2 * tiff.len()] {
+            sink.exif(&tiff, base, &plain_budget());
+        }
+        let limits: Vec<(&str, &str)> = sink
+            .out
+            .findings
+            .iter()
+            .map(|f| (f.rule_id, f.message.as_str()))
+            .collect();
+        assert_eq!(limits, vec![("L001", "EXIF entry limit")]);
+        let packet = b"<a><b>x</b></a>";
+        let limits = crate::limits::Limits {
+            max_xml_depth: 1,
+            ..crate::limits::Limits::default()
+        };
+        sink.xmp("XMP", packet, 0, packet.len(), true, &Budget::new(&limits));
+        sink.xmp("XMP", packet, 0, packet.len(), true, &Budget::new(&limits));
+        assert_eq!(sink.out.findings.len(), 2);
+        assert_eq!(sink.out.findings[1].message, "XMP depth limit");
     }
 
     fn tiff_with(entries: &[(u16, u16, u32, [u8; 4])], tail: &[u8]) -> Vec<u8> {
