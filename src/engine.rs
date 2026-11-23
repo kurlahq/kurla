@@ -1949,6 +1949,7 @@ mod tests {
     fn the_listed_other_image_formats_are_marked_metadata_not_scanned() {
         for path in [
             "a.tif", "a.tiff", "a.psd", "a.jxl", "a.jp2", "a.j2k", "a.bmp", "a.ico", "a.cur",
+            "a.tga", "a.emf", "a.wmf",
         ] {
             let (findings, coverage, _) = scan(path, &[0, 255, 1, 254]);
             assert_eq!(coverage.kind, FileKind::OtherImage, "{path}");
@@ -1956,7 +1957,7 @@ mod tests {
             assert!(findings.is_empty());
             assert_eq!(coverage.skip, None);
         }
-        for path in ["a.tga", "a.emf", "a.wmf", "a.svgz", "a.dat"] {
+        for path in ["a.svgz", "a.dat"] {
             let (_, coverage, _) = scan(path, &[0, 255, 1, 254]);
             assert!(!coverage.metadata_unscanned, "{path}");
         }

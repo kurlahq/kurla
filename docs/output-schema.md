@@ -153,7 +153,7 @@ Each finding has exactly these fields.
 | `scanned_by_category` | object | Files scanned with no skip, for each of `text`, `svg`, `image_metadata`, `pdf` and `unknown_binary`. All five keys are always present. |
 | `skipped` | array | Every file with a skip reason, each `{path, kind, category, reason}`. `kind` is one of `text`, `svg`, `png`, `jpeg`, `gif`, `webp`, `avif`, `pdf`, `other_image`, `unknown_binary`. `reason` is one of `size_limit`, `decompression_limit`, `timeout`, `unreadable`, `excluded_by_user`, `symlink_not_followed`, `pdf_not_scanned`, `malformed`. Malformed files are listed here and nowhere else. |
 | `not_scanned_for_drawn_text` | array of strings | Paths of files whose drawn text, such as text inside pixels, is not scanned. |
-| `not_scanned_for_metadata` | array of strings | Paths of TIFF, PSD, JPEG XL, JPEG 2000, BMP and ICO files. Kurla does not read their metadata yet, so text stored in it is not scanned. See [known-limits.md](known-limits.md). |
+| `not_scanned_for_metadata` | array of strings | Paths of TIFF, PSD, JPEG XL, JPEG 2000, BMP, ICO, TGA, EMF and WMF files. Kurla does not read their metadata yet, so text stored in it is not scanned. See [known-limits.md](known-limits.md). |
 | `excluded_by_user` | array of strings | Paths excluded by `--exclude`. These are also in `skipped`. |
 | `embedded_not_scanned` | array | Content found inside a scanned file that was not scanned, each `{path, byte_start, byte_end, declared_type, kind, reason}`. `declared_type` is a string or null. |
 | `encoded_runs_not_payloads` | number | The total, over all files, of encoded runs that did not decode to a payload. |

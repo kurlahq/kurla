@@ -9,7 +9,7 @@ Kurla reports what it scanned and what it did not. This page lists content that 
 - **Private PNG chunks and unknown WebP chunks.** Their content has no defined text layout.
 - **QuickTime text atoms** in an AVIF or HEIF file, such as the comment and description atoms under `moov/udta`.
 - **EXIF values of type BYTE or UNDEFINED that are not clean UTF-8 text.** This includes the internal structure of most maker notes. Such a value is read only when the whole value decodes as UTF-8 with no control characters other than tab and line breaks.
-- **TIFF, PSD, JPEG XL, JPEG 2000, BMP and ICO files.** Kurla does not read their metadata. Each such file is listed in the coverage report under `not_scanned_for_metadata`.
+- **TIFF, PSD, JPEG XL, JPEG 2000, BMP, ICO, TGA, EMF and WMF files.** Kurla does not read their metadata, such as the TGA image ID and the EMF and WMF comment records. Each such file is listed in the coverage report under `not_scanned_for_metadata`.
 
 ## Text that is not decoded
 
