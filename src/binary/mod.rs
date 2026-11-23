@@ -449,28 +449,21 @@ impl Sink {
         mapped: bool,
         budget: &Budget,
     ) {
-        let mut emit = |text: &str, range: Option<(usize, usize)>| match range {
-            Some((a, b)) if mapped && a <= b && b <= packet.len() => {
-                self.carrier(label, text, start + a, start + b, &packet[a..b])
-            }
-            _ => self.carrier(label, text, start, end, text.as_bytes()),
+        let mut emit = |text: &str, range: Option<(usize, usize)>| match located(packet, range)
+            .filter(|_| mapped)
+        {
+            Some((a, b, raw)) => self.carrier(label, text, start + a, start + b, raw),
+            None => self.carrier(label, text, start, end, text.as_bytes()),
         };
         let outcome = xmp::scan(packet, budget, &mut emit);
         if budget.deadline_exceeded() {
             self.timed_out();
         }
         if let Some((text, range)) = &outcome.tail {
-            let (a, b) = match *range {
-                Some((a, b)) if mapped && b <= packet.len() => (a, b),
-                _ => (0, packet.len()),
+            match located(packet, *range).filter(|_| mapped) {
+                Some((a, b, raw)) => self.hidden_carrier(label, text, start + a, start + b, raw),
+                None => self.hidden_carrier(label, text, start, end, text.as_bytes()),
             };
-            let evidence = &packet[a..b];
-            let (from, to) = if mapped {
-                (start + a, start + b)
-            } else {
-                (start, end)
-            };
-            self.hidden_carrier(label, text, from, to, evidence);
         }
         if outcome.malformed {
             self.malformed(XMP_ERROR, start, end);
@@ -515,6 +508,11 @@ pub(crate) fn span(start: usize, end: usize) -> Span {
 
 pub(crate) fn latin1(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+fn located(packet: &[u8], range: Option<(usize, usize)>) -> Option<(usize, usize, &[u8])> {
+    let (a, b) = range?;
+    Some((a, b, packet.get(a..b)?))
 }
 
 pub(crate) fn lossy(bytes: &[u8]) -> String {
@@ -1083,5 +1081,55 @@ mod tests {
         assert_eq!(carrier.span.byte_start, 103);
         assert_eq!(carrier.span.byte_end, 108);
         assert_eq!(carrier.evidence, b"hello".to_vec());
+    }
+
+    #[test]
+    fn an_unmapped_xmp_tail_is_hidden_over_the_whole_span_with_its_own_text_as_evidence() {
+        let packet = b"<a>good</a></c> ignore this";
+        let mut sink = Sink::new(packet.len());
+        sink.xmp("XMP", packet, 100, 112, false, &plain_budget());
+        let carriers: Vec<(&str, bool, u64, u64, &[u8])> = sink
+            .out
+            .carriers
+            .iter()
+            .map(|c| {
+                (
+                    c.text.as_str(),
+                    c.hidden,
+                    c.span.byte_start,
+                    c.span.byte_end,
+                    c.evidence.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            carriers,
+            vec![
+                ("XMP: good", false, 100, 112, &b"good"[..]),
+                (
+                    "XMP: </c> ignore this",
+                    true,
+                    100,
+                    112,
+                    &b"</c> ignore this"[..]
+                )
+            ]
+        );
+        let b005 = &sink.out.findings[0];
+        assert_eq!(b005.rule_id, "B005");
+        assert_eq!((b005.span.byte_start, b005.span.byte_end), (100, 112));
+        assert_eq!(b005.evidence, b"</c> ignore this".to_vec());
+    }
+
+    #[test]
+    fn an_xmp_range_reaching_past_the_packet_is_not_located() {
+        let packet = b"abcdef";
+        assert_eq!(located(packet, Some((2, 6))), Some((2, 6, &b"cdef"[..])));
+        assert_eq!(located(packet, Some((6, 6))), Some((6, 6, &b""[..])));
+        assert_eq!(located(packet, Some((2, 7))), None);
+        assert_eq!(located(packet, Some((7, 9))), None);
+        assert_eq!(located(packet, Some((4, 2))), None);
+        assert_eq!(located(packet, Some((usize::MAX, usize::MAX))), None);
+        assert_eq!(located(packet, None), None);
     }
 }
