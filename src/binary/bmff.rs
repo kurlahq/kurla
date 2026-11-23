@@ -1,6 +1,7 @@
-use super::{Placement, Sink, sub};
+use super::png::{Inflated, inflate};
+use super::{Placement, Sink, lossy, span, sub};
 use crate::limits::Budget;
-use crate::model::DetectorOutput;
+use crate::model::{DetectorOutput, EmbeddedBlob, FileKind};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
@@ -11,26 +12,56 @@ const MAX_RECORDED_RANGES: usize = 1 << 20;
 const EXIF_PREFIX: &[u8] = b"Exif\0\0";
 const XMP_MIME: &[u8] = b"application/rdf+xml";
 const RIFF_HEADER_LEN: usize = 12;
+const RIFF_SIZE: &str = "malformed WebP: RIFF size does not fit the file";
+const TRUNCATED_CHUNK: &str = "malformed WebP: truncated chunk";
+const WEBP_TRAILER: &str = "WebP data after RIFF";
+const TRUNCATED_BOX: &str = "malformed AVIF: truncated box";
+const INVALID_ITEM: &str = "malformed AVIF: invalid item information";
+const AVIF_TRAILER: &str = "AVIF data after the last box";
+const REFERENCED_ITEM: &str = "referenced item";
+const ENCODED_ITEM: &str = "encoded item";
+const INFLATE_LIMIT: &str = "compressed AVIF item inflates past the decompression budget";
+const XMP_LABEL: &str = "AVIF XMP";
+const XMP_UUID: [u8; 16] = [
+    0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, 0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF, 0xAC,
+];
+const TOP_LEVEL_BOXES: [&[u8; 4]; 11] = [
+    b"ftyp", b"styp", b"meta", b"moov", b"moof", b"mfra", b"mdat", b"free", b"skip", b"uuid",
+    b"sidx",
+];
 
 pub fn scan_webp(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
     let mut sink = Sink::new(bytes.len());
     if !(bytes.starts_with(b"RIFF") && bytes.get(8..RIFF_HEADER_LEN) == Some(b"WEBP".as_slice())) {
         return sink.out;
     }
+    let declared = le_u32(bytes, 4)
+        .and_then(|n| usize::try_from(n).ok())
+        .and_then(|n| n.checked_add(8));
+    let riff_end = match declared {
+        Some(end) if (RIFF_HEADER_LEN..=bytes.len()).contains(&end) => end,
+        _ => {
+            sink.malformed(RIFF_SIZE, 4, 8);
+            bytes.len()
+        }
+    };
+    let body = &bytes[..riff_end];
     let mut at = RIFF_HEADER_LEN;
-    loop {
+    while at < body.len() {
         if budget.deadline_exceeded() {
             sink.timed_out();
             break;
         }
-        let Some(kind) = sub(bytes, at, 4) else {
-            break;
-        };
-        let Some(size) = le_u32(bytes, at + 4).and_then(|n| usize::try_from(n).ok()) else {
+        let (Some(kind), Some(size)) = (
+            sub(body, at, 4),
+            le_u32(body, at + 4).and_then(|n| usize::try_from(n).ok()),
+        ) else {
+            sink.malformed(TRUNCATED_CHUNK, at, body.len());
             break;
         };
         let start = at + 8;
-        let Some(payload) = sub(bytes, start, size) else {
+        let Some(payload) = sub(body, start, size) else {
+            sink.malformed(TRUNCATED_CHUNK, at, body.len());
             break;
         };
         let end = start + size;
@@ -55,6 +86,9 @@ pub fn scan_webp(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
             break;
         }
         at = end.saturating_add(size & 1);
+    }
+    if !sink.stop {
+        sink.trailer(WEBP_TRAILER, bytes, riff_end, false);
     }
     sink.out
 }
@@ -97,12 +131,30 @@ fn be(bytes: &[u8], at: usize, width: usize) -> Option<u64> {
     )
 }
 
-fn is_xmp_mime(content_type: &[u8]) -> bool {
+fn mime_kind(content_type: &[u8]) -> Option<Wanted> {
     let base = content_type
         .split(|&c| c == b';')
         .next()
-        .unwrap_or_default();
-    base.trim_ascii().eq_ignore_ascii_case(XMP_MIME)
+        .unwrap_or_default()
+        .trim_ascii()
+        .to_ascii_lowercase();
+    if base == XMP_MIME {
+        Some(Wanted::Xmp)
+    } else if base.ends_with(b"+xml") || base.ends_with(b"/xml") {
+        Some(Wanted::Xml)
+    } else if base.starts_with(b"text/") {
+        Some(Wanted::Text)
+    } else {
+        None
+    }
+}
+
+fn coding(encoding: Option<&[u8]>) -> Coding {
+    match encoding.map(<[u8]>::trim_ascii) {
+        None | Some(b"") => Coding::Plain,
+        Some(name) if name.eq_ignore_ascii_case(b"deflate") => Coding::Deflate,
+        Some(_) => Coding::Unknown,
+    }
 }
 
 fn be_usize(bytes: &[u8], at: usize, width: usize) -> Option<usize> {
@@ -153,6 +205,22 @@ fn read_box(bytes: &[u8], at: usize, end: usize) -> Option<BoxHeader> {
 enum Wanted {
     Exif,
     Xmp,
+    Xml,
+    Text,
+    Uri,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Coding {
+    Plain,
+    Deflate,
+    Unknown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Item {
+    kind: Wanted,
+    coding: Coding,
 }
 
 #[derive(Clone, Copy)]
@@ -185,6 +253,53 @@ struct Resolved<'a> {
     ranges: Vec<(usize, usize)>,
 }
 
+struct Infe<'a> {
+    id: u32,
+    item: Option<Item>,
+    name: &'a [u8],
+    name_at: usize,
+}
+
+struct Location<'d> {
+    id: u64,
+    method: u64,
+    reference: u64,
+    base: u64,
+    extents: &'d [u8],
+}
+
+fn location<'d>(
+    d: &'d [u8],
+    at: &mut usize,
+    version: u8,
+    widths: Widths,
+    (base_width, id_width): (usize, usize),
+) -> Option<Location<'d>> {
+    let id = be(d, *at, id_width)?;
+    *at += id_width;
+    let mut method = 0;
+    if version >= 1 {
+        method = be(d, *at, 2)? & 0xF;
+        *at += 2;
+    }
+    let reference = be(d, *at, 2)?;
+    *at += 2;
+    let base = be(d, *at, base_width)?;
+    *at += base_width;
+    let count = be_usize(d, *at, 2)?;
+    *at += 2;
+    let extents_len = count.checked_mul(widths.index + widths.offset + widths.length)?;
+    let extents = sub(d, *at, extents_len)?;
+    *at += extents_len;
+    Some(Location {
+        id,
+        method,
+        reference,
+        base,
+        extents,
+    })
+}
+
 impl<'a> Avif<'a> {
     fn expired(&mut self) -> bool {
         if self.budget.deadline_exceeded() {
@@ -195,18 +310,49 @@ impl<'a> Avif<'a> {
         }
     }
 
+    fn invalid(&mut self, start: usize, end: usize) {
+        self.sink.malformed(INVALID_ITEM, start, end);
+    }
+
+    fn not_scanned(&mut self, (start, end): (usize, usize), format: &'static str) {
+        self.sink.out.embedded.push(EmbeddedBlob {
+            kind: FileKind::UnknownBinary,
+            declared_type: None,
+            format: Some(format),
+            span: span(start, end),
+            bytes: Vec::new(),
+            evidence: Vec::new(),
+        });
+    }
+
     fn run(&mut self) {
-        let metas = self.find_metas();
+        let (metas, tail) = self.find_metas();
         for (start, end) in metas {
             if self.sink.stop {
                 break;
             }
             self.meta(start, end);
         }
+        if let Some(at) = tail
+            && !self.sink.stop
+        {
+            self.leftover(at, self.bytes.len(), true);
+        }
     }
 
-    fn find_metas(&mut self) -> Vec<(usize, usize)> {
+    fn leftover(&mut self, at: usize, end: usize, top: bool) {
+        let boxed = sub(self.bytes, at + 4, 4)
+            .is_some_and(|kind| TOP_LEVEL_BOXES.iter().any(|known| kind == known.as_slice()));
+        if top && !boxed {
+            self.sink.trailer(AVIF_TRAILER, self.bytes, at, false);
+        } else {
+            self.sink.malformed(TRUNCATED_BOX, at, end);
+        }
+    }
+
+    fn find_metas(&mut self) -> (Vec<(usize, usize)>, Option<usize>) {
         let mut metas = Vec::new();
+        let mut tail = None;
         let mut stack = vec![Frame {
             at: 0,
             end: self.bytes.len(),
@@ -217,6 +363,13 @@ impl<'a> Avif<'a> {
                 break;
             }
             let Some(b) = read_box(self.bytes, frame.at, frame.end) else {
+                if frame.at < frame.end {
+                    if stack.len() == 1 {
+                        tail = Some(frame.at);
+                    } else {
+                        self.leftover(frame.at, frame.end, false);
+                    }
+                }
                 stack.pop();
                 continue;
             };
@@ -224,9 +377,16 @@ impl<'a> Avif<'a> {
                 top.at = b.end;
             }
             match &b.kind {
-                b"meta" => {
-                    if let Some(p) = b.payload.checked_add(4).filter(|&p| p <= b.end) {
-                        metas.push((p, b.end));
+                b"meta" => match b.payload.checked_add(4).filter(|&p| p <= b.end) {
+                    Some(p) => metas.push((p, b.end)),
+                    None => self.sink.malformed(TRUNCATED_BOX, b.start, b.end),
+                },
+                b"uuid" => {
+                    let body = self.bytes.get(b.payload..b.end).unwrap_or_default();
+                    if let Some(packet) = body.strip_prefix(&XMP_UUID) {
+                        let start = b.end - packet.len();
+                        let budget = &*self.budget;
+                        self.sink.xmp(XMP_LABEL, packet, start, b.end, true, budget);
                     }
                 }
                 b"moov" | b"trak" => {
@@ -245,13 +405,19 @@ impl<'a> Avif<'a> {
                 _ => {}
             }
         }
-        metas
+        (metas, tail)
     }
 
     fn meta(&mut self, start: usize, end: usize) {
         let (mut iinf, mut iloc, mut idat) = (None, None, None);
         let mut at = start;
-        while let Some(b) = read_box(self.bytes, at, end) {
+        loop {
+            let Some(b) = read_box(self.bytes, at, end) else {
+                if at < end {
+                    self.sink.malformed(TRUNCATED_BOX, at, end);
+                }
+                break;
+            };
             if self.expired() {
                 return;
             }
@@ -262,30 +428,49 @@ impl<'a> Avif<'a> {
                 b"idat" => &mut idat,
                 _ => continue,
             };
-            slot.get_or_insert(b);
+            if slot.is_some() {
+                self.invalid(b.start, b.end);
+            } else {
+                *slot = Some(b);
+            }
         }
-        let (Some(iinf), Some(iloc)) = (iinf, iloc) else {
-            return;
-        };
-        let wanted = self.iinf(iinf);
-        if wanted.is_empty() || self.sink.stop {
-            return;
+        match (iinf, iloc) {
+            (Some(iinf), Some(iloc)) => {
+                let wanted = self.iinf(iinf);
+                if !self.sink.stop {
+                    self.iloc(iloc, idat, &wanted);
+                }
+            }
+            (Some(iinf), None) => {
+                if !self.iinf(iinf).is_empty() {
+                    self.invalid(iinf.start, iinf.end);
+                }
+            }
+            (None, Some(iloc)) => self.invalid(iloc.start, iloc.end),
+            (None, None) => {}
         }
-        self.iloc(iloc, idat, &wanted);
     }
 
-    fn iinf(&mut self, b: BoxHeader) -> HashMap<u32, Vec<Wanted>> {
-        let mut wanted: HashMap<u32, Vec<Wanted>> = HashMap::new();
+    fn iinf(&mut self, b: BoxHeader) -> HashMap<u32, Vec<Item>> {
+        let mut wanted: HashMap<u32, Vec<Item>> = HashMap::new();
         let mut seen: HashSet<u32> = HashSet::new();
-        let Some(&version) = self.bytes.get(b.payload) else {
+        let version = self.bytes.get(b.payload..b.end).and_then(|d| d.first());
+        let count_width = if version == Some(&0) { 2 } else { 4 };
+        let first = b
+            .payload
+            .checked_add(4 + count_width)
+            .filter(|&at| at <= b.end);
+        let (Some(_), Some(mut at)) = (version, first) else {
+            self.invalid(b.start, b.end);
             return wanted;
         };
-        let count_width = if version == 0 { 2 } else { 4 };
-        let mut at = match b.payload.checked_add(4 + count_width) {
-            Some(at) if at <= b.end => at,
-            _ => return wanted,
-        };
-        while let Some(entry) = read_box(self.bytes, at, b.end) {
+        loop {
+            let Some(entry) = read_box(self.bytes, at, b.end) else {
+                if at < b.end {
+                    self.sink.malformed(TRUNCATED_BOX, at, b.end);
+                }
+                break;
+            };
             if self.expired() {
                 break;
             }
@@ -298,45 +483,75 @@ impl<'a> Avif<'a> {
                 self.sink.l001("item limit", entry.start, entry.end);
                 break;
             }
-            if let Some((id, kind)) = self.infe(entry) {
-                if !seen.insert(id) {
-                    self.anomaly = true;
-                }
-                if let Some(kind) = kind {
-                    let kinds = wanted.entry(id).or_default();
-                    if !kinds.contains(&kind) {
-                        kinds.push(kind);
-                    }
+            let Some(infe) = self.infe(entry) else {
+                self.invalid(entry.start, entry.end);
+                continue;
+            };
+            self.sink.carrier(
+                "AVIF item name",
+                &lossy(infe.name),
+                infe.name_at,
+                infe.name_at + infe.name.len(),
+                infe.name,
+            );
+            if !seen.insert(infe.id) {
+                self.anomaly = true;
+            }
+            if let Some(item) = infe.item {
+                let kinds = wanted.entry(infe.id).or_default();
+                if !kinds.contains(&item) {
+                    kinds.push(item);
                 }
             }
         }
         wanted
     }
 
-    fn infe(&self, b: BoxHeader) -> Option<(u32, Option<Wanted>)> {
+    fn infe(&self, b: BoxHeader) -> Option<Infe<'a>> {
         let d = self.bytes.get(b.payload..b.end)?;
         let version = *d.first()?;
         if version > 3 {
             return None;
         }
-        if version < 2 {
-            return Some((u32::try_from(be(d, 4, 2)?).ok()?, None));
-        }
-        let id_width = if version == 2 { 2 } else { 4 };
+        let id_width = if version == 3 { 4 } else { 2 };
         let id = u32::try_from(be(d, 4, id_width)?).ok()?;
-        let type_at = 4 + id_width + 2;
-        let kind = sub(d, type_at, 4)?;
-        let rest = d.get(type_at + 4..)?;
-        let wanted = match kind {
-            b"Exif" => Some(Wanted::Exif),
-            b"mime" => rest.iter().position(|&c| c == 0).and_then(|name_end| {
-                let after = &rest[name_end + 1..];
-                let content_type = after.split(|&c| c == 0).next().unwrap_or_default();
-                is_xmp_mime(content_type).then_some(Wanted::Xmp)
-            }),
-            _ => None,
+        let mut at = 4 + id_width + 2;
+        let kind = if version >= 2 {
+            let kind = sub(d, at, 4)?;
+            at += 4;
+            Some(kind)
+        } else {
+            None
         };
-        Some((id, wanted))
+        let rest = d.get(at..)?;
+        let name_end = rest.iter().position(|&c| c == 0)?;
+        let name = &rest[..name_end];
+        let mut fields = rest[name_end + 1..].split(|&c| c == 0);
+        let item = match kind {
+            Some(b"Exif") => Some(Item {
+                kind: Wanted::Exif,
+                coding: Coding::Plain,
+            }),
+            Some(b"mime") | None => {
+                let content_type = fields.next().unwrap_or_default();
+                let encoding = fields.next();
+                mime_kind(content_type).map(|kind| Item {
+                    kind,
+                    coding: coding(encoding),
+                })
+            }
+            Some(b"uri ") => Some(Item {
+                kind: Wanted::Uri,
+                coding: Coding::Plain,
+            }),
+            Some(_) => None,
+        };
+        Some(Infe {
+            id,
+            item,
+            name,
+            name_at: b.payload + at,
+        })
     }
 
     fn overlaps(&mut self) -> bool {
@@ -371,20 +586,15 @@ impl<'a> Avif<'a> {
         }
     }
 
-    fn iloc(&mut self, b: BoxHeader, idat: Option<BoxHeader>, wanted: &HashMap<u32, Vec<Wanted>>) {
+    fn iloc(&mut self, b: BoxHeader, idat: Option<BoxHeader>, wanted: &HashMap<u32, Vec<Item>>) {
         let bytes = self.bytes;
-        let Some(d) = bytes.get(b.payload..b.end) else {
+        let header = bytes
+            .get(b.payload..b.end)
+            .and_then(|d| Some((d, *d.first()?, *d.get(4)?, *d.get(5)?)));
+        let Some((d, version, sizes, bases)) = header else {
+            self.invalid(b.start, b.end);
             return;
         };
-        let Some(&version) = d.first() else {
-            return;
-        };
-        let (Some(&sizes), Some(&bases)) = (d.get(4), d.get(5)) else {
-            return;
-        };
-        if version > 2 {
-            return;
-        }
         let widths = Widths {
             index: if version >= 1 {
                 usize::from(bases & 15)
@@ -396,72 +606,54 @@ impl<'a> Avif<'a> {
         };
         let base_width = usize::from(bases >> 4);
         let valid = |w: usize| matches!(w, 0 | 4 | 8);
-        if !(valid(widths.index) && valid(widths.offset) && valid(base_width))
-            || !valid(widths.length)
-        {
-            return;
-        }
         let id_width = if version < 2 { 2 } else { 4 };
-        let Some(mut remaining) = be(d, 6, id_width) else {
+        let count = be(d, 6, id_width);
+        let usable = version <= 2
+            && valid(widths.index)
+            && valid(widths.offset)
+            && valid(base_width)
+            && valid(widths.length);
+        let (true, Some(mut remaining)) = (usable, count) else {
+            self.invalid(b.start, b.end);
             return;
         };
         let mut at = 6 + id_width;
-        let extent_width = widths.index + widths.offset + widths.length;
         while remaining > 0 {
             remaining -= 1;
             if self.expired() || self.sink.stop {
                 return;
             }
-            let Some(id) = be(d, at, id_width) else {
+            let Some(loc) = location(d, &mut at, version, widths, (base_width, id_width)) else {
+                self.invalid(b.start, b.end);
                 return;
             };
-            at += id_width;
-            let mut method = 0;
-            if version >= 1 {
-                let Some(m) = be(d, at, 2) else {
-                    return;
-                };
-                method = m & 0xF;
-                at += 2;
-            }
-            let Some(reference) = be(d, at, 2) else {
-                return;
-            };
-            at += 2;
-            let Some(base) = be(d, at, base_width) else {
-                return;
-            };
-            at += base_width;
-            let Some(count) = be_usize(d, at, 2) else {
-                return;
-            };
-            at += 2;
-            let Some(extents_len) = count.checked_mul(extent_width) else {
-                return;
-            };
-            let Some(extents) = sub(d, at, extents_len) else {
-                return;
-            };
-            at += extents_len;
-            let Some(kinds) = u32::try_from(id).ok().and_then(|id| wanted.get(&id)) else {
+            let Some(kinds) = u32::try_from(loc.id).ok().and_then(|id| wanted.get(&id)) else {
                 continue;
             };
-            if reference != 0 {
+            if loc.reference != 0 || loc.method == 2 {
+                self.not_scanned((b.start, b.end), REFERENCED_ITEM);
                 continue;
             }
-            let (origin, limit) = match (method, idat) {
+            let (origin, limit) = match (loc.method, idat) {
                 (0, _) => (0, bytes.len()),
                 (1, Some(i)) => (i.payload, i.end),
-                _ => continue,
+                _ => {
+                    self.invalid(b.start, b.end);
+                    continue;
+                }
             };
-            let Some(resolved) = self.resolve(extents, widths, base, (origin, limit)) else {
+            let Some(resolved) = self.resolve(loc.extents, widths, loc.base, (origin, limit))
+            else {
+                if !self.sink.stop {
+                    self.invalid(b.start, b.end);
+                }
                 continue;
             };
             if !self.charge(&resolved) {
                 return;
             }
-            for kind in kinds {
-                self.emit(&resolved, *kind);
+            for item in kinds {
+                self.emit(&resolved, *item);
             }
         }
     }
@@ -522,38 +714,75 @@ impl<'a> Avif<'a> {
         })
     }
 
-    fn emit(&mut self, item: &Resolved<'_>, kind: Wanted) {
+    fn decoded<'r>(&mut self, item: &'r Resolved<'_>, coding: Coding) -> Option<Cow<'r, [u8]>> {
+        let (start, end) = item.first;
+        match coding {
+            Coding::Plain => Some(Cow::Borrowed(&item.data)),
+            Coding::Unknown => {
+                self.not_scanned((start, end), ENCODED_ITEM);
+                None
+            }
+            Coding::Deflate => match inflate(&item.data, self.budget) {
+                Inflated::Text(out) => {
+                    self.sink.add_inflated(out.len());
+                    Some(Cow::Owned(out))
+                }
+                Inflated::Corrupt(partial) => {
+                    self.sink.add_inflated(partial.len());
+                    self.invalid(start, end);
+                    Some(Cow::Owned(partial))
+                }
+                Inflated::LimitHit => {
+                    self.sink.limit_hit(start, end, INFLATE_LIMIT);
+                    None
+                }
+            },
+        }
+    }
+
+    fn emit(&mut self, item: &Resolved<'_>, wanted: Item) {
+        let Some(data) = self.decoded(item, wanted.coding) else {
+            return;
+        };
+        let (start, end) = item.first;
+        let contiguous = item
+            .contiguous_from
+            .filter(|_| wanted.coding == Coding::Plain);
         let budget = &*self.budget;
-        match kind {
+        match wanted.kind {
             Wanted::Exif => {
-                let Some(offset) = be_usize(&item.data, 0, 4) else {
-                    return;
-                };
-                let Some(mut skip) = offset.checked_add(4) else {
-                    return;
-                };
-                let Some(mut tiff) = item.data.get(skip..) else {
+                let tiff = be_usize(&data, 0, 4)
+                    .and_then(|offset| offset.checked_add(4))
+                    .and_then(|skip| Some((skip, data.get(skip..)?)));
+                let Some((mut skip, mut tiff)) = tiff else {
+                    self.sink.malformed(INVALID_ITEM, start, end);
                     return;
                 };
                 if tiff.starts_with(EXIF_PREFIX) {
                     skip += EXIF_PREFIX.len();
                     tiff = &tiff[EXIF_PREFIX.len()..];
                 }
-                let placement = match item.contiguous_from {
+                let placement = match contiguous {
                     Some(from) => Placement::Mapped(from + skip),
-                    None => Placement::Whole(item.first.0, item.first.1),
+                    None => Placement::Whole(start, end),
                 };
                 self.sink.exif_at("AVIF Exif", tiff, placement, budget);
             }
             Wanted::Xmp => {
-                self.sink.xmp(
-                    "AVIF XMP",
-                    &item.data,
-                    item.first.0,
-                    item.first.1,
-                    item.contiguous_from.is_some(),
-                    budget,
-                );
+                self.sink
+                    .xmp(XMP_LABEL, &data, start, end, contiguous.is_some(), budget);
+            }
+            Wanted::Xml => {
+                self.sink
+                    .xmp("AVIF XML", &data, start, end, contiguous.is_some(), budget);
+            }
+            Wanted::Text => {
+                self.sink
+                    .carrier("AVIF text", &lossy(&data), start, end, &data);
+            }
+            Wanted::Uri => {
+                self.sink
+                    .carrier("AVIF uri item", &lossy(&data), start, end, &data);
             }
         }
     }
@@ -563,7 +792,7 @@ impl<'a> Avif<'a> {
 mod tests {
     use super::*;
     use crate::limits::Limits;
-    use crate::model::{CarrierKind, Family, RuleStatus, Severity, SkipReason};
+    use crate::model::{CarrierKind, Family, FileKind, RuleStatus, Severity, SkipReason};
     use std::time::Duration;
 
     const TIFF: [u8; 32] = [
@@ -578,6 +807,20 @@ mod tests {
 
     fn texts(out: &DetectorOutput) -> Vec<&str> {
         out.carriers.iter().map(|c| c.text.as_str()).collect()
+    }
+
+    fn findings(out: &DetectorOutput) -> Vec<(&str, &str, u64, u64)> {
+        out.findings
+            .iter()
+            .map(|f| {
+                (
+                    f.rule_id,
+                    f.message.as_str(),
+                    f.span.byte_start,
+                    f.span.byte_end,
+                )
+            })
+            .collect()
     }
 
     fn spans(out: &DetectorOutput) -> Vec<(u64, u64)> {
@@ -722,12 +965,77 @@ mod tests {
     }
 
     #[test]
-    fn webp_truncated_chunk_stops_walk_and_keeps_earlier_carriers() {
+    fn webp_truncated_chunk_keeps_earlier_carriers_and_marks_the_webp_malformed() {
         let bytes = riff(&[(b"EXIF", 32, &TIFF), (b"XMP ", 100, b"<a>x</a>")]);
         let out = scan_webp(&bytes, &mut budget());
         assert_eq!(texts(&out), vec!["WebP Exif ImageDescription: hello"]);
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed WebP: truncated chunk", 52, 68)]
+        );
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
         let huge = riff(&[(b"XMP ", u32::MAX, b"<a>x</a>")]);
-        assert!(scan_webp(&huge, &mut budget()).carriers.is_empty());
+        let out = scan_webp(&huge, &mut budget());
+        assert!(out.carriers.is_empty());
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed WebP: truncated chunk", 12, 28)]
+        );
+        let mut header = riff(&[(b"EXIF", 32, &TIFF)]);
+        header.extend_from_slice(b"XMP");
+        let size = (header.len() - 8) as u32;
+        header[4..8].copy_from_slice(&size.to_le_bytes());
+        let out = scan_webp(&header, &mut budget());
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed WebP: truncated chunk", 52, 55)]
+        );
+    }
+
+    #[test]
+    fn data_after_the_riff_size_follows_the_trailer_rule() {
+        let with = |tail: &[u8]| {
+            let mut bytes = riff(&[(b"EXIF", 32, &TIFF)]);
+            bytes.extend_from_slice(tail);
+            scan_webp(&bytes, &mut budget())
+        };
+        let out = with(b"note for the reader");
+        assert_eq!(
+            texts(&out),
+            vec![
+                "WebP Exif ImageDescription: hello",
+                "WebP data after RIFF: note for the reader"
+            ]
+        );
+        assert!(out.carriers[1].hidden);
+        assert_eq!(
+            findings(&out),
+            vec![("B004", "data after the end of the image", 52, 71)]
+        );
+        let out = with(b"PK\x03\x04rest of a zip");
+        assert_eq!(findings(&out)[0].0, "B004");
+        assert_eq!(out.embedded[0].format, Some("zip"));
+        let out = with(b"\0\0\0\0");
+        assert!(out.findings.is_empty() && out.embedded.is_empty());
+    }
+
+    #[test]
+    fn a_riff_size_that_does_not_fit_the_file_marks_the_webp_malformed() {
+        for declared in [1000u32, 0] {
+            let mut bytes = riff(&[(b"EXIF", 32, &TIFF)]);
+            bytes[4..8].copy_from_slice(&declared.to_le_bytes());
+            let out = scan_webp(&bytes, &mut budget());
+            assert_eq!(texts(&out), vec!["WebP Exif ImageDescription: hello"]);
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed WebP: RIFF size does not fit the file",
+                    4,
+                    8
+                )]
+            );
+        }
     }
 
     #[test]
@@ -809,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn iloc_v1_construction_method_2_is_skipped() {
+    fn items_stored_by_reference_are_listed_as_not_scanned() {
         let mut iloc = vec![0x44, 0x00];
         iloc.extend_from_slice(&1u16.to_be_bytes());
         iloc.extend_from_slice(&1u16.to_be_bytes());
@@ -818,12 +1126,441 @@ mod tests {
         iloc.extend_from_slice(&1u16.to_be_bytes());
         iloc.extend_from_slice(&0u32.to_be_bytes());
         iloc.extend_from_slice(&36u32.to_be_bytes());
-        let mut children = iinf(&[infe(2, 1, b"Exif", None)]);
-        children.extend_from_slice(&full(b"iloc", 1, &iloc));
-        children.extend_from_slice(&bx(b"idat", &exif_item()));
+        let mut external = vec![0x44, 0x00];
+        external.extend_from_slice(&1u16.to_be_bytes());
+        external.extend_from_slice(&1u16.to_be_bytes());
+        external.extend_from_slice(&1u16.to_be_bytes());
+        external.extend_from_slice(&1u16.to_be_bytes());
+        external.extend_from_slice(&0u32.to_be_bytes());
+        external.extend_from_slice(&36u32.to_be_bytes());
+        for (version, body) in [(1u8, iloc), (0u8, external)] {
+            let mut children = iinf(&[infe(2, 1, b"Exif", None)]);
+            let iloc_at = 32 + children.len();
+            let iloc_box = full(b"iloc", version, &body);
+            let iloc_end = iloc_at + iloc_box.len();
+            children.extend_from_slice(&iloc_box);
+            children.extend_from_slice(&bx(b"idat", &exif_item()));
+            let mut bytes = ftyp();
+            bytes.extend_from_slice(&full(b"meta", 0, &children));
+            let out = scan_avif(&bytes, &mut budget());
+            assert!(out.carriers.is_empty());
+            assert!(out.findings.is_empty());
+            assert_eq!(out.embedded.len(), 1);
+            let blob = &out.embedded[0];
+            assert_eq!(
+                (blob.kind, blob.format),
+                (FileKind::UnknownBinary, Some("referenced item"))
+            );
+            assert_eq!(
+                (blob.span.byte_start, blob.span.byte_end),
+                (iloc_at as u64, iloc_end as u64)
+            );
+        }
+    }
+
+    fn infe_with(version: u8, id: u16, kind: &[u8; 4], name: &[u8], strings: &[&[u8]]) -> Vec<u8> {
+        let mut body = id.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0, 0]);
+        if version >= 2 {
+            body.extend_from_slice(kind);
+        }
+        body.extend_from_slice(name);
+        body.push(0);
+        for s in strings {
+            body.extend_from_slice(s);
+            body.push(0);
+        }
+        full(b"infe", version, &body)
+    }
+
+    fn items_file(entries: &[Vec<u8>], items: &[(u16, usize)], mdat: &[u8]) -> Vec<u8> {
+        let children = |base: u32| {
+            let mut offset = base;
+            let located: Vec<(u16, Vec<(u32, u32)>)> = items
+                .iter()
+                .map(|&(id, len)| {
+                    let extent = (offset, len as u32);
+                    offset += len as u32;
+                    (id, vec![extent])
+                })
+                .collect();
+            let mut c = iinf(entries);
+            c.extend_from_slice(&iloc0(&located));
+            c
+        };
+        assemble(0, &children, mdat)
+    }
+
+    #[test]
+    fn version_0_and_1_item_info_with_an_xmp_content_type_is_read() {
+        for version in [0, 1] {
+            let entry = infe_with(version, 1, b"mime", b"", &[XMP_MIME]);
+            let bytes = items_file(&[entry], &[(1, 13)], b"<a>secret</a>");
+            let out = scan_avif(&bytes, &mut budget());
+            assert_eq!(texts(&out), vec!["AVIF XMP: secret"], "{version}");
+            assert!(out.findings.is_empty());
+        }
+    }
+
+    #[test]
+    fn item_names_are_carriers() {
+        let entry = infe_with(2, 1, b"Exif", b"Kitchen", &[]);
+        let bytes = items_file(&[entry], &[(1, 36)], &exif_item());
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(
+            texts(&out),
+            vec![
+                "AVIF item name: Kitchen",
+                "AVIF Exif ImageDescription: hello"
+            ]
+        );
+        assert_eq!(spans(&out)[0], (66, 73));
+        let old = infe_with(0, 1, b"    ", b"Pantry", &[b"image/jpeg"]);
+        let out = scan_avif(&items_file(&[old], &[], b""), &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF item name: Pantry"]);
+    }
+
+    #[test]
+    fn deflate_encoded_items_are_inflated_within_the_budget() {
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(b"<a>secret</a>", 6);
+        let entry = infe_with(2, 1, b"mime", b"", &[XMP_MIME, b"deflate"]);
+        let bytes = items_file(&[entry], &[(1, z.len())], &z);
+        let mut b = budget();
+        let out = scan_avif(&bytes, &mut b);
+        assert_eq!(texts(&out), vec!["AVIF XMP: secret"]);
+        assert_eq!(
+            b.remaining_decompressed(),
+            Limits::default().max_decompressed_bytes - 13
+        );
+        let bomb = miniz_oxide::deflate::compress_to_vec_zlib(&vec![b'A'; 100_000], 6);
+        let entry = infe_with(2, 1, b"mime", b"", &[XMP_MIME, b"deflate"]);
+        let bytes = items_file(&[entry], &[(1, bomb.len())], &bomb);
+        let limits = Limits {
+            max_decompressed_bytes: 1000,
+            ..Limits::default()
+        };
+        let out = scan_avif(&bytes, &mut Budget::new(&limits));
+        assert_eq!(findings(&out)[0].0, "B002");
+        assert_eq!(out.skip, Some(SkipReason::DecompressionLimit));
+        let entry = infe_with(2, 1, b"mime", b"", &[XMP_MIME, b"br"]);
+        let out = scan_avif(&items_file(&[entry], &[(1, 4)], b"abcd"), &mut budget());
+        assert!(out.carriers.is_empty() && out.findings.is_empty());
+        assert_eq!(out.embedded[0].format, Some("encoded item"));
+        let mut corrupt = miniz_oxide::deflate::compress_to_vec_zlib(b"<a>secret</a>", 6);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        let entry = infe_with(2, 1, b"mime", b"", &[XMP_MIME, b"deflate"]);
+        let out = scan_avif(
+            &items_file(&[entry], &[(1, corrupt.len())], &corrupt),
+            &mut budget(),
+        );
+        assert_eq!(texts(&out), vec!["AVIF XMP: secret"]);
+        assert_eq!(
+            findings(&out)[0].1,
+            "malformed AVIF: invalid item information"
+        );
+    }
+
+    #[test]
+    fn text_xml_and_uri_items_are_carriers() {
+        let entries = [
+            infe_with(2, 1, b"mime", b"", &[b"text/plain"]),
+            infe_with(2, 2, b"mime", b"", &[b"application/xml"]),
+            infe_with(2, 3, b"uri ", b"", &[b"urn:example:note"]),
+        ];
+        let mdat = b"hello there<a>words</a>a note";
+        let bytes = items_file(&entries, &[(1, 11), (2, 12), (3, 6)], mdat);
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(
+            texts(&out),
+            vec![
+                "AVIF text: hello there",
+                "AVIF XML: words",
+                "AVIF uri item: a note"
+            ]
+        );
+        assert!(out.findings.is_empty());
+    }
+
+    #[test]
+    fn broken_item_structures_mark_the_avif_malformed() {
+        let exif = || infe(2, 1, b"Exif", None);
+        let with_iloc = |entries: Vec<Vec<u8>>, iloc: Vec<u8>| {
+            let mut c = iinf(&entries);
+            c.extend_from_slice(&iloc);
+            let mut bytes = ftyp();
+            bytes.extend_from_slice(&full(b"meta", 0, &c));
+            bytes.extend_from_slice(&bx(b"mdat", &exif_item()));
+            bytes
+        };
+        let good_iloc = || iloc0(&[(1, vec![(0, 36)])]);
+        let mut cut_iloc = vec![0x44, 0x00];
+        cut_iloc.extend_from_slice(&1u16.to_be_bytes());
+        cut_iloc.push(0);
+        let mut method_1 = vec![0x44, 0x00];
+        method_1.extend_from_slice(&1u16.to_be_bytes());
+        method_1.extend_from_slice(&1u16.to_be_bytes());
+        method_1.extend_from_slice(&1u16.to_be_bytes());
+        method_1.extend_from_slice(&[0, 0]);
+        method_1.extend_from_slice(&1u16.to_be_bytes());
+        method_1.extend_from_slice(&0u32.to_be_bytes());
+        method_1.extend_from_slice(&36u32.to_be_bytes());
+        let cases = [
+            with_iloc(vec![full(b"infe", 4, &[0, 1, 0, 0])], good_iloc()),
+            with_iloc(vec![full(b"infe", 2, &[0])], good_iloc()),
+            with_iloc(vec![exif()], full(b"iloc", 3, &[0x44, 0, 0, 1])),
+            with_iloc(vec![exif()], full(b"iloc", 0, &cut_iloc)),
+            with_iloc(vec![exif()], iloc0(&[(1, vec![(100_000, 36)])])),
+            with_iloc(vec![exif()], full(b"iloc", 1, &method_1)),
+        ];
+        for bytes in cases {
+            let out = scan_avif(&bytes, &mut budget());
+            let found: Vec<(&str, &str)> = findings(&out).iter().map(|f| (f.0, f.1)).collect();
+            assert_eq!(
+                found,
+                vec![("L001", "malformed AVIF: invalid item information")]
+            );
+            assert_eq!(out.skip, Some(SkipReason::Malformed));
+        }
+        let mut cut_iinf = ftyp();
+        cut_iinf.extend_from_slice(&full(b"meta", 0, &full(b"iinf", 0, &[])));
+        let out = scan_avif(&cut_iinf, &mut budget());
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed AVIF: invalid item information", 32, 44)]
+        );
+    }
+
+    #[test]
+    fn an_exif_item_with_a_bad_header_offset_marks_the_avif_malformed() {
+        let mut item = vec![0, 0, 1, 0];
+        item.extend_from_slice(&TIFF);
+        let bytes = items_file(&[infe(2, 1, b"Exif", None)], &[(1, 36)], &item);
+        let out = scan_avif(&bytes, &mut budget());
+        assert!(out.carriers.is_empty());
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed AVIF: invalid item information", 105, 141)]
+        );
+    }
+
+    #[test]
+    fn a_meta_with_only_one_of_iinf_and_iloc_marks_the_avif_malformed() {
+        let only_iinf = iinf(&[infe(2, 1, b"Exif", None)]);
+        let only_iloc = iloc0(&[(1, vec![(0, 36)])]);
+        for children in [only_iinf, only_iloc] {
+            let mut bytes = ftyp();
+            bytes.extend_from_slice(&full(b"meta", 0, &children));
+            let out = scan_avif(&bytes, &mut budget());
+            assert_eq!(
+                findings(&out),
+                vec![(
+                    "L001",
+                    "malformed AVIF: invalid item information",
+                    32,
+                    32 + children.len() as u64
+                )]
+            );
+        }
+        let mut neither = ftyp();
+        neither.extend_from_slice(&full(b"meta", 0, &bx(b"hdlr", &[0; 8])));
+        assert!(scan_avif(&neither, &mut budget()).findings.is_empty());
+        let mut empty = iinf(&[]);
+        empty.extend_from_slice(&iloc0(&[]));
+        let mut both_empty = ftyp();
+        both_empty.extend_from_slice(&full(b"meta", 0, &empty));
+        assert!(scan_avif(&both_empty, &mut budget()).findings.is_empty());
+    }
+
+    fn iloc_sized(
+        version: u8,
+        (offset_size, length_size, base_size, index_size): (usize, usize, usize, usize),
+        base: u64,
+        (offset, length): (u64, u64),
+    ) -> Vec<u8> {
+        let field = |value: u64, width: usize| value.to_be_bytes()[8 - width..].to_vec();
+        let id_width = if version < 2 { 2 } else { 4 };
+        let mut body = vec![
+            (offset_size << 4 | length_size) as u8,
+            (base_size << 4 | index_size) as u8,
+        ];
+        body.extend(field(1, id_width));
+        body.extend(field(1, id_width));
+        if version >= 1 {
+            body.extend([0, 0]);
+        }
+        body.extend([0, 0]);
+        body.extend(field(base, base_size));
+        body.extend([0, 1]);
+        body.extend(field(0, index_size));
+        body.extend(field(offset, offset_size));
+        body.extend(field(length, length_size));
+        full(b"iloc", version, &body)
+    }
+
+    fn xmp_item_located_by(iloc: &dyn Fn(u64) -> Vec<u8>) -> Vec<u8> {
+        let children = |data_at: u32| {
+            let mut c = iinf(&[infe_with(2, 1, b"mime", b"", &[XMP_MIME])]);
+            c.extend_from_slice(&iloc(u64::from(data_at)));
+            c
+        };
+        assemble(0, &children, b"<a>secret</a>")
+    }
+
+    #[test]
+    fn an_iloc_base_offset_is_added_to_each_extent_offset() {
+        for base_size in [4, 8] {
+            let bytes = xmp_item_located_by(&|data_at| {
+                iloc_sized(0, (4, 4, base_size, 0), data_at.saturating_sub(5), (5, 13))
+            });
+            let out = scan_avif(&bytes, &mut budget());
+            assert_eq!(texts(&out), vec!["AVIF XMP: secret"], "{base_size}");
+            assert!(out.findings.is_empty(), "{base_size}");
+        }
+    }
+
+    #[test]
+    fn an_iloc_with_a_field_size_other_than_0_4_or_8_or_a_version_above_2_is_malformed() {
+        let cases = [
+            (0, (2, 4, 0, 0), false),
+            (0, (4, 2, 0, 0), false),
+            (0, (4, 4, 2, 0), true),
+            (1, (4, 4, 0, 2), false),
+            (3, (4, 4, 0, 0), false),
+        ];
+        for (version, sizes, in_base) in cases {
+            let bytes = xmp_item_located_by(&|data_at| {
+                let (base, offset) = if in_base { (data_at, 0) } else { (0, data_at) };
+                iloc_sized(version, sizes, base, (offset, 13))
+            });
+            let out = scan_avif(&bytes, &mut budget());
+            assert!(out.carriers.is_empty(), "{version} {sizes:?}");
+            let found: Vec<(&str, &str)> = findings(&out).iter().map(|f| (f.0, f.1)).collect();
+            assert_eq!(found, vec![("L001", INVALID_ITEM)], "{version} {sizes:?}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_entry_inside_iinf_marks_the_avif_malformed() {
+        let entry = infe_with(2, 1, b"mime", b"", &[XMP_MIME]);
+        let bytes = items_file(&[entry, vec![0, 0, 0]], &[(1, 13)], b"<a>secret</a>");
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF XMP: secret"]);
+        assert_eq!(findings(&out), vec![("L001", TRUNCATED_BOX, 87, 90)]);
+    }
+
+    #[test]
+    fn a_broken_iloc_marks_the_avif_malformed_when_no_item_holds_text() {
+        let mut children = iinf(&[infe(2, 1, b"av01", None)]);
+        let iloc_at = 32 + children.len() as u64;
+        let iloc = iloc_sized(3, (4, 4, 0, 0), 0, (0, 4));
+        children.extend_from_slice(&iloc);
         let mut bytes = ftyp();
         bytes.extend_from_slice(&full(b"meta", 0, &children));
-        assert!(scan_avif(&bytes, &mut budget()).carriers.is_empty());
+        bytes.extend_from_slice(&bx(b"mdat", b"AV1!"));
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(
+            findings(&out),
+            vec![("L001", INVALID_ITEM, iloc_at, iloc_at + iloc.len() as u64)]
+        );
+    }
+
+    const XMP_UUID: [u8; 16] = [
+        0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, 0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF,
+        0xAC,
+    ];
+
+    #[test]
+    fn a_uuid_xmp_box_is_read_at_the_top_level_and_in_moov() {
+        let mut payload = XMP_UUID.to_vec();
+        payload.extend_from_slice(b"<a>uuid words</a>");
+        let mut top = ftyp();
+        let at = top.len() as u64;
+        top.extend_from_slice(&bx(b"uuid", &payload));
+        let out = scan_avif(&top, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF XMP: uuid words"]);
+        assert_eq!(spans(&out), vec![(at + 27, at + 37)]);
+        let mut nested = ftyp();
+        nested.extend_from_slice(&bx(b"moov", &bx(b"uuid", &payload)));
+        let out = scan_avif(&nested, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF XMP: uuid words"]);
+        let mut other = vec![0; 16];
+        other.extend_from_slice(b"<a>not xmp</a>");
+        let mut bytes = ftyp();
+        bytes.extend_from_slice(&bx(b"uuid", &other));
+        let out = scan_avif(&bytes, &mut budget());
+        assert!(out.carriers.is_empty() && out.findings.is_empty());
+    }
+
+    #[test]
+    fn a_second_iinf_iloc_or_idat_in_one_meta_is_malformed() {
+        let cases: [(&[u8; 4], usize); 3] = [(b"iinf", 1), (b"iloc", 1), (b"idat", 2)];
+        for (kind, count) in cases {
+            let bytes = assemble(
+                0,
+                &|base| {
+                    let mut v = iinf(&[infe(2, 1, b"Exif", None)]);
+                    v.extend_from_slice(&iloc0(&[(1, vec![(base, 4 + TIFF.len() as u32)])]));
+                    for _ in 0..count {
+                        v.extend_from_slice(&bx(kind, &[0, 0, 0, 0, 0, 0]));
+                    }
+                    v
+                },
+                &exif_item(),
+            );
+            let out = scan_avif(&bytes, &mut budget());
+            assert!(!out.carriers.is_empty(), "{kind:?}");
+            let found: Vec<(&str, &str)> = findings(&out).iter().map(|f| (f.0, f.1)).collect();
+            assert_eq!(
+                found,
+                vec![("L001", "malformed AVIF: invalid item information")],
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_leftovers_are_a_trailer_or_a_truncated_box() {
+        let base = assemble(0, &exif_children, &exif_item());
+        let at = base.len() as u64;
+        let with = |tail: &[u8]| {
+            let mut bytes = base.clone();
+            bytes.extend_from_slice(tail);
+            scan_avif(&bytes, &mut budget())
+        };
+        let out = with(b"note for the reader");
+        assert_eq!(
+            texts(&out),
+            vec![
+                "AVIF Exif ImageDescription: hello",
+                "AVIF data after the last box: note for the reader"
+            ]
+        );
+        assert!(out.carriers[1].hidden);
+        assert_eq!(
+            findings(&out),
+            vec![("B004", "data after the end of the image", at, at + 19)]
+        );
+        let out = with(b"PK\x03\x04rest of a zip");
+        assert_eq!(findings(&out)[0].0, "B004");
+        assert_eq!(out.embedded[0].format, Some("zip"));
+        let out = with(b"\0\0\0\0");
+        assert!(out.findings.is_empty());
+        let out = with(b"\0\0\0\x64mdatabc");
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed AVIF: truncated box", at, at + 11)]
+        );
+        let mut nested = ftyp();
+        let mut children = iinf(&[infe(2, 1, b"Exif", None)]);
+        children.extend_from_slice(&[0, 0, 0, 50, b'i', b'l', b'o', b'c']);
+        nested.extend_from_slice(&full(b"meta", 0, &children));
+        let out = scan_avif(&nested, &mut budget());
+        let cut = (32 + children.len() - 8) as u64;
+        assert_eq!(
+            findings(&out),
+            vec![("L001", "malformed AVIF: truncated box", cut, cut + 8)]
+        );
     }
 
     #[test]
@@ -850,14 +1587,21 @@ mod tests {
     }
 
     #[test]
-    fn mime_item_with_other_content_type_is_ignored() {
-        let children = |base: u32| {
-            let mut c = iinf(&[infe(2, 1, b"mime", Some(b"text/plain"))]);
-            c.extend_from_slice(&iloc0(&[(1, vec![(base, 13)])]));
-            c
+    fn mime_item_with_a_text_or_unknown_content_type() {
+        let children = |kind: &'static [u8]| {
+            move |base: u32| {
+                let mut c = iinf(&[infe(2, 1, b"mime", Some(kind))]);
+                c.extend_from_slice(&iloc0(&[(1, vec![(base, 13)])]));
+                c
+            }
         };
-        let bytes = assemble(0, &children, b"<a>secret</a>");
-        assert!(scan_avif(&bytes, &mut budget()).carriers.is_empty());
+        let text = assemble(0, &children(b"text/plain"), b"<a>secret</a>");
+        assert_eq!(
+            texts(&scan_avif(&text, &mut budget())),
+            vec!["AVIF text: <a>secret</a>"]
+        );
+        let other = assemble(0, &children(b"image/jpeg"), b"<a>secret</a>");
+        assert!(scan_avif(&other, &mut budget()).carriers.is_empty());
     }
 
     #[test]
@@ -1066,8 +1810,8 @@ mod tests {
     }
 
     #[test]
-    fn thousand_duplicate_infe_entries_on_a_large_textless_item_parse_once() {
-        let packet = b"<b/>".repeat(25_000);
+    fn thousand_duplicate_infe_entries_on_a_large_item_parse_it_once() {
+        let packet = [&b"<a>x"[..], &b"<b/>".repeat(25_000), b"</a>"].concat();
         let length = packet.len() as u32;
         let children = move |base: u32| {
             let entries: Vec<_> = (0..1000)
@@ -1079,7 +1823,7 @@ mod tests {
         };
         let bytes = assemble(0, &children, &packet);
         let out = scan_avif(&bytes, &mut budget());
-        assert!(out.carriers.is_empty());
+        assert_eq!(texts(&out), vec!["AVIF XMP: x"]);
         assert!(out.findings.is_empty());
         assert_eq!(out.skip, None);
     }
@@ -1161,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn iloc_offset_size_nibble_three_stops_safely() {
+    fn iloc_offset_size_nibble_three_stops_safely_and_marks_the_avif_malformed() {
         let mut body = vec![0x34, 0x00];
         body.extend_from_slice(&1u16.to_be_bytes());
         body.extend_from_slice(&1u16.to_be_bytes());
@@ -1176,7 +1920,11 @@ mod tests {
         bytes.extend_from_slice(&bx(b"mdat", &exif_item()));
         let out = scan_avif(&bytes, &mut budget());
         assert!(out.carriers.is_empty());
-        assert_eq!(out.skip, None);
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        assert_eq!(
+            findings(&out)[0].1,
+            "malformed AVIF: invalid item information"
+        );
     }
 
     #[test]

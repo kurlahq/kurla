@@ -190,8 +190,19 @@ pub struct FileCoverage {
     pub category: Category,
     pub skip: Option<SkipReason>,
     pub drawn_text_unscanned: bool,
+    pub metadata_unscanned: bool,
     pub embedded_not_scanned: Vec<EmbeddedNotScanned>,
     pub encoded_runs_not_payloads: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedBlob {
+    pub kind: FileKind,
+    pub declared_type: Option<String>,
+    pub format: Option<&'static str>,
+    pub span: Span,
+    pub bytes: Vec<u8>,
+    pub evidence: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +210,7 @@ pub struct DetectorOutput {
     pub findings: Vec<RawFinding>,
     pub carriers: Vec<Carrier>,
     pub skip: Option<SkipReason>,
+    pub embedded: Vec<EmbeddedBlob>,
 }
 
 #[cfg(test)]

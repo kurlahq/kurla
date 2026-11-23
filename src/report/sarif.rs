@@ -1,6 +1,6 @@
 use super::{
-    Report, coverage_value, escape, family_name, invalid_value, rejected_value, severity_name,
-    status_name, warnings_value,
+    Report, SRCROOT, artifact_location, coverage_value, escape, family_name, invalid_value,
+    rejected_value, severity_name, status_name, warnings_value,
 };
 use crate::model::{Finding, RuleStatus, Severity};
 use crate::text::TextDoc;
@@ -90,7 +90,7 @@ fn result(finding: &Finding, docs: &mut Docs) -> Value {
         "message": {"text": text},
         "locations": [{
             "physicalLocation": {
-                "artifactLocation": {"uri": escape(&finding.path)},
+                "artifactLocation": artifact_location(&finding.path),
                 "region": region(finding, docs),
             }
         }],
@@ -171,6 +171,9 @@ pub fn render(report: &Report, source: &dyn Fn(&str) -> Option<Vec<u8>>) -> Stri
                 "version": env!("CARGO_PKG_VERSION"),
                 "rules": rules(report),
             }},
+            "originalUriBaseIds": {
+                SRCROOT: {"description": {"text": "The directory the scan ran from."}},
+            },
             "columnKind": "unicodeCodePoints",
             "results": results,
             "invocations": [{

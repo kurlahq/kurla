@@ -2,8 +2,8 @@ use crate::binary;
 use crate::limits::Budget;
 use crate::markup::decode_references;
 use crate::model::{
-    Carrier, CarrierKind, DetectorOutput, Family, FileKind, RawFinding, RuleStatus, Severity,
-    SkipReason, Span,
+    Carrier, CarrierKind, DetectorOutput, EmbeddedBlob, Family, FileKind, RawFinding, RuleStatus,
+    Severity, SkipReason, Span,
 };
 use crate::text::TextDoc;
 use crate::unicode::is_default_ignorable;
@@ -15,15 +15,6 @@ const EVIDENCE_CAP: usize = 4096;
 const TICK_INTERVAL: usize = 4096;
 const MIN_PRINTABLE_PERCENT: usize = 90;
 const MIN_WORDS: usize = 3;
-
-pub struct EmbeddedBlob {
-    pub kind: FileKind,
-    pub declared_type: Option<String>,
-    pub format: Option<&'static str>,
-    pub span: Span,
-    pub bytes: Vec<u8>,
-    pub evidence: Vec<u8>,
-}
 
 pub struct EncodedOutput {
     pub out: DetectorOutput,
@@ -460,6 +451,10 @@ fn qualifies_as_payload(text: &str) -> bool {
             || has_candidates(text))
 }
 
+pub(crate) fn is_readable_text(text: &str) -> bool {
+    !text.contains(char::REPLACEMENT_CHARACTER) && qualifies_as_payload(text)
+}
+
 struct Scanner<'a> {
     doc: &'a TextDoc,
     chars: Vec<char>,
@@ -797,6 +792,7 @@ pub fn scan_encoded(doc: &TextDoc, depth: u8, budget: &mut Budget) -> EncodedOut
             findings: scanner.findings,
             carriers: scanner.carriers,
             skip,
+            embedded: Vec::new(),
         },
         blobs: scanner.blobs,
         not_payload_runs: if at_limit {
@@ -1145,6 +1141,14 @@ mod tests {
         assert_eq!(run(&b64(three_words.as_bytes()), 0).out.carriers.len(), 1);
         let two_words = format!("aa bb{}", ".".repeat(50));
         assert_empty(&run(&b64(two_words.as_bytes()), 0));
+    }
+
+    #[test]
+    fn readable_text_needs_valid_utf8_printable_characters_and_three_words() {
+        assert!(is_readable_text("meet me at the usual place"));
+        assert!(!is_readable_text("two words"));
+        assert!(!is_readable_text("meet me at the usual place\u{FFFD}"));
+        assert!(!is_readable_text("one two three\u{1}\u{1}"));
     }
 
     #[test]

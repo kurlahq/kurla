@@ -58,6 +58,10 @@ Kurla keeps a local cache of per-file scan results so that unchanged files are n
 
 Anyone who can write to the cache directory can change scan results, because a stored entry is used in place of a scan. Use `--no-cache` wherever that is not acceptable, for example on a shared or untrusted machine or in a directory other users can write to.
 
+The key is not a secret. It is computed from the file's path and contents, the limits and a hash of the Kurla executable, none of which is secret, so anyone who can write to the cache directory can forge an entry for a file they expect to be scanned, and that entry will be trusted.
+
+In CI, run with `--no-cache`. If you cache between runs anyway, restore only a cache written by runs of trusted code: never one that a pull request from a fork, or any other job that ran untrusted code, could have written, and never one shared across repositories.
+
 ### What the key covers
 
 An entry is looked up by a SHA-256 key over these length-prefixed fields:
@@ -91,7 +95,7 @@ Warnings, rejected decisions files and usage errors go to standard error. Everyt
 
 ### Escaping
 
-Every string that came from a scanned repository or from a decisions file is escaped in all three formats: payloads, paths, messages, rule identifiers, `declared_type`, reviewer and reason, decisions-file error messages and the patterns and arguments echoed back in errors. Each control, bidirectional-control, default-ignorable, tag and variation-selector character, and the line and paragraph separators, becomes `\u{XXXX}` with at least four uppercase hexadecimal digits. Other text is unchanged. A backslash is not escaped.
+Every string that came from a scanned repository or from a decisions file is escaped in all three formats: payloads, paths, messages, rule identifiers, `declared_type`, reviewer and reason, decisions-file error messages and the patterns and arguments echoed back in errors. Each control, bidirectional-control, default-ignorable, tag and variation-selector character, and the line and paragraph separators, becomes `\u{XXXX}` with at least four uppercase hexadecimal digits. A backslash becomes `\\`, so every `\u{XXXX}` in the output was written by Kurla. Other text is unchanged. In SARIF, `artifactLocation.uri` is not escaped this way: it is the path as a URI reference, with every byte other than a letter, a digit, `-`, `.`, `_`, `~` or `/` percent-encoded. A path under the directory Kurla runs from, which is the repository root in CI, is a relative URI with `uriBaseId` `%SRCROOT%`; the run's `originalUriBaseIds` describes `%SRCROOT%` without giving its location, so the report does not reveal where the repository sits on the machine. A path outside that directory becomes an absolute `file:` URI.
 
 ### Exit code
 
@@ -105,7 +109,7 @@ The run is incomplete when any of these holds:
 - a file in the text, SVG or image metadata category has the skip reason `size_limit`, `decompression_limit`, `timeout` or `malformed`;
 - `--require-complete` is given and any file is in the unknown binary category (other images and unread special files included, but not files excluded by `--exclude` and not links that were not followed), or any `embedded_not_scanned` entry has a kind other than `pdf`.
 
-PDF files, embedded PDFs, files with unscanned drawn text, excluded files and links that were not followed never make a run incomplete. They stay listed in the coverage.
+PDF files, embedded PDFs, files with unscanned drawn text, files whose metadata is not scanned, excluded files and links that were not followed never make a run incomplete. They stay listed in the coverage.
 
 A rejected decisions file never makes `complete` false, because `complete` describes coverage only.
 
@@ -123,7 +127,7 @@ The top-level object has exactly these fields.
 | `threshold` | string | The `--fail-on` level: `info`, `low`, `medium`, `high` or `critical`. |
 | `findings` | array | Findings, ordered by path, byte offset and rule. |
 | `coverage` | object | What was and was not scanned. |
-| `carrier_counts` | object | Number of carriers seen, keyed by carrier name. Names with no carriers are absent. |
+| `carrier_counts` | object | Number of carriers that gave no finding of their own, keyed by carrier name: visible text that family A did not flag, and hidden bytes in an image that do not read as text. Names with no carriers are absent. |
 | `invalid_decisions` | array | Decisions entries that matched a finding but are not valid. |
 | `decisions_errors` | array | Decisions files that were rejected. |
 | `warnings` | array of strings | Problems that did not stop the run, for example the cache problems listed above. Each is also printed on standard error. `--no-cache` gives no warning. |
@@ -139,7 +143,7 @@ Each finding has exactly these fields.
 | `path` | string | The file, relative to the working directory when it is inside it. |
 | `location` | string | `agent_file`, `docs_template`, `code`, `data_asset` or `dependency`. |
 | `line`, `column` | number or null | One-based, counted in Unicode code points. Null for binary files. |
-| `byte_start`, `byte_end` | number | The byte range in the file. |
+| `byte_start`, `byte_end` | number | The byte range in the file. A finding inside a compressed SVG (`.svgz`) covers the whole file, because positions in the decompressed text do not exist in the file; its `line` and `column` are null, and its message ends with the position in the decompressed text, for example `(line 2, column 1 of the decompressed SVG)`. |
 | `carrier` | string | `hidden_text`, `decoded_payload`, `html_comment`, `svg_text`, `metadata_field`, `agent_file_text`, `active_content` or `resource_limit`. |
 | `message` | string | A short description. |
 | `payload` | string or null | The text that was hidden or decoded, when there is one. |
@@ -153,6 +157,7 @@ Each finding has exactly these fields.
 | `scanned_by_category` | object | Files scanned with no skip, for each of `text`, `svg`, `image_metadata`, `pdf` and `unknown_binary`. All five keys are always present. |
 | `skipped` | array | Every file with a skip reason, each `{path, kind, category, reason}`. `kind` is one of `text`, `svg`, `png`, `jpeg`, `gif`, `webp`, `avif`, `pdf`, `other_image`, `unknown_binary`. `reason` is one of `size_limit`, `decompression_limit`, `timeout`, `unreadable`, `excluded_by_user`, `symlink_not_followed`, `pdf_not_scanned`, `malformed`. Malformed files are listed here and nowhere else. |
 | `not_scanned_for_drawn_text` | array of strings | Paths of files whose drawn text, such as text inside pixels, is not scanned. |
+| `not_scanned_for_metadata` | array of strings | Paths of TIFF, PSD, JPEG XL, JPEG 2000, BMP, ICO, TGA, EMF and WMF files. Kurla does not read their metadata yet, so text stored in it is not scanned. See [known-limits.md](known-limits.md). |
 | `excluded_by_user` | array of strings | Paths excluded by `--exclude`. These are also in `skipped`. |
 | `embedded_not_scanned` | array | Content found inside a scanned file that was not scanned, each `{path, byte_start, byte_end, declared_type, kind, reason}`. `declared_type` is a string or null. |
 | `encoded_runs_not_payloads` | number | The total, over all files, of encoded runs that did not decode to a payload. |
@@ -180,7 +185,7 @@ Plain text with no colour. There is one line for each finding:
 
 A finding in a binary file has `<path>@<byte_start>-<byte_end>` in place of the position. A reviewed finding ends with `reviewed (counted|not counted) by <reviewer>: <reason>`.
 
-A `coverage:` section follows. It lists the scanned counts, every skipped file, every embedded entry that was not scanned, every file not scanned for drawn text, the number of excluded files and the encoded-run total. After it come the invalid decisions, the rejected decisions files and the warnings, one line each. The last line is `complete, exit code N` or `incomplete, exit code N`.
+A `coverage:` section follows. It lists the scanned counts, every skipped file, every embedded entry that was not scanned, every file not scanned for drawn text, every file whose metadata is not scanned, the number of excluded files and the encoded-run total. After it come the invalid decisions, the rejected decisions files and the warnings, one line each. The last line is `complete, exit code N` or `incomplete, exit code N`.
 
 ### Command line
 

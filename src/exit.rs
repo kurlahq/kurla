@@ -107,6 +107,7 @@ mod tests {
             category: kind.category(),
             skip,
             drawn_text_unscanned: kind.drawn_text_unscanned(),
+            metadata_unscanned: false,
             embedded_not_scanned: Vec::new(),
             encoded_runs_not_payloads: 0,
         }
@@ -207,6 +208,34 @@ mod tests {
                 vec![],
                 vec![file(FileKind::Png, Some(SkipReason::Timeout))],
                 2,
+                2,
+            ),
+            row(
+                "image metadata decompression limit",
+                vec![],
+                vec![file(FileKind::Png, Some(SkipReason::DecompressionLimit))],
+                2,
+                2,
+            ),
+            row(
+                "image metadata malformed",
+                vec![],
+                vec![file(FileKind::Jpeg, Some(SkipReason::Malformed))],
+                2,
+                2,
+            ),
+            row(
+                "unknown binary timeout counts only under the flag",
+                vec![],
+                vec![file(FileKind::UnknownBinary, Some(SkipReason::Timeout))],
+                0,
+                2,
+            ),
+            row(
+                "unknown binary size limit counts only under the flag",
+                vec![],
+                vec![file(FileKind::UnknownBinary, Some(SkipReason::SizeLimit))],
+                0,
                 2,
             ),
             row(

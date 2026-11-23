@@ -19,10 +19,10 @@ const KEY_LEN: usize = 64;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const RULE_IDS: [&str; 27] = [
+const RULE_IDS: [&str; 29] = [
     "A001", "A002", "A003", "A004", "A005", "A006", "A007", "A008", "A009", "A010", "B002", "B003",
-    "E001", "I002", "L001", "L002", "M002", "S002", "S003", "S004", "U001", "U002", "U003", "U004",
-    "U005", "U006", "U007",
+    "B004", "B005", "E001", "I002", "L001", "L002", "M002", "S002", "S003", "S004", "U001", "U002",
+    "U003", "U004", "U005", "U006", "U007",
 ];
 
 fn rule_id(name: &str) -> Option<&'static str> {
@@ -368,6 +368,7 @@ fn coverage_value(coverage: &FileCoverage) -> Value {
         "category": category_name(coverage.category),
         "skip": coverage.skip.map(skip_name),
         "drawn_text_unscanned": coverage.drawn_text_unscanned,
+        "metadata_unscanned": coverage.metadata_unscanned,
         "embedded_not_scanned": embedded,
         "encoded_runs_not_payloads": coverage.encoded_runs_not_payloads,
     })
@@ -524,6 +525,7 @@ fn read_coverage(mut map: Map<String, Value>) -> Option<FileCoverage> {
         category: category_from(&take_string(&mut map, "category")?)?,
         skip,
         drawn_text_unscanned: take_bool(&mut map, "drawn_text_unscanned")?,
+        metadata_unscanned: take_bool(&mut map, "metadata_unscanned")?,
         embedded_not_scanned: take_array(&mut map, "embedded_not_scanned")?
             .into_iter()
             .map(read_embedded)
@@ -635,6 +637,7 @@ mod tests {
             category: Category::Text,
             skip: None,
             drawn_text_unscanned: false,
+            metadata_unscanned: false,
             embedded_not_scanned: Vec::new(),
             encoded_runs_not_payloads: 0,
         }
@@ -895,6 +898,7 @@ mod tests {
             category: Category::ImageMetadata,
             skip: Some(SkipReason::DecompressionLimit),
             drawn_text_unscanned: true,
+            metadata_unscanned: true,
             embedded_not_scanned: vec![
                 EmbeddedNotScanned {
                     span: span(5, 6),
@@ -917,6 +921,65 @@ mod tests {
             (CarrierKind::ResourceLimit, u64::MAX),
         ]);
         let stored: Cached = (findings, cov, counts);
+        let key = base_key(&cache);
+        assert!(cache.put(&key, &stored));
+        assert_eq!(cache.get(&key), Some(stored));
+    }
+
+    #[test]
+    fn a_b004_finding_is_cached_and_read_back() {
+        let dir = TestDir::new();
+        let cache = open(&dir);
+        let mut b004 = finding(Severity::High, None);
+        b004.raw.rule_id = "B004";
+        b004.raw.family = Family::B;
+        b004.raw.carrier = CarrierKind::HiddenText;
+        let mut stored = value();
+        stored.0 = vec![b004];
+        let key = base_key(&cache);
+        assert!(cache.put(&key, &stored));
+        assert_eq!(cache.get(&key), Some(stored));
+    }
+
+    #[test]
+    fn the_cache_knows_exactly_the_rule_ids_the_product_code_emits() {
+        let mut found = std::collections::BTreeSet::new();
+        let mut dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).expect("src is readable") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = fs::read_to_string(&path).expect("source is UTF-8");
+                    let product = text.split("#[cfg(test)]").next().unwrap_or_default();
+                    for w in product.as_bytes().windows(6) {
+                        if w[0] == b'"'
+                            && w[5] == b'"'
+                            && w[1].is_ascii_uppercase()
+                            && w[2..5].iter().all(u8::is_ascii_digit)
+                        {
+                            found.insert(String::from_utf8_lossy(&w[1..5]).into_owned());
+                        }
+                    }
+                }
+            }
+        }
+        let table: std::collections::BTreeSet<String> =
+            RULE_IDS.iter().map(|id| id.to_string()).collect();
+        assert_eq!(found, table);
+    }
+
+    #[test]
+    fn a_b005_finding_is_cached_and_read_back() {
+        let dir = TestDir::new();
+        let cache = open(&dir);
+        let mut b005 = finding(Severity::High, None);
+        b005.raw.rule_id = "B005";
+        b005.raw.family = Family::B;
+        b005.raw.carrier = CarrierKind::HiddenText;
+        let mut stored = value();
+        stored.0 = vec![b005];
         let key = base_key(&cache);
         assert!(cache.put(&key, &stored));
         assert_eq!(cache.get(&key), Some(stored));

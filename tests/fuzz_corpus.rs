@@ -49,8 +49,9 @@ fn root() -> PathBuf {
 
 fn seeds(target: &str) -> Vec<(String, Vec<u8>)> {
     let dir = root().join("fuzz").join("corpus").join(target);
-    assert!(!seeds_in(&dir).is_empty(), "no seeds for {target}");
-    seeds_in(&dir)
+    let found = seeds_in(&dir);
+    assert!(!found.is_empty(), "no seeds for {target}");
+    found
 }
 
 fn seeds_in(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
@@ -267,22 +268,38 @@ fn hand_built_seeds_reach_the_metadata_they_were_built_to_carry() {
     );
     assert_eq!(
         carriers_in("jpeg", "minimal_exif_xmp_com.jpg", kurla::binary::scan_jpeg),
-        4
+        7
     );
     assert!(carriers_in("gif", "minimal_comment_xmp.gif", kurla::binary::scan_gif) >= 2);
     assert_eq!(
         carriers_in("bmff", "minimal_exif_xmp.webp", kurla::binary::scan_webp),
-        3
+        6
     );
     assert_eq!(
         carriers_in("bmff", "minimal_exif_xmp.avif", kurla::binary::scan_avif),
-        3
+        8
     );
     let tiff = fs::read(root().join("fuzz/corpus/exif/minimal_two_entries.tiff")).expect("seed");
     assert_eq!(
         kurla::binary::exif_text_fields(&tiff).expect("valid").len(),
         2
     );
+}
+
+#[test]
+fn the_svgz_seed_reaches_the_svg_scanner_through_every_header_field() {
+    let bytes = fs::read(root().join("fuzz/corpus/scan_file/two_members_all_fields.svgz"))
+        .expect("seed exists");
+    assert!(scan_file::NAMES.contains(&"x.svgz"));
+    let gunzipped = kurla::binary::gunzip(
+        &bytes,
+        &mut kurla::limits::Budget::new(&scan_file::limits()),
+    );
+    assert!(!gunzipped.malformed);
+    assert_eq!(gunzipped.out.carriers.len(), 3);
+    let (findings, coverage, _) = kurla::engine::scan_file("x.svgz", &bytes, &scan_file::limits());
+    assert_eq!(coverage.skip, None);
+    assert!(findings.iter().any(|f| f.raw.rule_id == "S003"));
 }
 
 fn limit_output(skip: Option<SkipReason>, rule: &'static str) -> DetectorOutput {
@@ -293,6 +310,7 @@ fn limit_output(skip: Option<SkipReason>, rule: &'static str) -> DetectorOutput 
         findings: vec![raw],
         carriers: Vec::new(),
         skip,
+        embedded: Vec::new(),
     }
 }
 
@@ -301,6 +319,7 @@ fn quiet_output() -> DetectorOutput {
         findings: Vec::new(),
         carriers: Vec::new(),
         skip: None,
+        embedded: Vec::new(),
     }
 }
 

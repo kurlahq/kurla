@@ -1,4 +1,4 @@
-use super::context::Context;
+use super::context::{BRAILLE_BLANK, Context};
 use super::{
     Script, confusable_skeleton, is_allowed_variation_pair, is_bidi_control, is_default_ignorable,
     is_private_use, is_tag, is_variation_selector, script,
@@ -48,7 +48,7 @@ fn rule_of(c: char) -> Option<Rule> {
         Some(Rule::U004)
     } else if is_private_use(c) {
         Some(Rule::U005)
-    } else if is_default_ignorable(c) {
+    } else if is_default_ignorable(c) || c == BRAILLE_BLANK {
         Some(Rule::U001)
     } else {
         None
@@ -404,6 +404,97 @@ mod tests {
     }
 
     #[test]
+    fn mongolian_zwj_not_flagged() {
+        let text = "\u{1820}\u{200D}\u{1821}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+    }
+
+    #[test]
+    fn nko_zwnj_not_flagged() {
+        let text = "\u{07CA}\u{200C}\u{07CB}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+    }
+
+    #[test]
+    fn adlam_zwj_not_flagged() {
+        let text = "\u{1E922}\u{200D}\u{1E923}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+    }
+
+    #[test]
+    fn mongolian_vowel_separator_not_flagged() {
+        let text = "\u{1828}\u{180E}\u{1820}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+        for other in [
+            "a\u{180E}b",
+            "\u{1810}\u{180E}\u{1811}",
+            "\u{1828}\u{180E}",
+            "\u{180E}\u{1820}",
+        ] {
+            let findings = scan_text(&doc_str(other), LocationKind::DocsTemplate);
+            assert_single(
+                &findings,
+                "U001",
+                Severity::High,
+                RuleStatus::Stable,
+                Some("1"),
+            );
+        }
+    }
+
+    #[test]
+    fn braille_blank_in_string_is_u001() {
+        let findings = scan_text(&doc_str("let s = \"a\u{2800}b\";"), LocationKind::Code);
+        assert_single(
+            &findings,
+            "U001",
+            Severity::High,
+            RuleStatus::Stable,
+            Some("1"),
+        );
+    }
+
+    #[test]
+    fn braille_text_line_not_flagged() {
+        let text = "\u{2813}\u{2811}\u{2807}\u{2807}\u{2815}\u{2800}\u{283A}\u{2815}\u{2817}\u{2807}\u{2819}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+        for edge in [
+            "\u{2801}\u{2800}",
+            "\u{2800}\u{28FF}",
+            "x\n\u{2813}\u{2800}",
+        ] {
+            assert!(scan_text(&doc_str(edge), LocationKind::DocsTemplate).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_braille_blank_is_exempt_only_on_a_line_with_other_braille() {
+        for text in [
+            "\u{2813}\u{2811}\n\u{2800}",
+            "\u{2800}\r\u{2813}",
+            "\u{2900}\u{2800}",
+            "\u{2800}\u{2800}",
+        ] {
+            let findings = scan_text(&doc_str(text), LocationKind::DocsTemplate);
+            assert_eq!(findings.len(), 1, "{text:?}");
+            assert_eq!(findings[0].rule_id, "U001");
+        }
+    }
+
+    #[test]
+    fn a_run_of_joiners_between_letters_is_flagged_in_full() {
+        let text = "\u{0645}\u{200C}\u{200C}\u{200C}\u{200C}\u{200C}\u{06CC}";
+        let findings = scan_text(&doc_str(text), LocationKind::DocsTemplate);
+        assert_single(
+            &findings,
+            "U001",
+            Severity::High,
+            RuleStatus::Stable,
+            Some("5"),
+        );
+    }
+
+    #[test]
     fn zwj_between_letters_of_unlisted_script_is_u001() {
         let findings = scan_text(&doc_str("a\u{200D}b"), LocationKind::DocsTemplate);
         assert_single(
@@ -413,6 +504,54 @@ mod tests {
             RuleStatus::Stable,
             Some("1"),
         );
+    }
+
+    fn assert_each_is_one_u001(texts: &[&str]) {
+        for text in texts {
+            let findings = scan_text(&doc_str(text), LocationKind::DocsTemplate);
+            assert_eq!(findings.len(), 1, "{text:?}");
+            assert_eq!(findings[0].rule_id, "U001", "{text:?}");
+            assert_eq!(findings[0].payload.as_deref(), Some("1"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_joiner_at_either_end_of_the_text_is_u001() {
+        assert_each_is_one_u001(&[
+            "\u{200C}\u{0628}",
+            "\u{200D}\u{0915}",
+            "\u{0628}\u{200C}",
+            "\u{0915}\u{200D}",
+        ]);
+    }
+
+    #[test]
+    fn a_joiner_next_to_a_non_letter_is_u001() {
+        assert_each_is_one_u001(&[
+            "\u{0628}\u{200C}\u{0661}",
+            "\u{0661}\u{200C}\u{0628}",
+            "\u{0915}\u{200D}\u{0967}",
+            "\u{0628}\u{200C} \u{0628}",
+            "\u{0628}\u{200C}.",
+        ]);
+    }
+
+    #[test]
+    fn a_joiner_between_letters_of_two_scripts_is_u001() {
+        assert_each_is_one_u001(&[
+            "\u{0628}\u{200C}\u{0915}",
+            "\u{0915}\u{200D}\u{0628}",
+            "\u{1820}\u{200D}\u{07CA}",
+            "\u{0628}\u{200C}b",
+            "b\u{200D}\u{0915}",
+        ]);
+    }
+
+    #[test]
+    fn a_joiner_after_combining_marks_is_judged_by_the_letter_before_them() {
+        let text = "\u{0645}\u{0650}\u{0651}\u{200C}\u{06CC}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+        assert_each_is_one_u001(&["\u{0650}\u{200C}\u{0628}", "\u{0645}\u{0650}\u{200C}b"]);
     }
 
     #[test]

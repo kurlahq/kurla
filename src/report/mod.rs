@@ -49,10 +49,53 @@ fn needs_escape(c: char) -> bool {
         || is_variation_selector(c)
 }
 
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for &b in text.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+pub(crate) fn sarif_uri(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if let Some(rest) = path.strip_prefix("//") {
+        return format!("file://{}", percent_encode(rest));
+    }
+    if path.starts_with('/') {
+        return format!("file://{}", percent_encode(path));
+    }
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        return format!(
+            "file:///{}:{}",
+            char::from(bytes[0]),
+            percent_encode(&path[2..])
+        );
+    }
+    percent_encode(path)
+}
+
+pub(crate) const SRCROOT: &str = "%SRCROOT%";
+
+pub(crate) fn artifact_location(path: &str) -> Value {
+    let uri = sarif_uri(path);
+    if uri.starts_with("file:") {
+        json!({ "uri": uri })
+    } else {
+        json!({ "uri": uri, "uriBaseId": SRCROOT })
+    }
+}
+
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if needs_escape(c) {
+        if c == '\\' {
+            out.push_str(r"\\");
+        } else if needs_escape(c) {
             let _ = write!(out, "\\u{{{:04X}}}", c as u32);
         } else {
             out.push(c);
@@ -226,6 +269,12 @@ pub(crate) fn coverage_value(report: &Report) -> Value {
         .filter(|file| file.drawn_text_unscanned)
         .map(|file| json!(escape(&file.path)))
         .collect();
+    let metadata: Vec<Value> = report
+        .coverage
+        .iter()
+        .filter(|file| file.metadata_unscanned)
+        .map(|file| json!(escape(&file.path)))
+        .collect();
     let excluded: Vec<Value> = report
         .coverage
         .iter()
@@ -257,6 +306,7 @@ pub(crate) fn coverage_value(report: &Report) -> Value {
         "scanned_by_category": scanned,
         "skipped": skipped,
         "not_scanned_for_drawn_text": drawn,
+        "not_scanned_for_metadata": metadata,
         "excluded_by_user": excluded,
         "embedded_not_scanned": embedded,
         "encoded_runs_not_payloads": runs,
@@ -393,6 +443,7 @@ mod tests {
             category: kind.category(),
             skip,
             drawn_text_unscanned: kind.drawn_text_unscanned(),
+            metadata_unscanned: false,
             embedded_not_scanned: Vec::new(),
             encoded_runs_not_payloads: 0,
         }
@@ -534,6 +585,52 @@ mod tests {
     }
 
     #[test]
+    fn escape_doubles_a_backslash_so_every_escape_comes_from_kurla() {
+        assert_eq!(escape(r"a\u{202E}b"), r"a\\u{202E}b");
+        assert_ne!(escape(r"a\u{202E}b"), escape("a\u{202E}b"));
+        assert_eq!(escape(r"\"), r"\\");
+        assert_eq!(escape("\u{1B}[31m"), r"\u{001B}[31m");
+    }
+
+    #[test]
+    fn sarif_uris_are_percent_encoded_uri_references() {
+        assert_eq!(sarif_uri("dir/a b%#?.txt"), "dir/a%20b%25%23%3F.txt");
+        assert_eq!(sarif_uri("a\u{202E}b"), "a%E2%80%AEb");
+        assert_eq!(sarif_uri(r"a\b{c}"), "a%5Cb%7Bc%7D");
+        assert_eq!(sarif_uri("Az09-._~/x"), "Az09-._~/x");
+        assert_eq!(sarif_uri("/tmp/x y"), "file:///tmp/x%20y");
+        assert_eq!(sarif_uri("C:/Users/x y"), "file:///C:/Users/x%20y");
+        assert_eq!(sarif_uri("//server/share/a"), "file://server/share/a");
+        assert_eq!(sarif_uri("c:"), "c%3A");
+        assert_eq!(sarif_uri("C:/"), "file:///C:/");
+        assert_eq!(sarif_uri("1:/x"), "1%3A/x");
+        assert_eq!(sarif_uri("C:x/y"), "C%3Ax/y");
+        assert_eq!(sarif_uri("C|/y"), "C%7C/y");
+    }
+
+    #[test]
+    fn sarif_locations_inside_the_root_are_relative_to_srcroot() {
+        let relative = json!({"uri": "dir/a%20b.txt", "uriBaseId": "%SRCROOT%"});
+        assert_eq!(artifact_location("dir/a b.txt"), relative);
+        let hex = json!({"uri": "hex%3A00ff", "uriBaseId": "%SRCROOT%"});
+        assert_eq!(artifact_location("hex:00ff"), hex);
+        assert_eq!(artifact_location("/abs/x"), json!({"uri": "file:///abs/x"}));
+        assert_eq!(artifact_location("C:/x"), json!({"uri": "file:///C:/x"}));
+        let fixture = rich();
+        let sarif: Value =
+            serde_json::from_str(&sarif::render(&fixture.report(), &no_source)).unwrap();
+        let run = &sarif["runs"][0];
+        assert_eq!(
+            run["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"],
+            json!({"uri": "dir/%E2%80%AEtail", "uriBaseId": "%SRCROOT%"})
+        );
+        assert_eq!(
+            run["originalUriBaseIds"],
+            json!({"%SRCROOT%": {"description": {"text": "The directory the scan ran from."}}})
+        );
+    }
+
+    #[test]
     fn escape_leaves_visible_text_alone() {
         assert_eq!(escape("plain é 日本 \u{1F600}"), "plain é 日本 \u{1F600}");
         assert_eq!(escape(""), "");
@@ -581,7 +678,7 @@ mod tests {
         let result = &sarif["runs"][0]["results"][0];
         assert_eq!(
             result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "dir/\\u{202E}tail"
+            "dir/%E2%80%AEtail"
         );
         assert!(
             result["message"]["text"]
@@ -658,6 +755,7 @@ mod tests {
                 "scanned_by_category",
                 "skipped",
                 "not_scanned_for_drawn_text",
+                "not_scanned_for_metadata",
                 "excluded_by_user",
                 "embedded_not_scanned",
                 "encoded_runs_not_payloads",
@@ -1180,5 +1278,32 @@ mod tests {
         let mut seen = reads.borrow().clone();
         seen.sort();
         assert_eq!(seen, vec!["f1.txt", "f2.txt", "f3.txt"]);
+    }
+
+    #[test]
+    fn files_whose_metadata_is_not_scanned_are_listed_in_every_text_format() {
+        let mut tiff = coverage_entry("pic.tiff", FileKind::OtherImage, None);
+        tiff.metadata_unscanned = true;
+        let fixture = Fixture {
+            findings: Vec::new(),
+            coverage: vec![tiff, coverage_entry("a.md", FileKind::Text, None)],
+            counts: BTreeMap::new(),
+            invalid: Vec::new(),
+            rejected: Vec::new(),
+            warnings: Vec::new(),
+            threshold: Severity::High,
+            require_complete: false,
+        };
+        let report = fixture.report();
+        let json: Value = serde_json::from_str(&json::render(&report)).unwrap();
+        assert_eq!(
+            json["coverage"]["not_scanned_for_metadata"],
+            serde_json::json!(["pic.tiff"])
+        );
+        assert!(human::render(&report).contains(
+            "
+metadata not scanned pic.tiff
+"
+        ));
     }
 }

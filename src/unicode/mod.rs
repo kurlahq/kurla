@@ -29,6 +29,7 @@ pub enum Script {
     Myanmar,
     Khmer,
     Mongolian,
+    Adlam,
     Common,
     Inherited,
     Other,
@@ -406,6 +407,15 @@ mod tests {
             confusable_skeleton("paypal"),
             confusable_skeleton("p\u{0430}yp\u{0430}l")
         );
+    }
+
+    #[test]
+    fn hangul_decomposition_ends_at_the_last_syllable() {
+        assert_eq!(
+            nfd("\u{D7A3}".chars()),
+            vec!['\u{1112}', '\u{1175}', '\u{11C2}']
+        );
+        assert_eq!(nfd("\u{D7A4}".chars()), vec!['\u{D7A4}']);
     }
 
     #[test]

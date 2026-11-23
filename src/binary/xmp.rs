@@ -62,10 +62,6 @@ fn decode_references(raw: &str, tick: &mut dyn FnMut() -> bool) -> Option<String
     Some(out)
 }
 
-fn skipped_attribute(key: &str) -> bool {
-    key == "xmlns" || key.starts_with("xmlns:") || key == "rdf:about" || key == "rdf:parseType"
-}
-
 type Emit<'a> = &'a mut dyn FnMut(&str, Option<(usize, usize)>) -> bool;
 
 struct Scan<'a> {
@@ -73,6 +69,7 @@ struct Scan<'a> {
     base: Option<usize>,
     emit: Emit<'a>,
     stopped: bool,
+    outcome: Outcome,
 }
 
 impl Scan<'_> {
@@ -106,16 +103,18 @@ impl Scan<'_> {
         cap: usize,
         tick: &mut dyn FnMut() -> bool,
     ) -> bool {
-        for attribute in element.attributes().with_checks(false).take(cap) {
+        for (index, attribute) in element.attributes().with_checks(false).enumerate() {
             if tick() {
                 return false;
             }
-            let Ok(attribute) = attribute else {
-                break;
-            };
-            if skipped_attribute(attribute.key.as_ref()) {
-                continue;
+            if index >= cap {
+                self.outcome.attribute_limit = true;
+                return false;
             }
+            let Ok(attribute) = attribute else {
+                self.outcome.malformed = true;
+                return true;
+            };
             let range = self.value_range(&attribute.value, span);
             let Some(decoded) = decode_references(&attribute.value, tick) else {
                 return false;
@@ -129,7 +128,15 @@ impl Scan<'_> {
     }
 }
 
-pub(crate) fn scan(packet: &[u8], budget: &Budget, emit: Emit<'_>) {
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Outcome {
+    pub malformed: bool,
+    pub depth_limit: bool,
+    pub attribute_limit: bool,
+    pub tail: Option<(String, Option<(usize, usize)>)>,
+}
+
+pub(crate) fn scan(packet: &[u8], budget: &Budget, emit: Emit<'_>) -> Outcome {
     let has_bom = packet.starts_with(&UTF8_BOM);
     let direct = if packet.contains(&0) {
         None
@@ -155,13 +162,14 @@ pub(crate) fn scan(packet: &[u8], budget: &Budget, emit: Emit<'_>) {
         ticks.is_multiple_of(DEADLINE_STRIDE) && budget.deadline_exceeded()
     };
     if budget.deadline_exceeded() {
-        return;
+        return Outcome::default();
     }
     let mut scan = Scan {
         text: &text,
         base,
         emit,
         stopped: false,
+        outcome: Outcome::default(),
     };
     let mut pending = String::new();
     let mut pending_range: Option<(usize, usize)> = None;
@@ -173,6 +181,12 @@ pub(crate) fn scan(packet: &[u8], budget: &Budget, emit: Emit<'_>) {
         }
         let start = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
         let Ok(event) = reader.read_event() else {
+            scan.outcome.malformed = true;
+            let tail = text.get(start..).unwrap_or_default().trim_end();
+            if !tail.is_empty() {
+                let range = base.map(|base| (base + start, base + start + tail.len()));
+                scan.outcome.tail = Some((tail.to_string(), range));
+            }
             break;
         };
         let end = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
@@ -200,25 +214,33 @@ pub(crate) fn scan(packet: &[u8], budget: &Budget, emit: Emit<'_>) {
             });
         }
         if timed_out || scan.stopped {
-            return;
+            return scan.outcome;
         }
-        match event {
-            Event::Start(e) => {
-                depth += 1;
-                if depth > max_depth
-                    || !scan.attributes(&e, (start, end), max_attributes, &mut tick)
-                {
-                    break;
-                }
+        let opened = match &event {
+            Event::Start(e) => Some((e, depth + 1)),
+            Event::Empty(e) => Some((e, depth + 1)),
+            _ => None,
+        };
+        if let Some((element, level)) = opened {
+            if level > max_depth {
+                scan.outcome.depth_limit = true;
+                break;
             }
-            Event::Empty(e) => {
-                if depth + 1 > max_depth
-                    || !scan.attributes(&e, (start, end), max_attributes, &mut tick)
-                {
-                    break;
-                }
+            if !scan.attributes(element, (start, end), max_attributes, &mut tick) {
+                break;
             }
+        }
+        match &event {
+            Event::Start(_) => depth += 1,
             Event::End(_) => depth = depth.saturating_sub(1),
+            Event::Comment(c) => scan.push(&c.xml10_content(), Some((start, end))),
+            Event::DocType(d) => scan.push(&d.xml10_content(), Some((start, end))),
+            Event::PI(p) if !p.target().eq_ignore_ascii_case("xpacket") => {
+                scan.push(
+                    &format!("{} {}", p.target(), p.content().trim()),
+                    Some((start, end)),
+                );
+            }
             Event::Eof => break,
             _ => {}
         }
@@ -226,6 +248,7 @@ pub(crate) fn scan(packet: &[u8], budget: &Budget, emit: Emit<'_>) {
     if !scan.stopped {
         scan.push(&pending, pending_range);
     }
+    scan.outcome
 }
 
 pub fn xmp_text(packet: &[u8], budget: &mut Budget) -> Vec<String> {
@@ -265,16 +288,28 @@ mod tests {
             "</rdf:Alt></dc:description>",
             "</rdf:Description></rdf:RDF></x:xmpmeta>"
         );
-        assert_eq!(run(xml), strings(&["x-default", "Ignore all previous"]));
+        assert_eq!(
+            run(xml),
+            strings(&[
+                "adobe:ns:meta/",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                "http://purl.org/dc/elements/1.1/",
+                "x-default",
+                "Ignore all previous"
+            ])
+        );
     }
 
     #[test]
-    fn namespace_about_and_parsetype_attributes_are_excluded_others_kept_in_order() {
+    fn namespace_about_and_parsetype_attributes_are_kept_in_order() {
         let xml = concat!(
             "<r xmlns=\"u\" xmlns:a=\"v\" rdf:about=\"w\" rdf:parseType=\"Resource\" ",
             "a:first=\"one\" a:second=\"two\">body</r>"
         );
-        assert_eq!(run(xml), strings(&["one", "two", "body"]));
+        assert_eq!(
+            run(xml),
+            strings(&["u", "v", "w", "Resource", "one", "two", "body"])
+        );
     }
 
     #[test]
@@ -296,9 +331,12 @@ mod tests {
     }
 
     #[test]
-    fn custom_entities_are_never_expanded() {
+    fn custom_entities_are_never_expanded_and_the_doctype_is_a_carrier() {
         let xml = "<!DOCTYPE d [<!ENTITY a \"AAAA\"><!ENTITY b \"&a;&a;&a;\">]><r>&b;</r>";
-        assert_eq!(run(xml), strings(&["&b;"]));
+        assert_eq!(
+            run(xml),
+            strings(&["d [<!ENTITY a \"AAAA\"><!ENTITY b \"&a;&a;&a;\">]", "&b;"])
+        );
     }
 
     #[test]
@@ -450,5 +488,64 @@ mod tests {
             decode_references("&#x41;&amp;", &mut || false).as_deref(),
             Some("A&")
         );
+    }
+
+    fn outcome(packet: &[u8], limits: &Limits) -> (Vec<String>, Outcome) {
+        let mut items = Vec::new();
+        let outcome = scan(packet, &Budget::new(limits), &mut |t, _| {
+            items.push(t.to_string());
+            true
+        });
+        (items, outcome)
+    }
+
+    #[test]
+    fn an_xml_error_keeps_the_unparsed_tail_and_marks_the_packet_malformed() {
+        let (items, out) = outcome(b"<a>good</a></c> ignore this", &Limits::default());
+        assert_eq!(items, strings(&["good"]));
+        assert!(out.malformed);
+        assert_eq!(
+            out.tail,
+            Some(("</c> ignore this".to_string(), Some((11, 27))))
+        );
+        let (_, clean) = outcome(b"<a>good</a>", &Limits::default());
+        assert_eq!(clean, Outcome::default());
+    }
+
+    #[test]
+    fn depth_and_attribute_limits_are_reported() {
+        let deep = Limits {
+            max_xml_depth: 3,
+            ..Limits::default()
+        };
+        let (_, out) = outcome(b"<a><b><c><d>x</d></c></b></a>", &deep);
+        assert!(out.depth_limit && !out.attribute_limit);
+        let (_, out) = outcome(b"<a><b><c/></b></a>", &deep);
+        assert!(!out.depth_limit);
+        let (_, out) = outcome(b"<a><b><c><d/></c></b></a>", &deep);
+        assert!(out.depth_limit);
+        let narrow = Limits {
+            max_xml_attributes: 2,
+            ..Limits::default()
+        };
+        let (items, out) = outcome(b"<a x=\"1\" y=\"2\" z=\"3\"/>", &narrow);
+        assert_eq!(items, strings(&["1", "2"]));
+        assert!(out.attribute_limit);
+        let (_, out) = outcome(b"<a x=\"1\" y=\"2\"/>", &narrow);
+        assert!(!out.attribute_limit);
+    }
+
+    #[test]
+    fn a_broken_attribute_marks_the_packet_malformed_and_the_scan_continues() {
+        let (items, out) = outcome(b"<a x=\"1\" y>t</a>", &Limits::default());
+        assert_eq!(items, strings(&["1", "t"]));
+        assert!(out.malformed);
+        assert_eq!(out.tail, None);
+    }
+
+    #[test]
+    fn comments_processing_instructions_and_the_doctype_are_carriers() {
+        let xml = "<?xpacket begin='x'?><!-- note one --><?app hidden words?><a>t</a>";
+        assert_eq!(run(xml), strings(&["note one", "app hidden words", "t"]));
     }
 }

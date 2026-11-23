@@ -2,7 +2,7 @@
 
 | Name | Version | Source | Published | Reason |
 | --- | --- | --- | --- | --- |
-| Rust toolchain | 1.98.1 | rustup, pinned in `rust-toolchain.toml` | before 2026-11-05 | Compiler, rustfmt and clippy for every crate in the workspace. |
+| Rust toolchain | 1.98.1 | rustup, pinned in `rust-toolchain.toml` | 2026-09-01 (commit date reported by `rustc -vV`) | Compiler, rustfmt and clippy for every crate in the workspace. |
 | actions/checkout | v7.0.1 (`3d3c42e5aac5ba805825da76410c181273ba90b1`) | GitHub Actions | 2026-07-20 | Checks out the repository in CI, with `persist-credentials: false`. GitHub's own action, pinned by full commit SHA. |
 | actions/upload-artifact | v7.0.2 (`cf430e030ddbb5b0abf93d22962f4752f3646cd9`) | GitHub Actions | 2026-10-07 | Carries each mutation-test shard's `mutants.out` to the merge job in `.github/workflows/mutants.yml`. GitHub's own action, pinned by full commit SHA. |
 | actions/download-artifact | v8.0.2 (`9000827ccba6bdab643e8b6fd33ac0654aef8333`) | GitHub Actions | 2026-10-07 | Fetches every shard's `mutants.out` in the merge job of `.github/workflows/mutants.yml`. GitHub's own action, pinned by full commit SHA. |
@@ -23,9 +23,9 @@
 | libfuzzer-sys | 0.4.13 | crates.io | 2026-06-04 | Fuzz workspace only, direct. Rust bindings to LLVM's libFuzzer, used by every target in `fuzz/fuzz_targets`. Licence (MIT OR Apache-2.0) AND NCSA, see the NCSA exception below. |
 | libc | 0.2.191 | crates.io | 2026-10-16 | Pulled in by cpufeatures. |
 | memchr | 2.8.3 | crates.io | 2026-07-08 | Pulled in by quick-xml and serde_json. |
-| miniz_oxide | 0.9.1 | crates.io | 2026-03-13 | Direct. Inflate and deflate for compressed archive members, with no C code. |
+| miniz_oxide | 0.9.1 | crates.io | 2026-03-13 | Direct. Inflate for zlib streams in PNG text chunks and deflate-encoded AVIF items, and for gzip in `.svgz`, with no C code. Its deflate side is used only by tests. |
 | proc-macro2 | 1.0.107 | crates.io | 2026-07-19 | Listed in Cargo.lock through serde_derive, syn and quote. Not compiled: serde's derive feature is off. |
-| quick-xml | 0.42.0 | crates.io | 2026-08-22 | Direct. Streaming XML parsing for OOXML and similar formats. |
+| quick-xml | 0.42.0 | crates.io | 2026-08-22 | Direct. Streaming XML parsing for SVG and XMP. Kurla never loads a DTD or expands an entity with it. |
 | quote | 1.0.47 | crates.io | 2026-07-19 | Listed in Cargo.lock through serde_derive. Not compiled: serde's derive feature is off. |
 | r-efi | 6.0.0 | crates.io | 2026-02-03 | Fuzz workspace only. Pulled in by getrandom (UEFI targets). Licence MIT OR Apache-2.0 OR LGPL-2.1-or-later, used under MIT OR Apache-2.0. |
 | same-file | 1.0.6 | crates.io | 2020-01-11 | Pulled in by walkdir. |

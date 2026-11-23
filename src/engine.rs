@@ -1,13 +1,13 @@
 use crate::agent_files::{active_commands, is_agent_file};
 use crate::aimed::{self, PatternHit};
-use crate::binary::{self, scan_avif, scan_gif, scan_jpeg, scan_png, scan_webp};
-use crate::encoded::{EmbeddedBlob, EncodedOutput, scan_encoded};
+use crate::binary::{self, gunzip, scan_avif, scan_gif, scan_jpeg, scan_png, scan_webp};
+use crate::encoded::{EncodedOutput, scan_encoded};
 use crate::limits::{Budget, Limits};
 use crate::location;
 use crate::markup::{Markup, scan_markup};
 use crate::model::{
-    Carrier, CarrierKind, DetectorOutput, EmbeddedNotScanned, Family, FileCoverage, FileKind,
-    Finding, LocationKind, RawFinding, RuleStatus, Severity, SkipReason, Span,
+    Carrier, CarrierKind, DetectorOutput, EmbeddedBlob, EmbeddedNotScanned, Family, FileCoverage,
+    FileKind, Finding, LocationKind, RawFinding, RuleStatus, Severity, SkipReason, Span,
 };
 use crate::severity::finalize;
 use crate::svg::{MALFORMED_XML, scan_svg};
@@ -23,6 +23,7 @@ pub const RULES_VERSION: &str = "1";
 const SNIFF_PREFIX: usize = 8192;
 const PAYLOAD_CAP: usize = 256;
 const EVIDENCE_CAP: usize = 4096;
+const EMBEDDED_DEPTH_LIMIT: &str = "embedded file depth limit";
 
 struct Entry {
     raw: RawFinding,
@@ -90,6 +91,17 @@ fn not_scanned_reason(format: Option<&str>) -> String {
         Some(name) => format!("{name} content not scanned"),
         None => "unrecognised binary content".to_string(),
     }
+}
+
+fn at_decompressed_position(mut entry: Entry, span: Span) -> Entry {
+    if let (Some(line), Some(column)) = (entry.raw.span.line, entry.raw.span.column) {
+        entry.raw.message = format!(
+            "{} (line {line}, column {column} of the decompressed SVG)",
+            entry.raw.message
+        );
+    }
+    entry.raw.span = span;
+    entry
 }
 
 fn take_malformed_tail(out: &mut DetectorOutput) -> Option<Carrier> {
@@ -256,16 +268,21 @@ impl<'a> Engine<'a> {
             let mut classified = false;
             if carrier.hidden && carrier.kind != CarrierKind::DecodedPayload {
                 let hit = !aimed::classify(&carrier.text).is_empty();
-                classified = !hit;
+                let mut covered = false;
                 for entry in &mut entries {
-                    if hit
-                        && entry.raw.carrier == CarrierKind::HiddenText
+                    if entry.raw.carrier == CarrierKind::HiddenText
                         && covers(&entry.raw.span, &carrier.span)
                     {
-                        entry.instruction_like = true;
-                        classified = true;
+                        covered = true;
+                        if hit {
+                            entry.instruction_like = true;
+                        }
                     }
                 }
+                if !hit && !covered {
+                    *self.counts.entry(carrier.kind).or_insert(0) += 1;
+                }
+                classified = !hit || covered;
             }
             jobs.push((carrier, classified));
         }
@@ -289,6 +306,29 @@ impl<'a> Engine<'a> {
                 aimed_only: false,
             });
         }
+        for blob in out.embedded {
+            self.route_embedded(blob, depth.saturating_add(1), remap);
+        }
+    }
+
+    fn route_embedded(&mut self, blob: EmbeddedBlob, depth: u8, remap: Option<Span>) {
+        let scannable = matches!(
+            blob.kind,
+            FileKind::Png | FileKind::Jpeg | FileKind::Gif | FileKind::Webp | FileKind::Avif
+        );
+        if scannable && depth > self.limits.max_decode_depth {
+            let span = remap.unwrap_or(blob.span);
+            self.push(limit_finding("L001", EMBEDDED_DEPTH_LIMIT, span));
+            self.note_skip(Some(SkipReason::SizeLimit));
+            self.embedded.push(EmbeddedNotScanned {
+                span,
+                declared_type: blob.declared_type,
+                kind: blob.kind,
+                reason: EMBEDDED_DEPTH_LIMIT.to_string(),
+            });
+            return;
+        }
+        self.route_blob(blob, depth, remap);
     }
 
     fn absorb_encoded(&mut self, encoded: EncodedOutput, depth: u8, remap: Option<Span>) {
@@ -343,6 +383,33 @@ impl<'a> Engine<'a> {
         self.push_unicode(found, None);
         let encoded = scan_encoded(doc, 0, &mut self.budget);
         self.absorb_encoded(encoded, 0, None);
+    }
+
+    fn svgz(&mut self, bytes: &[u8]) {
+        let span = whole(self.len);
+        let gunzipped = gunzip(bytes, &mut self.budget);
+        self.absorb(gunzipped.out, 0, None);
+        self.drain();
+        let Some(data) = gunzipped.data else {
+            return;
+        };
+        let Some(doc) = TextDoc::decode(&data) else {
+            self.unreadable(span);
+            return;
+        };
+        let first = self.entries.len();
+        let listed = self.embedded.len();
+        self.svg(&data, &doc);
+        self.drain();
+        for entry in self.entries.split_off(first) {
+            if gunzipped.malformed && entry.raw.message == MALFORMED_XML {
+                continue;
+            }
+            self.entries.push(at_decompressed_position(entry, span));
+        }
+        for entry in &mut self.embedded[listed..] {
+            entry.span = span;
+        }
     }
 
     fn agent_file(&mut self, doc: &TextDoc) {
@@ -488,6 +555,7 @@ impl<'a> Engine<'a> {
             category: self.kind.category(),
             skip: self.skip,
             drawn_text_unscanned: self.kind.drawn_text_unscanned(),
+            metadata_unscanned: crate::binary::metadata_unscanned(self.rel_path, self.kind),
             embedded_not_scanned: self.embedded,
             encoded_runs_not_payloads: self.not_payload_runs,
         };
@@ -537,6 +605,7 @@ fn scan_kind(rel_path: &str, bytes: &[u8], limits: &Limits, kind: FileKind) -> S
     let location = location::classify(rel_path, max_line);
     let mut engine = Engine::new(rel_path, limits, kind, location, bytes.len());
     match (kind, doc) {
+        (FileKind::Svg, _) if bytes.starts_with(&binary::gzip::MAGIC) => engine.svgz(bytes),
         (FileKind::Text | FileKind::Svg, None) => engine.unreadable(whole(bytes.len())),
         (FileKind::Text, Some(doc)) => engine.text(&doc),
         (FileKind::Svg, Some(doc)) => engine.svg(bytes, &doc),
@@ -1393,6 +1462,113 @@ mod tests {
         assert_eq!(quiet.severity, Severity::High);
     }
 
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0, 0, 0xFF];
+        v.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(data, 6));
+        v.extend_from_slice(&[0; 8]);
+        v
+    }
+
+    #[test]
+    fn svgz_is_inflated_and_scanned_as_svg_over_the_whole_file() {
+        let svg = format!(
+            "{SVG_OPEN}\n<script>alert(1)</script><text>{}</text><g id=\"{}\"/>\n<desc>{PHRASE}</desc><image href=\"data:application/zip;base64,{}\"/></svg>",
+            tags("hi"),
+            base64(PHRASE.as_bytes()),
+            base64(b"PK\x03\x04rest of a zip")
+        );
+        let bytes = gzip(svg.as_bytes());
+        let (findings, coverage, _) = scan("a.svgz", &bytes);
+        assert_eq!(coverage.kind, FileKind::Svg);
+        assert!(!coverage.drawn_text_unscanned);
+        assert_eq!(coverage.skip, None);
+        let ids = rule_ids(&findings);
+        assert!(ids.contains(&"S003") && ids.contains(&"E001"), "{ids:?}");
+        assert!(findings.iter().any(|f| f.raw.family == Family::U));
+        assert!(findings.iter().all(|f| f.raw.span == whole(bytes.len())));
+        let listed: Vec<Span> = coverage
+            .embedded_not_scanned
+            .iter()
+            .map(|e| e.span)
+            .collect();
+        assert_eq!(listed, vec![whole(bytes.len())]);
+        assert_eq!(
+            of_rule(&findings, "S003")[0].raw.message,
+            "script element in SVG (line 2, column 1 of the decompressed SVG)"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.raw.message.ends_with(" of the decompressed SVG)")),
+            "{findings:?}"
+        );
+        let aimed: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.raw.family == Family::A)
+            .collect();
+        assert!(!aimed.is_empty());
+        assert!(aimed.iter().all(|f| {
+            f.raw
+                .message
+                .starts_with("text aimed at an AI agent (line 3, column ")
+        }));
+        let (plain, coverage, _) = scan("a.svgz", SCRIPT_SVG.as_bytes());
+        assert_eq!(coverage.kind, FileKind::Svg);
+        assert_eq!(rule_ids(&plain), vec!["S003"]);
+        assert_eq!(plain[0].raw.message, "script element in SVG");
+    }
+
+    #[test]
+    fn an_svgz_bomb_is_b002() {
+        let limits = Limits {
+            max_decompressed_bytes: 1000,
+            ..Limits::default()
+        };
+        let svg = format!("{SVG_OPEN}{}</svg>", " ".repeat(5000));
+        let (findings, coverage, _) = scan_file("a.svgz", &gzip(svg.as_bytes()), &limits);
+        assert_eq!(rule_ids(&findings), vec!["B002"]);
+        assert_eq!(findings[0].severity, Severity::High);
+        assert_eq!(coverage.skip, Some(SkipReason::DecompressionLimit));
+        assert_eq!(coverage.kind, FileKind::Svg);
+    }
+
+    #[test]
+    fn a_corrupt_svgz_is_malformed_once_and_its_partial_svg_is_scanned() {
+        let partial = format!("{SVG_OPEN}<script>alert(1)</script><g></g></g>{PHRASE}");
+        let declared = (partial.len() + 50) as u16;
+        let mut bytes = vec![0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0, 0, 0xFF, 0x01];
+        bytes.extend_from_slice(&declared.to_le_bytes());
+        bytes.extend_from_slice(&(!declared).to_le_bytes());
+        bytes.extend_from_slice(partial.as_bytes());
+        let (findings, coverage, _) = scan("a.svgz", &bytes);
+        let l001 = of_rule(&findings, "L001");
+        assert_eq!(l001.len(), 1);
+        assert_eq!(l001[0].raw.message, "malformed gzip: corrupt stream");
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+        assert!(rule_ids(&findings).contains(&"S003"));
+        assert_eq!(of_rule(&findings, "S002")[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn a_whole_svgz_with_broken_xml_keeps_the_malformed_xml_finding() {
+        let svg = format!("{SVG_OPEN}<g></g></g>");
+        let (findings, coverage, _) = scan("a.svgz", &gzip(svg.as_bytes()));
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(
+            findings[0].raw.message,
+            format!("{MALFORMED_XML} (line 1, column 48 of the decompressed SVG)")
+        );
+        assert_eq!(coverage.skip, Some(SkipReason::Malformed));
+    }
+
+    #[test]
+    fn svgz_that_inflates_to_binary_is_unreadable() {
+        let (findings, coverage, _) = scan("a.svgz", &gzip(&[0, 255, 1, 254]));
+        assert_eq!(rule_ids(&findings), vec!["L001"]);
+        assert_eq!(findings[0].raw.message, "unreadable file");
+        assert_eq!(coverage.skip, Some(SkipReason::Unreadable));
+    }
+
     #[test]
     fn instruction_like_text_after_svg_parse_error_is_hidden_content() {
         let svg = format!("{SVG_OPEN}<g></g></g>{PHRASE}");
@@ -1572,6 +1748,7 @@ mod tests {
             findings: vec![limit_finding(rule, message, tail_span(10, 20))],
             carriers,
             skip: None,
+            embedded: Vec::new(),
         }
     }
 
@@ -1673,5 +1850,156 @@ mod tests {
         let hidden_only = "<svg xmlns=\"http://www.w3.org/2000/svg\"><text display=\"none\">hello there</text></svg>";
         let (_, _, counts) = scan("a.svg", hidden_only.as_bytes());
         assert!(counts.is_empty());
+    }
+
+    fn png_ending_with(trailer: &[u8]) -> Vec<u8> {
+        let mut v = PNG_SIGNATURE.to_vec();
+        v.extend_from_slice(&png_chunk(b"IEND", &[]));
+        v.extend_from_slice(trailer);
+        v
+    }
+
+    #[test]
+    fn a_png_trailer_is_b004_high_and_critical_when_instruction_like() {
+        let (findings, _, _) = scan("a.png", &png_ending_with(b"note for the reader"));
+        assert_eq!(rule_ids(&findings), vec!["B004"]);
+        assert_eq!(findings[0].severity, Severity::High);
+        let (findings, _, _) = scan("a.png", &png_ending_with(PHRASE.as_bytes()));
+        assert_eq!(rule_ids(&findings), vec!["B004"]);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].raw.span.byte_start, 20);
+    }
+
+    fn jpeg_with_exif_value(tag: u16, value: &[u8]) -> Vec<u8> {
+        let mut tiff = vec![0x49, 0x49, 0x2A, 0, 8, 0, 0, 0, 1, 0];
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&26u32.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0, 0, 0]);
+        tiff.extend_from_slice(value);
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        v.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        v.extend_from_slice(&payload);
+        v
+    }
+
+    #[test]
+    fn readable_hidden_text_in_an_image_is_b005_high_and_critical_when_instruction_like() {
+        let bytes = jpeg_with_exif_value(0x010E, b"shown\0meet me at the usual place");
+        let (findings, _, counts) = scan("a.jpg", &bytes);
+        assert_eq!(rule_ids(&findings), vec!["B005"]);
+        assert_eq!(findings[0].severity, Severity::High);
+        let span = (
+            findings[0].raw.span.byte_start,
+            findings[0].raw.span.byte_end,
+        );
+        assert_eq!(span, (44, 70));
+        assert_eq!(counts.get(&CarrierKind::HiddenText), None);
+        assert_eq!(counts.get(&CarrierKind::MetadataField), Some(&1));
+        let aimed = jpeg_with_exif_value(0x010E, format!("shown\0{PHRASE}").as_bytes());
+        let (findings, _, counts) = scan("a.jpg", &aimed);
+        assert_eq!(rule_ids(&findings), vec!["B005"]);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(counts.get(&CarrierKind::HiddenText), None);
+    }
+
+    #[test]
+    fn camera_style_nul_padded_exif_fields_with_leftover_junk_stay_quiet() {
+        let mut binary_junk = b"NIKON D850".to_vec();
+        binary_junk.extend_from_slice(&[0; 6]);
+        binary_junk.extend_from_slice(&[0x01, 0x00, 0x9C, 0x02, 0x10, 0xFF]);
+        binary_junk.extend_from_slice(&[0; 10]);
+        let leftover_name = b"Canon EOS R5\0 Mark II\0\0\0\0\0\0\0\0\0\0\0".to_vec();
+        for value in [binary_junk, leftover_name] {
+            assert_eq!(value.len(), 32);
+            let (findings, coverage, counts) = scan("a.jpg", &jpeg_with_exif_value(0x0110, &value));
+            assert!(findings.is_empty(), "{findings:?}");
+            assert_eq!(coverage.skip, None);
+            assert_eq!(counts.get(&CarrierKind::MetadataField), Some(&1));
+            assert_eq!(counts.get(&CarrierKind::HiddenText), Some(&1));
+        }
+    }
+
+    #[test]
+    fn a_zip_after_iend_is_listed_as_embedded_and_not_scanned() {
+        let bytes = png_ending_with(b"PK\x03\x04rest of a zip");
+        let (findings, coverage, _) = scan("a.png", &bytes);
+        assert_eq!(rule_ids(&findings), vec!["B004"]);
+        assert_eq!(
+            coverage.embedded_not_scanned,
+            vec![EmbeddedNotScanned {
+                span: Span {
+                    byte_start: 20,
+                    byte_end: bytes.len() as u64,
+                    line: None,
+                    column: None,
+                },
+                declared_type: None,
+                kind: FileKind::UnknownBinary,
+                reason: "zip content not scanned".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_image_after_iend_is_scanned_as_an_embedded_image() {
+        let bytes = png_ending_with(&jpeg_with_comment(PHRASE));
+        let (findings, coverage, _) = scan("a.png", &bytes);
+        let aimed: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.raw.family == Family::A)
+            .collect();
+        assert!(!aimed.is_empty());
+        assert!(
+            aimed
+                .iter()
+                .all(|f| f.raw.carrier == CarrierKind::MetadataField
+                    && f.raw.span.byte_start == 20
+                    && f.raw.span.byte_end == bytes.len() as u64)
+        );
+        assert!(coverage.embedded_not_scanned.is_empty());
+    }
+
+    #[test]
+    fn embedded_images_past_the_decode_depth_are_listed_with_l001() {
+        let mut chain = png_ending_with(&[]);
+        for _ in 0..3 {
+            chain = png_ending_with(&chain);
+        }
+        let (findings, coverage, _) = scan("a.png", &chain);
+        let l001 = of_rule(&findings, "L001");
+        assert_eq!(l001.len(), 1);
+        assert_eq!(l001[0].raw.message, "embedded file depth limit");
+        assert_eq!(coverage.skip, Some(SkipReason::SizeLimit));
+        assert_eq!(coverage.embedded_not_scanned.len(), 1);
+        assert_eq!(coverage.embedded_not_scanned[0].kind, FileKind::Png);
+        assert_eq!(
+            coverage.embedded_not_scanned[0].reason,
+            "embedded file depth limit"
+        );
+        assert_eq!(of_rule(&findings, "B004").len(), 3);
+    }
+
+    #[test]
+    fn the_listed_other_image_formats_are_marked_metadata_not_scanned() {
+        for path in [
+            "a.tif", "a.tiff", "a.psd", "a.jxl", "a.jp2", "a.j2k", "a.bmp", "a.ico", "a.cur",
+            "a.tga", "a.emf", "a.wmf",
+        ] {
+            let (findings, coverage, _) = scan(path, &[0, 255, 1, 254]);
+            assert_eq!(coverage.kind, FileKind::OtherImage, "{path}");
+            assert!(coverage.metadata_unscanned, "{path}");
+            assert!(findings.is_empty());
+            assert_eq!(coverage.skip, None);
+        }
+        for path in ["a.svgz", "a.dat"] {
+            let (_, coverage, _) = scan(path, &[0, 255, 1, 254]);
+            assert!(!coverage.metadata_unscanned, "{path}");
+        }
+        let (_, coverage, _) = scan("a.png", &png_ending_with(&[]));
+        assert!(!coverage.metadata_unscanned);
     }
 }

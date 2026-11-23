@@ -1,6 +1,6 @@
 use kurla::binary::scan_png;
 use kurla::limits::{Budget, Limits};
-use kurla::model::{CarrierKind, DetectorOutput, SkipReason};
+use kurla::model::{CarrierKind, DetectorOutput, SkipReason, Span};
 
 use crate::spans;
 
@@ -52,7 +52,8 @@ pub fn check_decompression(small_consumed: u64, large_consumed: u64, small: &Det
 pub fn check(data: &[u8]) {
     let mut small = Budget::new(&limits());
     let out = scan_png(data, &mut small);
-    spans::check_spans(data.len(), "png", &out.findings, &out.carriers, &[]);
+    let embedded: Vec<Span> = out.embedded.iter().map(|blob| blob.span).collect();
+    spans::check_spans(data.len(), "png", &out.findings, &out.carriers, &embedded);
     let mut large = Budget::new(&large_limits());
     scan_png(data, &mut large);
     check_decompression(
