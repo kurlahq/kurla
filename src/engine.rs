@@ -93,6 +93,17 @@ fn not_scanned_reason(format: Option<&str>) -> String {
     }
 }
 
+fn at_decompressed_position(mut entry: Entry, span: Span) -> Entry {
+    if let (Some(line), Some(column)) = (entry.raw.span.line, entry.raw.span.column) {
+        entry.raw.message = format!(
+            "{} (line {line}, column {column} of the decompressed SVG)",
+            entry.raw.message
+        );
+    }
+    entry.raw.span = span;
+    entry
+}
+
 fn take_malformed_tail(out: &mut DetectorOutput) -> Option<Carrier> {
     let span = out
         .findings
@@ -378,6 +389,7 @@ impl<'a> Engine<'a> {
         let span = whole(self.len);
         let gunzipped = gunzip(bytes, &mut self.budget);
         self.absorb(gunzipped.out, 0, None);
+        self.drain();
         let Some(data) = gunzipped.data else {
             return;
         };
@@ -386,23 +398,18 @@ impl<'a> Engine<'a> {
             return;
         };
         let first = self.entries.len();
-        let out = scan_svg(&data, &mut self.budget, self.limits);
-        self.absorb(out, 0, Some(span));
-        if gunzipped.malformed {
-            let added = self.entries.split_off(first);
-            self.entries.extend(
-                added
-                    .into_iter()
-                    .filter(|entry| entry.raw.message != MALFORMED_XML),
-            );
+        let listed = self.embedded.len();
+        self.svg(&data, &doc);
+        self.drain();
+        for entry in self.entries.split_off(first) {
+            if gunzipped.malformed && entry.raw.message == MALFORMED_XML {
+                continue;
+            }
+            self.entries.push(at_decompressed_position(entry, span));
         }
-        let mut found = scan_text(&doc, self.location);
-        for raw in &mut found {
-            raw.span = span;
+        for entry in &mut self.embedded[listed..] {
+            entry.span = span;
         }
-        self.push_unicode(found, None);
-        let encoded = scan_encoded(&doc, 0, &mut self.budget);
-        self.absorb_encoded(encoded, 0, Some(span));
     }
 
     fn agent_file(&mut self, doc: &TextDoc) {
@@ -1465,9 +1472,10 @@ mod tests {
     #[test]
     fn svgz_is_inflated_and_scanned_as_svg_over_the_whole_file() {
         let svg = format!(
-            "{SVG_OPEN}<script>alert(1)</script><text>{}</text><g id=\"{}\"/></svg>",
+            "{SVG_OPEN}\n<script>alert(1)</script><text>{}</text><g id=\"{}\"/>\n<desc>{PHRASE}</desc><image href=\"data:application/zip;base64,{}\"/></svg>",
             tags("hi"),
-            base64(PHRASE.as_bytes())
+            base64(PHRASE.as_bytes()),
+            base64(b"PK\x03\x04rest of a zip")
         );
         let bytes = gzip(svg.as_bytes());
         let (findings, coverage, _) = scan("a.svgz", &bytes);
@@ -1478,9 +1486,36 @@ mod tests {
         assert!(ids.contains(&"S003") && ids.contains(&"E001"), "{ids:?}");
         assert!(findings.iter().any(|f| f.raw.family == Family::U));
         assert!(findings.iter().all(|f| f.raw.span == whole(bytes.len())));
+        let listed: Vec<Span> = coverage
+            .embedded_not_scanned
+            .iter()
+            .map(|e| e.span)
+            .collect();
+        assert_eq!(listed, vec![whole(bytes.len())]);
+        assert_eq!(
+            of_rule(&findings, "S003")[0].raw.message,
+            "script element in SVG (line 2, column 1 of the decompressed SVG)"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.raw.message.ends_with(" of the decompressed SVG)")),
+            "{findings:?}"
+        );
+        let aimed: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| f.raw.family == Family::A)
+            .collect();
+        assert!(!aimed.is_empty());
+        assert!(aimed.iter().all(|f| {
+            f.raw
+                .message
+                .starts_with("text aimed at an AI agent (line 3, column ")
+        }));
         let (plain, coverage, _) = scan("a.svgz", SCRIPT_SVG.as_bytes());
         assert_eq!(coverage.kind, FileKind::Svg);
         assert_eq!(rule_ids(&plain), vec!["S003"]);
+        assert_eq!(plain[0].raw.message, "script element in SVG");
     }
 
     #[test]
@@ -1519,7 +1554,10 @@ mod tests {
         let svg = format!("{SVG_OPEN}<g></g></g>");
         let (findings, coverage, _) = scan("a.svgz", &gzip(svg.as_bytes()));
         assert_eq!(rule_ids(&findings), vec!["L001"]);
-        assert_eq!(findings[0].raw.message, MALFORMED_XML);
+        assert_eq!(
+            findings[0].raw.message,
+            format!("{MALFORMED_XML} (line 1, column 48 of the decompressed SVG)")
+        );
         assert_eq!(coverage.skip, Some(SkipReason::Malformed));
     }
 
