@@ -14,6 +14,8 @@ const UNKNOWN_METHOD: &str = "malformed PNG: unknown compression method";
 const TRUNCATED_CHUNK: &str = "malformed PNG: truncated chunk";
 const INCOMPLETE_HEADER: &str = "malformed PNG: chunk header is incomplete";
 const TRAILER_LABEL: &str = "PNG data after IEND";
+const IEND_DATA: &str = "malformed PNG: IEND chunk holds data";
+const IEND_DATA_LABEL: &str = "PNG data inside IEND";
 
 pub(crate) enum Inflated {
     Text(Vec<u8>),
@@ -314,8 +316,15 @@ impl Walker<'_> {
                 b"pCAL" => self.pcal_chunk(&chunk),
                 b"eXIf" => self.sink.exif(chunk.data, chunk.data_start, &*self.budget),
                 b"IEND" => {
-                    let after = chunk.data_start + chunk.data.len() + CRC_LEN;
-                    self.sink.trailer(TRAILER_LABEL, bytes, after, false);
+                    let data_end = chunk.data_start + chunk.data.len();
+                    if !chunk.data.is_empty() {
+                        self.sink.malformed(IEND_DATA, chunk.data_start, data_end);
+                        let through_data = &bytes[..data_end];
+                        self.sink
+                            .trailer(IEND_DATA_LABEL, through_data, chunk.data_start, false);
+                    }
+                    self.sink
+                        .trailer(TRAILER_LABEL, bytes, data_end + CRC_LEN, false);
                     return;
                 }
                 _ => {}
@@ -813,13 +822,8 @@ mod tests {
         assert!(out.embedded.is_empty());
     }
 
-    #[test]
-    fn data_after_an_iend_chunk_that_holds_data_starts_after_its_crc() {
-        let mut bytes = png(&[chunk(b"tEXt", b"A\0one"), chunk(b"IEND", b"abcd")]);
-        bytes.extend_from_slice(b"note for the reader");
-        let out = scan_png(&bytes, &mut budget());
-        let trailer: Vec<(&str, u64, u64, &[u8])> = out
-            .carriers
+    fn hidden(out: &DetectorOutput) -> Vec<(&str, u64, u64, &[u8])> {
+        out.carriers
             .iter()
             .filter(|c| c.hidden)
             .map(|c| {
@@ -830,23 +834,64 @@ mod tests {
                     c.evidence.as_slice(),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn data_after_an_iend_chunk_that_holds_data_starts_after_its_crc() {
+        let mut bytes = png(&[chunk(b"tEXt", b"A\0one"), chunk(b"IEND", b"abcd")]);
+        bytes.extend_from_slice(b"note for the reader");
+        let out = scan_png(&bytes, &mut budget());
         assert_eq!(
-            trailer,
+            hidden(&out),
+            vec![
+                ("PNG data inside IEND: abcd", 33, 37, &b"abcd"[..]),
+                (
+                    "PNG data after IEND: note for the reader",
+                    41,
+                    60,
+                    &b"note for the reader"[..]
+                )
+            ]
+        );
+        assert_eq!(
+            findings(&out),
+            vec![
+                ("L001", "malformed PNG: IEND chunk holds data", 33, 37),
+                ("B004", "data after the end of the image", 33, 37),
+                ("B004", "data after the end of the image", 41, 60)
+            ]
+        );
+    }
+
+    #[test]
+    fn data_inside_an_iend_chunk_is_malformed_and_b004_unless_it_is_padding() {
+        let out = scan_png(
+            &png(&[chunk(b"IEND", b"note for the reader")]),
+            &mut budget(),
+        );
+        assert_eq!(
+            hidden(&out),
             vec![(
-                "PNG data after IEND: note for the reader",
-                41,
-                60,
+                "PNG data inside IEND: note for the reader",
+                16,
+                35,
                 &b"note for the reader"[..]
             )]
         );
-        let b004: Vec<(&str, &str, u64, u64)> = findings(&out)
-            .into_iter()
-            .filter(|f| f.0 == "B004")
-            .collect();
         assert_eq!(
-            b004,
-            vec![("B004", "data after the end of the image", 41, 60)]
+            findings(&out),
+            vec![
+                ("L001", "malformed PNG: IEND chunk holds data", 16, 35),
+                ("B004", "data after the end of the image", 16, 35)
+            ]
+        );
+        assert_eq!(out.skip, Some(SkipReason::Malformed));
+        let padded = scan_png(&png(&[chunk(b"IEND", b"\0\0 \r\n\t")]), &mut budget());
+        assert!(padded.carriers.is_empty());
+        assert_eq!(
+            findings(&padded),
+            vec![("L001", "malformed PNG: IEND chunk holds data", 16, 22)]
         );
     }
 
