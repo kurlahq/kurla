@@ -852,7 +852,7 @@ mod tests {
         rational.extend_from_slice(&u16b(LE, 1));
         rational.extend_from_slice(&entry(LE, 0x9C9D, 5, 1, u32b(LE, 26)));
         rational.extend_from_slice(&[0, 0, 0, 0]);
-        rational.extend_from_slice(b"E F G H ");
+        rational.extend_from_slice(b"E\0F\0G\0H\0");
         assert_eq!(
             exif_text_fields(&rational),
             Ok(vec![pair("XPAuthor", "EFGH")])
