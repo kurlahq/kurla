@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn exif_values_overlapping_one_blob_stay_under_the_output_cap() {
+    fn overlapping_exif_values_beyond_the_output_cap_give_b003() {
         let bytes = png(&[chunk(b"eXIf", &overlapping_tiff(1000, 30000, true))]);
         let out = scan_png(&bytes, &mut budget());
         assert!(cost(&out) <= 3 * bytes.len() + 65536);

@@ -26,6 +26,7 @@ use crate::text::TextDoc;
 pub(crate) const EVIDENCE_CAP: usize = 4096;
 const TRAILER_MESSAGE: &str = "data after the end of the image";
 const HIDDEN_MESSAGE: &str = "readable text hidden in the image";
+const REPLACEMENT_UTF8: [u8; 3] = [0xEF, 0xBF, 0xBD];
 const EXIF_BAD_HEADER: &str = "malformed EXIF: invalid TIFF header";
 const EXIF_OUTSIDE: &str = "malformed EXIF: entry or value outside the block";
 const EXIF_IFD_LIMIT: &str = "EXIF IFD limit";
@@ -120,6 +121,11 @@ pub fn sniff(bytes: &[u8], path: &str) -> FileKind {
     } else {
         FileKind::UnknownBinary
     }
+}
+
+fn output_weight(bytes: &[u8]) -> usize {
+    let replacements = bytes.windows(3).filter(|w| *w == REPLACEMENT_UTF8).count();
+    bytes.len() - 2 * replacements
 }
 
 pub(crate) fn is_padding(bytes: &[u8]) -> bool {
@@ -338,7 +344,7 @@ impl Sink {
         }
         let evidence = &evidence[..evidence.len().min(EVIDENCE_CAP)];
         let full = format!("{label}: {text}");
-        let cost = text.len().saturating_add(evidence.len());
+        let cost = output_weight(text.as_bytes()).saturating_add(output_weight(evidence));
         if self.used.saturating_add(cost) > self.cap() {
             self.stop = true;
             self.amplification(start, end);
@@ -713,6 +719,25 @@ mod tests {
         assert_eq!(finding.rule_id, "L001");
         assert_eq!(finding.span.byte_start, 100);
         assert_eq!(finding.span.byte_end, 100 + 12026);
+    }
+
+    #[test]
+    fn replacement_characters_cost_one_byte_each_against_the_output_cap() {
+        let mut packet = b"<a>".to_vec();
+        packet.extend_from_slice(&[0xFF; 30_000]);
+        packet.extend_from_slice(b"</a>");
+        let mut sink = Sink::new(packet.len());
+        sink.xmp("XMP", &packet, 0, packet.len(), true, &plain_budget());
+        assert!(sink.out.findings.is_empty(), "{:?}", sink.out.findings);
+        assert_eq!(sink.out.carriers.len(), 1);
+        let fffd = "\u{FFFD}";
+        let evidence = fffd.repeat(1000);
+        let mut exact = Sink::new(0);
+        let text = fffd.repeat(64_536);
+        assert!(exact.carrier("L", &text, 0, 1, evidence.as_bytes()));
+        let mut over = Sink::new(0);
+        let text = fffd.repeat(64_537);
+        assert!(!over.carrier("L", &text, 0, 1, evidence.as_bytes()));
     }
 
     #[test]

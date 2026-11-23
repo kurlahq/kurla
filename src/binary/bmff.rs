@@ -1718,8 +1718,8 @@ mod tests {
     }
 
     #[test]
-    fn thousand_duplicate_infe_entries_on_a_large_textless_item_parse_once() {
-        let packet = b"<b/>".repeat(25_000);
+    fn thousand_duplicate_infe_entries_on_a_large_item_parse_it_once() {
+        let packet = [&b"<a>x"[..], &b"<b/>".repeat(25_000), b"</a>"].concat();
         let length = packet.len() as u32;
         let children = move |base: u32| {
             let entries: Vec<_> = (0..1000)
@@ -1731,7 +1731,7 @@ mod tests {
         };
         let bytes = assemble(0, &children, &packet);
         let out = scan_avif(&bytes, &mut budget());
-        assert!(out.carriers.is_empty());
+        assert_eq!(texts(&out), vec!["AVIF XMP: x"]);
         assert!(out.findings.is_empty());
         assert_eq!(out.skip, None);
     }
