@@ -109,8 +109,8 @@ Every payload, path and message in every format escapes control, bidirectional a
 - Text drawn inside images is not scanned, and PDFs are not scanned. Both are listed in the coverage, and neither affects the exit code. Embedded formats that Kurla does not read are listed as not scanned.
 - Family A is experimental. Its findings, and those of the look-alike script rule `U006`, are capped at `medium`, so they never fail the default gate on their own. Expect both false positives and misses.
 - Kurla is not a guarantee that a repository is free of hidden or hostile content.
-- The macOS build is offline by flag only: it uses `--locked --offline` and the vendored sources, but the runner that builds it keeps network access. The Linux and Windows builds run in a container with no network.
-- The release binaries are not signed. Windows SmartScreen and macOS Gatekeeper may warn when you run them.
+- The macOS release build will be offline by flag only: it will use `--locked --offline` and the vendored sources, but the runner that builds it will keep network access. The Linux and Windows release builds will run in a container with no network.
+- The release binaries will not be signed. Windows SmartScreen and macOS Gatekeeper may warn when you run them.
 
 ## Supply chain
 
