@@ -58,6 +58,10 @@ Kurla keeps a local cache of per-file scan results so that unchanged files are n
 
 Anyone who can write to the cache directory can change scan results, because a stored entry is used in place of a scan. Use `--no-cache` wherever that is not acceptable, for example on a shared or untrusted machine or in a directory other users can write to.
 
+The key is not a secret. It is computed from the file's path and contents, the limits and a hash of the Kurla executable, none of which is secret, so anyone who can write to the cache directory can forge an entry for a file they expect to be scanned, and that entry will be trusted.
+
+In CI, run with `--no-cache`. If you cache between runs anyway, restore only a cache written by runs of trusted code: never one that a pull request from a fork, or any other job that ran untrusted code, could have written, and never one shared across repositories.
+
 ### What the key covers
 
 An entry is looked up by a SHA-256 key over these length-prefixed fields:

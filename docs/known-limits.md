@@ -23,3 +23,24 @@ Kurla reports what it scanned and what it did not. This page lists content that 
 
 - **Ideographic variation sequences** are reported as U003 (high). An ideographic variation sequence is a CJK ideograph followed by a selector from U+E0100 to U+E01EF, used mostly for Japanese place and personal names. Kurla does not ship the Ideographic Variation Database, which lists the registered sequences, so it cannot tell a registered sequence from a selector that carries data. A reviewer can mark such a finding as reviewed.
 - **Blank-looking characters that are not default-ignorable** are not flagged. Kurla finds invisible characters by the Unicode `Default_Ignorable_Code_Point` property, and also flags U+2800 BRAILLE PATTERN BLANK unless the same line holds another braille character. Other characters that draw as empty space are not flagged: the space characters U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F and U+3000, and symbols that draw nothing, such as U+1D159 MUSICAL SYMBOL NULL NOTEHEAD. They show as a gap, so a reader sees spacing where they are.
+
+## Markup in Markdown and HTML
+
+- **Raw-text elements are read as markup.** The contents of `<script>`, `<style>`, `<textarea>` and `<title>` are not treated as raw text, so a string inside JavaScript or CSS that looks like hidden markup can give a false M002.
+- **Implicit end tags are not modelled.** HTML closes `p`, `li` and `td` elements without an end tag; Kurla does not, so hidden text can run on to the next matching end tag. A page with more than 256 elements left open this way gets an L001 "markup nesting limit", even when it is valid HTML.
+- **Some code in Markdown is read as markup.** Fenced code blocks inside lists or block quotes, and `\<` escapes, are not recognised, so markup shown as code there can give a false M002.
+- **Content that is never displayed is not checked for hiding.** Kurla does not look inside `<template>` or `<noscript>`, and does not evaluate style sheets, so text hidden by a CSS rule or a class is not found.
+- **How code and comments end.** A fenced code block ends as in CommonMark: at a fence of the same character, at least as long as the opening fence, indented by at most three spaces and followed only by spaces or tabs. An HTML comment ends as in the WHATWG HTML tokenizer: at `-->` or `--!>`, and `<!-->` and `<!--->` are complete, empty comments.
+
+## SVG
+
+- **Transforms are not evaluated.** A `transform` on an element or on one of its ancestors turns off the check for text placed outside the drawing.
+- **Style sheets are not evaluated.** Hiding through a `<style>` element or a class rule is not found. Inline `style` attributes are read.
+- **Clip rectangles are read from attributes only**, not from the `style` attribute.
+- **Every attribute whose name starts with `on`** is reported as an event handler, as the design requires, including names that are not real handlers.
+
+## Scanning
+
+- **Files that change during a scan.** Kurla lists the files first and reads each one once. A file changed after it was read is not read again, and a file replaced between the listing and the read is scanned in its new form.
+- **NTFS alternate data streams and extended attributes** are not read. Tools that read a file normally do not see them either.
+- **Duplicate keys in agent configuration.** When a key appears twice in a JSON settings file, Kurla reads the last one, as JavaScript's `JSON.parse` does.
