@@ -1,4 +1,4 @@
-use super::context::Context;
+use super::context::{BRAILLE_BLANK, Context};
 use super::{
     Script, confusable_skeleton, is_allowed_variation_pair, is_bidi_control, is_default_ignorable,
     is_private_use, is_tag, is_variation_selector, script,
@@ -48,7 +48,7 @@ fn rule_of(c: char) -> Option<Rule> {
         Some(Rule::U004)
     } else if is_private_use(c) {
         Some(Rule::U005)
-    } else if is_default_ignorable(c) {
+    } else if is_default_ignorable(c) || c == BRAILLE_BLANK {
         Some(Rule::U001)
     } else {
         None
@@ -439,6 +439,45 @@ mod tests {
                 RuleStatus::Stable,
                 Some("1"),
             );
+        }
+    }
+
+    #[test]
+    fn braille_blank_in_string_is_u001() {
+        let findings = scan_text(&doc_str("let s = \"a\u{2800}b\";"), LocationKind::Code);
+        assert_single(
+            &findings,
+            "U001",
+            Severity::High,
+            RuleStatus::Stable,
+            Some("1"),
+        );
+    }
+
+    #[test]
+    fn braille_text_line_not_flagged() {
+        let text = "\u{2813}\u{2811}\u{2807}\u{2807}\u{2815}\u{2800}\u{283A}\u{2815}\u{2817}\u{2807}\u{2819}";
+        assert!(scan_text(&doc_str(text), LocationKind::DocsTemplate).is_empty());
+        for edge in [
+            "\u{2801}\u{2800}",
+            "\u{2800}\u{28FF}",
+            "x\n\u{2813}\u{2800}",
+        ] {
+            assert!(scan_text(&doc_str(edge), LocationKind::DocsTemplate).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_braille_blank_is_exempt_only_on_a_line_with_other_braille() {
+        for text in [
+            "\u{2813}\u{2811}\n\u{2800}",
+            "\u{2800}\r\u{2813}",
+            "\u{2900}\u{2800}",
+            "\u{2800}\u{2800}",
+        ] {
+            let findings = scan_text(&doc_str(text), LocationKind::DocsTemplate);
+            assert_eq!(findings.len(), 1, "{text:?}");
+            assert_eq!(findings[0].rule_id, "U001");
         }
     }
 

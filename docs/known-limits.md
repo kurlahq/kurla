@@ -13,4 +13,13 @@ Kurla reports what it scanned and what it did not. This page lists content that 
 
 ## Text that is not decoded
 
-- **UTF-16 text without a byte-order mark whose characters are mostly outside ASCII**, such as Chinese, Japanese or Korean text. Kurla recognises UTF-16 without a byte-order mark by the zero bytes that ASCII characters produce in it. A file with too few of them is listed in the coverage report as unknown binary instead of being scanned as text.
+- **UTF-16 text without a byte-order mark whose characters are mostly outside ASCII.** Kurla recognises UTF-16 without a byte-order mark by the zero bytes that ASCII characters produce in it. A file with too few of them is handled in one of two ways:
+  - When its bytes are not valid UTF-8, as is usual for Chinese, Japanese, Korean, Greek or Hebrew text, the file is listed in the coverage report as `unknown_binary`. That makes the run incomplete only with `--require-complete`.
+  - When its bytes happen to be valid UTF-8, as for most Cyrillic or Arabic letters, whose UTF-16 code units are an ASCII byte and a control byte, the file is scanned as UTF-8 text. That text is a string of control characters and stray ASCII characters, so the scan says nothing about the UTF-16 content.
+
+  In both cases a payload hidden in such a file is not active for most readers either: an editor or an agent that reads the file as UTF-8, as most do, sees garbage, not the hidden text. The risk is a tool that guesses BOM-less UTF-16 on its own.
+
+## Unicode characters
+
+- **Ideographic variation sequences** are reported as U003 (high). An ideographic variation sequence is a CJK ideograph followed by a selector from U+E0100 to U+E01EF, used mostly for Japanese place and personal names. Kurla does not ship the Ideographic Variation Database, which lists the registered sequences, so it cannot tell a registered sequence from a selector that carries data. A reviewer can mark such a finding as reviewed.
+- **Blank-looking characters that are not default-ignorable** are not flagged. Kurla finds invisible characters by the Unicode `Default_Ignorable_Code_Point` property, and also flags U+2800 BRAILLE PATTERN BLANK unless the same line holds another braille character. Other characters that draw as empty space are not flagged: the space characters U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F and U+3000, and symbols that draw nothing, such as U+1D159 MUSICAL SYMBOL NULL NOTEHEAD. They show as a gap, so a reader sees spacing where they are.

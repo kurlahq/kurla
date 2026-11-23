@@ -9,6 +9,8 @@ const ZWJ: char = '\u{200D}';
 const SOFT_HYPHEN: char = '\u{00AD}';
 const BOM: char = '\u{FEFF}';
 const MONGOLIAN_VOWEL_SEPARATOR: char = '\u{180E}';
+pub(super) const BRAILLE_BLANK: char = '\u{2800}';
+const BRAILLE_CELLS: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 const VS16: char = '\u{FE0F}';
 const BLACK_FLAG: char = '\u{1F3F4}';
 const MAX_TAG_SEQUENCE_CHARS: usize = 32;
@@ -52,7 +54,7 @@ pub struct Context<'a> {
     chars: &'a [char],
     location: LocationKind,
     bidi_exempt: bool,
-    rgi: Vec<bool>,
+    exempt: Vec<bool>,
 }
 
 impl<'a> Context<'a> {
@@ -61,7 +63,7 @@ impl<'a> Context<'a> {
             chars,
             location,
             bidi_exempt: location != LocationKind::Code && mostly_rtl(chars),
-            rgi: rgi_mask(chars),
+            exempt: exempt_mask(chars),
         }
     }
 
@@ -74,7 +76,7 @@ impl<'a> Context<'a> {
             MONGOLIAN_VOWEL_SEPARATOR => self.between_mongolian_letters(i),
             SOFT_HYPHEN => self.location != LocationKind::Code && self.between_letters(i),
             _ if is_bidi_control(c) => self.bidi_exempt,
-            _ => self.rgi[i],
+            _ => self.exempt[i],
         }
     }
 
@@ -130,7 +132,7 @@ fn mostly_rtl(chars: &[char]) -> bool {
     letters > 0 && rtl * RTL_RATIO_DIVISOR >= letters
 }
 
-fn rgi_mask(chars: &[char]) -> Vec<bool> {
+fn exempt_mask(chars: &[char]) -> Vec<bool> {
     let mut mask = vec![false; chars.len()];
     for (i, &c) in chars.iter().enumerate() {
         if c != BLACK_FLAG {
@@ -144,6 +146,17 @@ fn rgi_mask(chars: &[char]) -> Vec<bool> {
         if let Some(len) = rgi_tag_sequence_len(&window) {
             mask[i..i + len].fill(true);
         }
+    }
+    let mut start = 0;
+    for line in chars.split(|c| matches!(c, '\n' | '\r')) {
+        if line.iter().any(|c| BRAILLE_CELLS.contains(c)) {
+            for (offset, &c) in line.iter().enumerate() {
+                if c == BRAILLE_BLANK {
+                    mask[start + offset] = true;
+                }
+            }
+        }
+        start += line.len() + 1;
     }
     mask
 }
