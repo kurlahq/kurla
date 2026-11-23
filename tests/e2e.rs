@@ -1314,10 +1314,10 @@ fn e2e_rlo_in_a_file_name_is_escaped_on_every_stream() {
         let out = stdout_of(&output);
         assert!(!out.contains('\u{202E}'), "{format}");
         let backslash = char::from(92u8);
-        let escaped = if format == "human" {
-            format!("evil{backslash}u{{202E}}name.md")
-        } else {
-            format!("evil{backslash}{backslash}u{{202E}}name.md")
+        let escaped = match format {
+            "human" => format!("evil{backslash}u{{202E}}name.md"),
+            "json" => format!("evil{backslash}{backslash}u{{202E}}name.md"),
+            _ => "evil%E2%80%AEname.md".to_string(),
         };
         assert!(out.contains(&escaped), "{format}");
         assert!(!stderr_of(&output).contains('\u{202E}'), "{format}");
@@ -1325,6 +1325,38 @@ fn e2e_rlo_in_a_file_name_is_escaped_on_every_stream() {
     let output = kurla(&dir, &["scan", "--no-cache", "--bad\u{202E}flag"]);
     assert_eq!(code_of(&output), 2);
     assert!(!stderr_of(&output).contains('\u{202E}'));
+}
+
+#[test]
+fn e2e_a_missing_base_is_rejected_and_a_missing_rlo_path_is_escaped() {
+    let dir = TestDir::new();
+    dir.write("a.txt", b"hello\n");
+    let args = [
+        "scan",
+        "--no-cache",
+        "--format",
+        "json",
+        "--decisions-base",
+        "missing.json",
+    ];
+    let output = kurla(&dir, &args);
+    assert_eq!(code_of(&output), 2);
+    let json: Value = serde_json::from_str(&stdout_of(&output)).unwrap();
+    let rejected = &json["decisions_errors"];
+    assert_eq!(rejected.as_array().map(Vec::len), Some(1));
+    assert_eq!(rejected[0]["file"], "missing.json");
+    let message = rejected[0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("cannot read decisions file"),
+        "{message}"
+    );
+    assert!(stderr_of(&output).contains("decisions file missing.json"));
+    let missing = format!("missing{}path", '\u{202E}');
+    let output = kurla(&dir, &["scan", "--no-cache", &missing]);
+    assert_eq!(code_of(&output), 2);
+    let stderr = stderr_of(&output);
+    assert!(!stderr.contains('\u{202E}'));
+    assert!(stderr.contains("missing\\u{202E}path"), "{stderr}");
 }
 
 fn decisions_entry(fingerprint: &str, rule: &str, path: &str, extra: &str) -> String {

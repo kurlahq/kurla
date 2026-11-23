@@ -91,7 +91,7 @@ Warnings, rejected decisions files and usage errors go to standard error. Everyt
 
 ### Escaping
 
-Every string that came from a scanned repository or from a decisions file is escaped in all three formats: payloads, paths, messages, rule identifiers, `declared_type`, reviewer and reason, decisions-file error messages and the patterns and arguments echoed back in errors. Each control, bidirectional-control, default-ignorable, tag and variation-selector character, and the line and paragraph separators, becomes `\u{XXXX}` with at least four uppercase hexadecimal digits. Other text is unchanged. A backslash is not escaped.
+Every string that came from a scanned repository or from a decisions file is escaped in all three formats: payloads, paths, messages, rule identifiers, `declared_type`, reviewer and reason, decisions-file error messages and the patterns and arguments echoed back in errors. Each control, bidirectional-control, default-ignorable, tag and variation-selector character, and the line and paragraph separators, becomes `\u{XXXX}` with at least four uppercase hexadecimal digits. A backslash becomes `\\`, so every `\u{XXXX}` in the output was written by Kurla. Other text is unchanged. In SARIF, `artifactLocation.uri` is not escaped this way: it is the path as a URI reference, with every byte other than a letter, a digit, `-`, `.`, `_`, `~` or `/` percent-encoded, and an absolute path becomes a `file:` URI.
 
 ### Exit code
 

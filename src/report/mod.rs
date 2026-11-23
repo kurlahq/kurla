@@ -49,10 +49,42 @@ fn needs_escape(c: char) -> bool {
         || is_variation_selector(c)
 }
 
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for &b in text.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+pub(crate) fn sarif_uri(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if let Some(rest) = path.strip_prefix("//") {
+        return format!("file://{}", percent_encode(rest));
+    }
+    if path.starts_with('/') {
+        return format!("file://{}", percent_encode(path));
+    }
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        return format!(
+            "file:///{}:{}",
+            char::from(bytes[0]),
+            percent_encode(&path[2..])
+        );
+    }
+    percent_encode(path)
+}
+
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if needs_escape(c) {
+        if c == '\\' {
+            out.push_str(r"\\");
+        } else if needs_escape(c) {
             let _ = write!(out, "\\u{{{:04X}}}", c as u32);
         } else {
             out.push(c);
@@ -542,6 +574,30 @@ mod tests {
     }
 
     #[test]
+    fn escape_doubles_a_backslash_so_every_escape_comes_from_kurla() {
+        assert_eq!(escape(r"a\u{202E}b"), r"a\\u{202E}b");
+        assert_ne!(escape(r"a\u{202E}b"), escape("a\u{202E}b"));
+        assert_eq!(escape(r"\"), r"\\");
+        assert_eq!(escape("\u{1B}[31m"), r"\u{001B}[31m");
+    }
+
+    #[test]
+    fn sarif_uris_are_percent_encoded_uri_references() {
+        assert_eq!(sarif_uri("dir/a b%#?.txt"), "dir/a%20b%25%23%3F.txt");
+        assert_eq!(sarif_uri("a\u{202E}b"), "a%E2%80%AEb");
+        assert_eq!(sarif_uri(r"a\b{c}"), "a%5Cb%7Bc%7D");
+        assert_eq!(sarif_uri("Az09-._~/x"), "Az09-._~/x");
+        assert_eq!(sarif_uri("/tmp/x y"), "file:///tmp/x%20y");
+        assert_eq!(sarif_uri("C:/Users/x y"), "file:///C:/Users/x%20y");
+        assert_eq!(sarif_uri("//server/share/a"), "file://server/share/a");
+        assert_eq!(sarif_uri("c:"), "c%3A");
+        assert_eq!(sarif_uri("C:/"), "file:///C:/");
+        assert_eq!(sarif_uri("1:/x"), "1%3A/x");
+        assert_eq!(sarif_uri("C:x/y"), "C%3Ax/y");
+        assert_eq!(sarif_uri("C|/y"), "C%7C/y");
+    }
+
+    #[test]
     fn escape_leaves_visible_text_alone() {
         assert_eq!(escape("plain é 日本 \u{1F600}"), "plain é 日本 \u{1F600}");
         assert_eq!(escape(""), "");
@@ -589,7 +645,7 @@ mod tests {
         let result = &sarif["runs"][0]["results"][0];
         assert_eq!(
             result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
-            "dir/\\u{202E}tail"
+            "dir/%E2%80%AEtail"
         );
         assert!(
             result["message"]["text"]

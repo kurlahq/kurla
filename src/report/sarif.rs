@@ -1,6 +1,6 @@
 use super::{
-    Report, coverage_value, escape, family_name, invalid_value, rejected_value, severity_name,
-    status_name, warnings_value,
+    Report, coverage_value, escape, family_name, invalid_value, rejected_value, sarif_uri,
+    severity_name, status_name, warnings_value,
 };
 use crate::model::{Finding, RuleStatus, Severity};
 use crate::text::TextDoc;
@@ -90,7 +90,7 @@ fn result(finding: &Finding, docs: &mut Docs) -> Value {
         "message": {"text": text},
         "locations": [{
             "physicalLocation": {
-                "artifactLocation": {"uri": escape(&finding.path)},
+                "artifactLocation": {"uri": sarif_uri(&finding.path)},
                 "region": region(finding, docs),
             }
         }],
