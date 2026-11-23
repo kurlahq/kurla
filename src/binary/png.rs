@@ -309,7 +309,7 @@ impl Walker<'_> {
                 b"eXIf" => self.sink.exif(chunk.data, chunk.data_start, &*self.budget),
                 b"IEND" => {
                     let after = chunk.data_start + chunk.data.len() + CRC_LEN;
-                    self.sink.trailer(TRAILER_LABEL, bytes, after, true);
+                    self.sink.trailer(TRAILER_LABEL, bytes, after, false);
                     return;
                 }
                 _ => {}

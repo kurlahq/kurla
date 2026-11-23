@@ -84,7 +84,7 @@ pub fn scan_webp(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
         at = end.saturating_add(size & 1);
     }
     if !sink.stop {
-        sink.trailer(WEBP_TRAILER, bytes, riff_end, true);
+        sink.trailer(WEBP_TRAILER, bytes, riff_end, false);
     }
     sink.out
 }
@@ -340,7 +340,7 @@ impl<'a> Avif<'a> {
         let boxed = sub(self.bytes, at + 4, 4)
             .is_some_and(|kind| TOP_LEVEL_BOXES.iter().any(|known| kind == known.as_slice()));
         if top && !boxed {
-            self.sink.trailer(AVIF_TRAILER, self.bytes, at, true);
+            self.sink.trailer(AVIF_TRAILER, self.bytes, at, false);
         } else {
             self.sink.malformed(TRUNCATED_BOX, at, end);
         }

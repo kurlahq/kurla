@@ -228,7 +228,7 @@ impl<'a> Gif<'a> {
                 },
                 0x2C => self.image(at),
                 0x3B => {
-                    self.sink.trailer(TRAILER_LABEL, self.bytes, at + 1, true);
+                    self.sink.trailer(TRAILER_LABEL, self.bytes, at + 1, false);
                     None
                 }
                 _ => {

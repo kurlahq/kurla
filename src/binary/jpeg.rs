@@ -178,7 +178,7 @@ pub fn scan_jpeg(bytes: &[u8], budget: &mut Budget) -> DetectorOutput {
         at += 2;
         match marker {
             0xD9 => {
-                sink.trailer(TRAILER_LABEL, bytes, at, false);
+                sink.trailer(TRAILER_LABEL, bytes, at, true);
                 break;
             }
             0x00 | 0x01 | 0xD0..=0xD8 => continue,
@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn data_after_eoi_is_b004_unless_it_is_a_recognised_file() {
+    fn data_after_eoi_is_b004_unless_it_is_a_second_jpeg_or_a_motion_photo() {
         let base = jpeg(&[seg(0xFE, b"one"), vec![0xFF, 0xD9]]);
         let with = |tail: &[u8]| {
             let mut bytes = base.clone();
@@ -536,19 +536,41 @@ mod tests {
         let second: &[u8] = &[0xFF, 0xD8, 0xFF, 0xFE, 0x00, 0x04, b'h', b'i', 0xFF, 0xD9];
         let mut mp4 = vec![0, 0, 0, 0x10];
         mp4.extend_from_slice(b"ftypmp42\0\0\0\0");
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
         let cases = [
-            (second, FileKind::Jpeg, None),
-            (&mp4[..], FileKind::UnknownBinary, Some("mp4/mov")),
+            (second, FileKind::Jpeg, None, false),
+            (&mp4[..], FileKind::UnknownBinary, Some("mp4/mov"), false),
             (
                 &b"PK\x03\x04rest of a zip"[..],
                 FileKind::UnknownBinary,
                 Some("zip"),
+                true,
             ),
+            (&b"%PDF-1.7 rest"[..], FileKind::Pdf, Some("pdf"), true),
+            (
+                &[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4][..],
+                FileKind::UnknownBinary,
+                Some("7z"),
+                true,
+            ),
+            (png, FileKind::Png, None, true),
         ];
-        for (tail, kind, format) in cases {
+        for (tail, kind, format, flagged) in cases {
             let out = with(tail);
-            assert!(out.findings.is_empty(), "{format:?}");
-            assert_eq!(texts(&out), vec!["JPEG COM: one"]);
+            let expected = if flagged {
+                vec![(
+                    "B004",
+                    "data after the end of the image",
+                    11,
+                    11 + tail.len() as u64,
+                )]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(findings(&out), expected, "{format:?}");
+            assert_eq!(out.carriers[0].text, "JPEG COM: one");
+            assert_eq!(out.carriers.len(), 1 + usize::from(flagged));
+            assert!(out.carriers.iter().skip(1).all(|c| c.hidden));
             assert_eq!(out.embedded.len(), 1);
             assert_eq!(
                 (out.embedded[0].kind, out.embedded[0].format),

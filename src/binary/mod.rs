@@ -152,6 +152,10 @@ fn embedded_blob(tail: &[u8], start: usize, end: usize) -> Option<EmbeddedBlob> 
     })
 }
 
+fn is_jpeg_companion(blob: &EmbeddedBlob) -> bool {
+    blob.kind == FileKind::Jpeg || blob.format == Some("mp4/mov")
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Placement {
     Mapped(usize),
@@ -264,7 +268,7 @@ impl Sink {
         self.push_carrier(Visibility::Hidden, label, text, (start, end), evidence)
     }
 
-    pub(crate) fn trailer(&mut self, label: &str, bytes: &[u8], start: usize, flag_known: bool) {
+    pub(crate) fn trailer(&mut self, label: &str, bytes: &[u8], start: usize, companions: bool) {
         let Some(tail) = bytes.get(start..) else {
             return;
         };
@@ -273,7 +277,7 @@ impl Sink {
         }
         let end = bytes.len();
         let blob = embedded_blob(tail, start, end);
-        let flagged = flag_known || blob.is_none();
+        let flagged = !(companions && blob.as_ref().is_some_and(is_jpeg_companion));
         self.out.embedded.extend(blob);
         if !flagged {
             return;
