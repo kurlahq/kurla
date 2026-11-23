@@ -437,10 +437,9 @@ impl<'a> Avif<'a> {
         match (iinf, iloc) {
             (Some(iinf), Some(iloc)) => {
                 let wanted = self.iinf(iinf);
-                if wanted.is_empty() || self.sink.stop {
-                    return;
+                if !self.sink.stop {
+                    self.iloc(iloc, idat, &wanted);
                 }
-                self.iloc(iloc, idat, &wanted);
             }
             (Some(iinf), None) => {
                 if !self.iinf(iinf).is_empty() {
@@ -1371,6 +1370,99 @@ mod tests {
         let mut both_empty = ftyp();
         both_empty.extend_from_slice(&full(b"meta", 0, &empty));
         assert!(scan_avif(&both_empty, &mut budget()).findings.is_empty());
+    }
+
+    fn iloc_sized(
+        version: u8,
+        (offset_size, length_size, base_size, index_size): (usize, usize, usize, usize),
+        base: u64,
+        (offset, length): (u64, u64),
+    ) -> Vec<u8> {
+        let field = |value: u64, width: usize| value.to_be_bytes()[8 - width..].to_vec();
+        let id_width = if version < 2 { 2 } else { 4 };
+        let mut body = vec![
+            (offset_size << 4 | length_size) as u8,
+            (base_size << 4 | index_size) as u8,
+        ];
+        body.extend(field(1, id_width));
+        body.extend(field(1, id_width));
+        if version >= 1 {
+            body.extend([0, 0]);
+        }
+        body.extend([0, 0]);
+        body.extend(field(base, base_size));
+        body.extend([0, 1]);
+        body.extend(field(0, index_size));
+        body.extend(field(offset, offset_size));
+        body.extend(field(length, length_size));
+        full(b"iloc", version, &body)
+    }
+
+    fn xmp_item_located_by(iloc: &dyn Fn(u64) -> Vec<u8>) -> Vec<u8> {
+        let children = |data_at: u32| {
+            let mut c = iinf(&[infe_with(2, 1, b"mime", b"", &[XMP_MIME])]);
+            c.extend_from_slice(&iloc(u64::from(data_at)));
+            c
+        };
+        assemble(0, &children, b"<a>secret</a>")
+    }
+
+    #[test]
+    fn an_iloc_base_offset_is_added_to_each_extent_offset() {
+        for base_size in [4, 8] {
+            let bytes = xmp_item_located_by(&|data_at| {
+                iloc_sized(0, (4, 4, base_size, 0), data_at.saturating_sub(5), (5, 13))
+            });
+            let out = scan_avif(&bytes, &mut budget());
+            assert_eq!(texts(&out), vec!["AVIF XMP: secret"], "{base_size}");
+            assert!(out.findings.is_empty(), "{base_size}");
+        }
+    }
+
+    #[test]
+    fn an_iloc_with_a_field_size_other_than_0_4_or_8_or_a_version_above_2_is_malformed() {
+        let cases: [(u8, (usize, usize, usize, usize), bool); 5] = [
+            (0, (2, 4, 0, 0), false),
+            (0, (4, 2, 0, 0), false),
+            (0, (4, 4, 2, 0), true),
+            (1, (4, 4, 0, 2), false),
+            (3, (4, 4, 0, 0), false),
+        ];
+        for (version, sizes, in_base) in cases {
+            let bytes = xmp_item_located_by(&|data_at| {
+                let (base, offset) = if in_base { (data_at, 0) } else { (0, data_at) };
+                iloc_sized(version, sizes, base, (offset, 13))
+            });
+            let out = scan_avif(&bytes, &mut budget());
+            assert!(out.carriers.is_empty(), "{version} {sizes:?}");
+            let found: Vec<(&str, &str)> = findings(&out).iter().map(|f| (f.0, f.1)).collect();
+            assert_eq!(found, vec![("L001", INVALID_ITEM)], "{version} {sizes:?}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_entry_inside_iinf_marks_the_avif_malformed() {
+        let entry = infe_with(2, 1, b"mime", b"", &[XMP_MIME]);
+        let bytes = items_file(&[entry, vec![0, 0, 0]], &[(1, 13)], b"<a>secret</a>");
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(texts(&out), vec!["AVIF XMP: secret"]);
+        assert_eq!(findings(&out), vec![("L001", TRUNCATED_BOX, 87, 90)]);
+    }
+
+    #[test]
+    fn a_broken_iloc_marks_the_avif_malformed_when_no_item_holds_text() {
+        let mut children = iinf(&[infe(2, 1, b"av01", None)]);
+        let iloc_at = 32 + children.len() as u64;
+        let iloc = iloc_sized(3, (4, 4, 0, 0), 0, (0, 4));
+        children.extend_from_slice(&iloc);
+        let mut bytes = ftyp();
+        bytes.extend_from_slice(&full(b"meta", 0, &children));
+        bytes.extend_from_slice(&bx(b"mdat", b"AV1!"));
+        let out = scan_avif(&bytes, &mut budget());
+        assert_eq!(
+            findings(&out),
+            vec![("L001", INVALID_ITEM, iloc_at, iloc_at + iloc.len() as u64)]
+        );
     }
 
     const XMP_UUID: [u8; 16] = [
