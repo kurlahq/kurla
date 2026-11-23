@@ -942,6 +942,35 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_knows_exactly_the_rule_ids_the_product_code_emits() {
+        let mut found = std::collections::BTreeSet::new();
+        let mut dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).expect("src is readable") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = fs::read_to_string(&path).expect("source is UTF-8");
+                    let product = text.split("#[cfg(test)]").next().unwrap_or_default();
+                    for w in product.as_bytes().windows(6) {
+                        if w[0] == b'"'
+                            && w[5] == b'"'
+                            && w[1].is_ascii_uppercase()
+                            && w[2..5].iter().all(u8::is_ascii_digit)
+                        {
+                            found.insert(String::from_utf8_lossy(&w[1..5]).into_owned());
+                        }
+                    }
+                }
+            }
+        }
+        let table: std::collections::BTreeSet<String> =
+            RULE_IDS.iter().map(|id| id.to_string()).collect();
+        assert_eq!(found, table);
+    }
+
+    #[test]
     fn a_b005_finding_is_cached_and_read_back() {
         let dir = TestDir::new();
         let cache = open(&dir);

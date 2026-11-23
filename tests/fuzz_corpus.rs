@@ -49,8 +49,9 @@ fn root() -> PathBuf {
 
 fn seeds(target: &str) -> Vec<(String, Vec<u8>)> {
     let dir = root().join("fuzz").join("corpus").join(target);
-    assert!(!seeds_in(&dir).is_empty(), "no seeds for {target}");
-    seeds_in(&dir)
+    let found = seeds_in(&dir);
+    assert!(!found.is_empty(), "no seeds for {target}");
+    found
 }
 
 fn seeds_in(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {

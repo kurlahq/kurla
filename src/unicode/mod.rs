@@ -410,6 +410,15 @@ mod tests {
     }
 
     #[test]
+    fn hangul_decomposition_ends_at_the_last_syllable() {
+        assert_eq!(
+            nfd("\u{D7A3}".chars()),
+            vec!['\u{1112}', '\u{1175}', '\u{11C2}']
+        );
+        assert_eq!(nfd("\u{D7A4}".chars()), vec!['\u{D7A4}']);
+    }
+
+    #[test]
     fn skeleton_decomposes_canonically() {
         assert_eq!(confusable_skeleton("\u{00E9}"), "e\u{0301}");
         assert_eq!(confusable_skeleton("\u{AC00}"), "\u{1100}\u{1161}");
