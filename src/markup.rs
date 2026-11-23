@@ -795,7 +795,8 @@ pub fn scan_markup(doc: &TextDoc, budget: &mut Budget, flavour: Markup) -> Detec
                 i = end;
             }
             Some(Token::Open(tag)) => {
-                let void = tag.self_closing || VOID_ELEMENTS.contains(&tag.name.as_str());
+                let void =
+                    (tag.self_closing && !tag.hidden) || VOID_ELEMENTS.contains(&tag.name.as_str());
                 if void {
                     if tag.hidden && root.is_none() {
                         emit_hidden(&mut out, doc, &chars, (i, tag.end), None);
@@ -1126,6 +1127,21 @@ mod tests {
         assert_eq!(out.carriers[0].text, "");
         let out = html("<br hidden><img hidden/>");
         assert_eq!(payloads(&out), vec![None, None]);
+    }
+
+    #[test]
+    fn self_closing_syntax_does_not_end_a_hidden_non_void_element() {
+        let out = html("<div hidden/>secret words</div><p>shown</p>");
+        assert_eq!(payloads(&out), vec![Some("secret words")]);
+        let span = (
+            out.findings[0].span.byte_start,
+            out.findings[0].span.byte_end,
+        );
+        assert_eq!(span, (0, 31));
+        let out = html("<p><span hidden/>tail</p><p>shown</p>");
+        assert_eq!(payloads(&out), vec![Some("tail")]);
+        let out = html("<div/>shown</div>");
+        assert!(out.findings.is_empty());
     }
 
     #[test]
