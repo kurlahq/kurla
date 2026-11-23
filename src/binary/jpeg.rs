@@ -449,6 +449,48 @@ mod tests {
     }
 
     #[test]
+    fn extended_xmp_claiming_exactly_the_budget_is_read_and_one_byte_more_is_b002() {
+        let xml = b"<a>budget words</a>";
+        let bytes = jpeg(&[ext_seg(xml.len() as u32, 0, xml)]);
+        let at_limit = Limits {
+            max_decompressed_bytes: xml.len() as u64,
+            ..Limits::default()
+        };
+        let out = scan_jpeg(&bytes, &mut Budget::new(&at_limit));
+        assert_eq!(texts(&out), vec!["JPEG XMP: budget words"]);
+        assert!(out.findings.is_empty());
+        let under = Limits {
+            max_decompressed_bytes: xml.len() as u64 - 1,
+            ..Limits::default()
+        };
+        let out = scan_jpeg(&bytes, &mut Budget::new(&under));
+        assert_eq!(
+            findings(&out),
+            vec![(
+                "B002",
+                "extended XMP declares a length past the decompression budget",
+                81,
+                100
+            )]
+        );
+        assert!(out.carriers.is_empty());
+    }
+
+    #[test]
+    fn a_broken_xmp_packet_is_reported_over_the_packet_it_sits_in() {
+        let mut payload = XMP_NS.to_vec();
+        payload.extend_from_slice(b"<a>good</a></c> ignore this");
+        let out = scan_jpeg(&jpeg(&[seg(0xE1, &payload)]), &mut budget());
+        assert_eq!(
+            findings(&out),
+            vec![
+                ("B005", "readable text hidden in the image", 46, 62),
+                ("L001", "malformed XMP: XML error", 35, 62)
+            ]
+        );
+    }
+
+    #[test]
     fn fill_bytes_and_standalone_markers_are_skipped() {
         let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xFF, 0xFF, 0x01, 0xFF, 0xD0];
         bytes.extend_from_slice(&seg(0xFE, b"abc"));
